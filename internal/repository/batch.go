@@ -166,7 +166,7 @@ func (r *TemplateRepo) UpdateTemplatesBatch(ctx context.Context, ids []int64, p 
 				u = u.SetFormatModels(formatModelsToStrings(*p.FormatModels))
 			}
 			if p.ModelMapping != nil {
-				u = u.SetModelMapping(*p.ModelMapping)
+				u = u.SetModelMapping(nonNilModelMapping(*p.ModelMapping))
 			}
 			if _, err := u.Save(ctx); err != nil {
 				if sqlgraph.IsUniqueConstraintError(err) && p.Name != nil {

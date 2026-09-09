@@ -39,12 +39,12 @@ func TestModelMappingModeJSONRoundTrip(t *testing.T) {
 	require.Error(t, json.Unmarshal([]byte(`""`), &m))
 }
 
-func TestModelMappingRejectsTopLevelNull(t *testing.T) {
+func TestModelMappingNullUnmarshalsEmpty(t *testing.T) {
 	for _, input := range []string{`null`, " \nnull\t"} {
 		var m ModelMapping
-		err := json.Unmarshal([]byte(input), &m)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "must not be null")
+		require.NoError(t, json.Unmarshal([]byte(input), &m))
+		require.NotNil(t, m)
+		require.Empty(t, m)
 	}
 }
 

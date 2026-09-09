@@ -271,8 +271,11 @@ func (e *ModelMappingEntry) UnmarshalJSON(data []byte) error {
 type ModelMapping map[string]ModelMappingEntry
 
 func (m *ModelMapping) UnmarshalJSON(data []byte) error {
+	// JSON null：HTTP 面仍由 handler 400；读路径（Ent 扫描存量行）把 null 当空对象。
+	// 根因：nil map 经 encoding/json 落库为 JSON null，列表 Unmarshal 失败会整页 500。
 	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
-		return fmt.Errorf("model_mapping must not be null")
+		*m = ModelMapping{}
+		return nil
 	}
 	type raw ModelMapping
 	var tmp raw

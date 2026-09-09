@@ -33,7 +33,7 @@ func (r *TemplateRepo) CreateTemplate(ctx context.Context, t *domain.Template) (
 		SetSupportedFormats(formatsToStrings(t.SupportedFormats)).
 		SetModels(t.Models).
 		SetFormatModels(formatModelsToStrings(t.FormatModels)).
-		SetModelMapping(t.ModelMapping).
+		SetModelMapping(nonNilModelMapping(t.ModelMapping)).
 		Save(ctx)
 	if err != nil {
 		if sqlgraph.IsUniqueConstraintError(err) {
@@ -117,7 +117,7 @@ func (r *TemplateRepo) UpdateTemplate(ctx context.Context, t *domain.Template) (
 			SetSupportedFormats(formatsToStrings(t.SupportedFormats)).
 			SetModels(t.Models).
 			SetFormatModels(formatModelsToStrings(t.FormatModels)).
-			SetModelMapping(t.ModelMapping).
+			SetModelMapping(nonNilModelMapping(t.ModelMapping)).
 			Save(ctx)
 		return saveErr
 	})
@@ -160,4 +160,11 @@ func formatModelsToStrings(m map[domain.RequestFormat][]string) map[string][]str
 		out[string(k)] = v
 	}
 	return out
+}
+
+func nonNilModelMapping(m domain.ModelMapping) domain.ModelMapping {
+	if m == nil {
+		return domain.ModelMapping{}
+	}
+	return m
 }
