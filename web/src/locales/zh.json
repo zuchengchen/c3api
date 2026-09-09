@@ -248,6 +248,10 @@
         "recommended": "推荐",
         "comingSoon": "适配器待实现"
       },
+      "parse": {
+        "sub2apiNoMatch": "文件中没有可导入的 Codex {{type}} 账号（OpenAI oauth / setup-token）",
+        "sub2apiInvalid": "不是 Sub2API 账号导出格式（需要 accounts[] 或带 credentials 的账号对象）"
+      },
       "input": {
         "fileTab": "文件",
         "textTab": "粘贴文本",
@@ -294,7 +298,7 @@
       },
       "stepDesc": {
         "kind": "不同类型对应不同后端接口，模板会按类型自动过滤",
-        "source": "仅 CPA 已就绪，其余来源为扩展占位",
+        "source": "CPA 与 Sub2API 已就绪，其余来源为扩展占位",
         "input": "文件与粘贴共用同一解析，关闭弹窗自动清空",
         "preview": "仅发送有效行，分片 100 条顺序提交"
       },
@@ -315,6 +319,7 @@
       "fileDropDesc": "支持 .json / .txt / .at_txt · 最大 5 MB",
       "selected": "已选择",
       "pastePlaceholder": "粘贴 JSON / JSONL / 单对象\n示例：{\"email\":\"a@b.com\",\"account_id\":\"id-1\",\"access_token\":\"ey...\"}",
+      "pastePlaceholderSub2api": "粘贴 Sub2API 账号导出 JSON（含 accounts[]，或 {code,data} 信封）",
       "pasteHint2": "已自动去除 BOM · 300ms 防抖解析 · 空行跳过 · 仅 JSON.parse",
       "folderOnlyCpa": "文件夹上传仅支持 CPA 格式",
       "filesCount": "{{count}} 个文件",
