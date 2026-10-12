@@ -276,6 +276,10 @@ export default {
         "recommended": "Recommended",
         "comingSoon": "Adapter coming soon"
       },
+      "parse": {
+        "sub2apiNoMatch": "No importable Codex {{type}} accounts (OpenAI oauth / setup-token)",
+        "sub2apiInvalid": "Not a Sub2API account export (need accounts[] or an object with credentials)"
+      },
       "input": {
         "fileTab": "File",
         "textTab": "Paste text",
@@ -325,7 +329,7 @@ export default {
       },
       "stepDesc": {
         "kind": "Each type maps to a backend endpoint; templates are filtered by type",
-        "source": "Only CPA is ready; other sources are placeholders",
+        "source": "CPA and Sub2API are ready; other sources are placeholders",
         "input": "File and paste share the same parse; closing clears the content",
         "preview": "Only valid rows are sent, 100 per batch sequentially"
       },
@@ -346,6 +350,7 @@ export default {
       "fileDropDesc": "Supports .json / .txt / .at_txt · max 5 MB",
       "selected": "Selected",
       "pastePlaceholder": "Paste JSON / JSONL / single object\ne.g. {\"email\":\"a@b.com\",\"account_id\":\"id-1\",\"access_token\":\"ey...\"}",
+      "pastePlaceholderSub2api": "Paste a Sub2API account export (accounts[], or a {code,data} envelope)",
       "pasteHint2": "BOM stripped · 300ms debounce · skips empty lines · JSON.parse only",
       "folderOnlyCpa": "Folder upload only for CPA",
       "filesCount": "{{count}} files",

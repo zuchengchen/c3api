@@ -1,6 +1,7 @@
 import type { CredentialKind, NormalizedRow } from './normalize'
 import { normalizeRow } from './normalize'
 import { parseRawText } from './parse'
+import { parseSub2ApiExport } from './sub2api'
 import type { components } from '@/lib/api/schema'
 
 export type SourceId = 'cpa' | 'c3api' | 'sub2api' | 'cockpit' | '9router' | 'codex' | 'axonhub' | 'codex-manager'
@@ -14,6 +15,7 @@ const cpa: ImportAdapter = { id: 'cpa', credentialKinds: supported, parse: (text
   return { rows: parsed.rows.map((raw, index) => normalizeRow(raw, kind, index)) }
 } }
 const stub = (id: SourceId): ImportAdapter => ({ id, credentialKinds: supported, parse: () => ({ rows: [], parseError: 'adapterComingSoon' }) })
-export const adapters: Record<SourceId, ImportAdapter> = { cpa, c3api: stub('c3api'), sub2api: stub('sub2api'), cockpit: stub('cockpit'), '9router': stub('9router'), codex: stub('codex'), axonhub: stub('axonhub'), 'codex-manager': stub('codex-manager') }
+const sub2api: ImportAdapter = { id: 'sub2api', credentialKinds: supported, parse: parseSub2ApiExport }
+export const adapters: Record<SourceId, ImportAdapter> = { cpa, c3api: stub('c3api'), sub2api, cockpit: stub('cockpit'), '9router': stub('9router'), codex: stub('codex'), axonhub: stub('axonhub'), 'codex-manager': stub('codex-manager') }
 export function getAdapter(id: SourceId) { return adapters[id] }
 export type ImportItem = components['schemas']['CodexOAuthImportItem'] | components['schemas']['CodexPATImportItem']
