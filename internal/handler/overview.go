@@ -22,21 +22,21 @@ import (
 // 游标积压 lag 族注入面）。全冷面（聚合查询 + 快照遍历）；内部 TTL 30s 缓存，
 // 键含 days/group_id + 请求时区规范名 + 该时区日界（summary"今日"跨午夜滚转
 // 且不同浏览器时区结果各异——两分量都进键，无进程级时区）；无 singleflight
-// （dashboard 单消费者，P3 声明接受）。
+// （dashboard 单消费者，声明接受）。
 func (h *AdminAPI) GetAdminOverview(w http.ResponseWriter, r *http.Request, params GetAdminOverviewParams) {
 	zone, err := resolveStatsZone(params.Timezone)
 	if err != nil {
 		httpface.WriteServiceErr(w, err)
 		return
 	}
-	days := deref(params.Days)
+	days := httpface.Deref(params.Days)
 	if days < 1 {
 		days = 7 // 缺省 7（契约 default；nil/非法回落缺省）
 	}
 	if days > 30 {
 		days = 30
 	}
-	groupID := deref(params.GroupId)
+	groupID := httpface.Deref(params.GroupId)
 	day := dayStart(h.now(), zone) // 缓存键与聚合区间同一日界源（请求时区）
 	key := fmt.Sprintf("o:%d:%d:%s:%s", days, groupID, zone.String(), day.Format("2006-01-02"))
 	if v, ok := h.overviewCache.get(key); ok {

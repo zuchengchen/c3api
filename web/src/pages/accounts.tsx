@@ -5,15 +5,18 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
-import { Plus, Pencil, Trash2, Users, Ban, CircleCheck, Filter, Settings2, SlidersHorizontal, Upload } from 'lucide-react'
+import { Plus, Pencil, Trash2, Users, Ban, CircleCheck, Filter, Settings2, SlidersHorizontal, Upload, RotateCcw } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { api } from '@/App'
+import type { DynamicKey } from '@/lib/i18n'
+import { useAccountSurface } from '@/lib/api/scope'
 import { ApiError, ApiUnauthorized } from '@/lib/api/client'
+import { parseMultiplier, validCacheDomain } from '@/lib/account-config'
 import { BatchBar } from '@/components/batch-bar'
 import { ListToolbar } from '@/components/list-toolbar'
 import { Pagination } from '@/components/pagination'
 import { SortableHeader, type SortOrder } from '@/components/sortable-header'
 import { Badge } from '@/components/ui/badge'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -23,22 +26,22 @@ import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMe
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { toast } from '@/components/ui/toast'
-import { StatusBadge, CooldownBadge } from '@/components/status-badge'
-import { browserTimeZone, fmtTokens, formatPercent, toRFC3339, truncate } from '@/components/fmt'
+import { browserTimeZone, fmtTokens, formatPercent, formatDateTime, toRFC3339, truncate } from '@/components/fmt'
+import { StatsWindowNotice } from '@/components/stats-window-notice'
+import { compositeMaxSpanSeconds } from '@/lib/stats-capabilities'
 import { cn } from '@/lib/utils'
 import type { components } from '@/lib/api/schema'
 import { CodexImportDialog } from '@/components/codex-import/import-dialog'
+import { SupplierPicker } from '@/components/supplier/supplier-picker'
 
 type AccountView = components['schemas']['AccountView']
 type AccountCreate = components['schemas']['AccountCreate']
-type AccountPatch = components['schemas']['AccountPatch']
-type AccountStatus = components['schemas']['AccountStatus']
+type AccountConfigPatch = components['schemas']['AccountConfigPatch']
 type AccountExt = components['schemas']['AccountExt']
 type Group = components['schemas']['Group']
 
@@ -52,7 +55,7 @@ const isCodexTemplate = (a: AccountView) =>
 // 视口懒加载块大小 = 批量端点上限（accounts/usage ≤100/次）。
 const USAGE_BLOCK_SIZE = 100
 const ACCOUNTS_HIDDEN_STORAGE_KEY = 'accounts-hidden-columns'
-const ACCOUNTS_HIDDENABLE_COLS = ['name', 'template', 'status', 'weight', 'maxConcurrency', 'curConcurrency', 'errRate', 'errCount', 'lastError', 'usage'] as const
+const ACCOUNTS_HIDDENABLE_COLS = ['name', 'template', 'state', 'costMultiplier', 'cacheDomain', 'maxConcurrency', 'curConcurrency', 'errRate', 'errCount', 'lastError', 'usage'] as const
 
 function loadHiddenCols(): Set<string> {
   try {
@@ -82,13 +85,17 @@ const fmtReset = (ms: number): string => {
   return `${m}m`
 }
 
-// —— 用量明细弹窗（B-2）：预置时间范围（hours ≤72 → 分桶 hour 粒度，否则 day）——
+// —— 用量明细弹窗：预置时间范围（hours ≤72 → 分桶 hour 粒度，否则 day）——
 const USAGE_RANGES = [
   { key: '24h', hours: 24 },
   { key: '7d', hours: 168 },
   { key: '30d', hours: 720 },
   { key: '90d', hours: 2160 },
 ] as const
+
+// 与服务端 ceilHour 同一取整（毫秒精度下与进位式逐位相同）。尾窗上界要接预设的
+// 生效上界，但尾窗下界是末桶起点，不能再发成 window=。
+const ceilHourISO = (ms: number) => new Date(Math.ceil(ms / 3_600_000) * 3_600_000).toISOString()
 
 // 分桶时间列按粒度截断：day → 仅日期（桶边界 08:00 的 UTC 时刻对"一天"无语义）；
 // hour → 日期 + 整点（桶起点）。本地时区转换（与 formatDateTime 一致）。
@@ -143,6 +150,37 @@ function UsageCell({ item }: { item?: components['schemas']['AccountUsageItem'] 
   )
 }
 
+// —— 生命周期展示（fenced 端点为唯一写面；倍率/缓存域校验见 lib/account-config）——
+const fmtMult = (v?: number | null): string => (v == null ? '—' : `×${Number(v.toFixed(4))}`)
+
+// 生命周期状态徽章对：管理面 enabled（契约恒回显；缺失按禁用展示——fail-closed）
+// + 运行时失效（failed_at 置位即标红，tooltip 携带来源/时刻；恢复唯一入口 recover）。
+function LifecycleBadges({ a }: { a: AccountView }) {
+  const { t } = useTranslation()
+  const enabled = a.Enabled === true
+  return (
+    <div className="flex items-center gap-1.5">
+      <Badge variant="secondary" className={cn('gap-1.5', enabled ? 'text-emerald-700 dark:text-emerald-400' : 'text-muted-foreground')}>
+        <span className={cn('size-1.5 shrink-0 rounded-full', enabled ? 'bg-emerald-500' : 'bg-muted-foreground/60')} />
+        {t(enabled ? 'accounts.state.enabled' : 'accounts.state.disabled')}
+      </Badge>
+      {a.FailedAt && (
+        <Tooltip>
+          <TooltipTrigger render={<span className="inline-flex" />}>
+            <Badge variant="secondary" className="gap-1.5 text-red-600 dark:text-red-400">
+              <span className="size-1.5 shrink-0 rounded-full bg-red-500" />
+              {t('accounts.state.failed')}
+            </Badge>
+          </TooltipTrigger>
+          <TooltipContent>
+            {t('accounts.state.failedTip', { source: a.FailureSource ?? '—', time: formatDateTime(a.FailedAt) })}
+          </TooltipContent>
+        </Tooltip>
+      )}
+    </div>
+  )
+}
+
 // RFC3339（API）→ datetime-local 'YYYY-MM-DDTHH:mm'（本地时区；DateTimePicker 值格式，'' = 未设置）
 function toLocalDT(iso: string): string {
   const d = new Date(iso)
@@ -150,20 +188,19 @@ function toLocalDT(iso: string): string {
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
-// 批量更新表单里 status/template_id 的「不修改」哨兵值。
-type BatchStatus = 'all' | AccountStatus
-
-const STATUSES: AccountStatus[] = ['active', 'unhealthy', '429', 'disabled']
-
 interface FormState {
   name: string
   template_id: string // Select 值统一用字符串，提交时转 number
   base_url: string // 账号级覆盖（'' = 继承模板）
   upstream_key: string
-  status: AccountStatus
-  weight: string
   max_concurrency: string
   group_ids: number[]
+  // 生命周期表单项（创建/编辑对话框直配；随创建/PATCH 请求体一次落库）：
+  // cost_multiplier 字符串形态（默认 '1' = ×1），提交前经 parseMultiplier
+  // 校验（0–10，bp 4 位小数）；cache_domain 空串 = 账号私有域（编辑态按变化
+  // 发送 null = 清空）。
+  cost_multiplier: string
+  cache_domain: string
   // codex 凭据（按模板类型分流：codex-oauth → codex_oauth_* 组；codex-pat →
   // codex_pat_key；与 account_ext 字段对应——保存时链式写入扩展配置）
   codex_oauth_token: string
@@ -171,6 +208,14 @@ interface FormState {
   codex_oauth_expires_at: string
   codex_pat_key: string
   codex_email: string
+  codex_account_id: string
+  // 归属供应商 user_id（**仅管理面作用域**：把账号分配给供应商的唯一入口，
+  // spec §2.5/§6.1 L834）；供应商面不展示、不可编辑（服务端恒为 JWT 本人）。
+  // 空串 = 不发送（创建态 = 平台自有 null；编辑态 = 保持不变，绝不误清空）。
+  supplier_user_id: string
+  // 清空归属哨兵（对齐 clearCacheDomain）：编辑态勾选 ⇒ 显式发送 supplier_user_id:
+  // null（回平台自有）；供应商面不展示该控件（服务端恒为 JWT 本人）。
+  clearOwner: boolean
 }
 
 const emptyForm = (): FormState => ({
@@ -178,18 +223,23 @@ const emptyForm = (): FormState => ({
   template_id: '',
   base_url: '',
   upstream_key: '',
-  status: 'active',
-  weight: '0',
   max_concurrency: '8',
   group_ids: [],
+  cost_multiplier: '1',
+  cache_domain: '',
   codex_oauth_token: '',
   codex_oauth_refresh_token: '',
   codex_oauth_expires_at: '',
   codex_pat_key: '',
   codex_email: '',
+  codex_account_id: '',
+  supplier_user_id: '',
+  clearOwner: false,
 })
 
 function isCodexCt(ct?: string | null) { return ct === 'codex-oauth' || ct === 'codex-pat' }
+// PUT 全列更新：account id 优先用表单手填值，空则回显原值防清空
+const codexAccountIdBody = (val: string, cur?: string | null) => val.trim() || cur || null
 function toForm(a: AccountView): FormState {
   const ct = a.Template?.CredentialType as string | undefined
   const codex = isCodexCt(ct)
@@ -198,35 +248,47 @@ function toForm(a: AccountView): FormState {
     template_id: String(a.TemplateID ?? ''),
     base_url: codex ? '' : (a.BaseURL ?? ''), // Codex: must clear stale BaseURL on load
     upstream_key: a.UpstreamKey ?? '',
-    status: a.Status ?? 'active',
-    weight: String(a.Weight ?? 0),
     max_concurrency: String(a.MaxConcurrency ?? 8),
-    // 编辑回显不走账号列表（I-1 方案 B）：对话框挂载时经 getAccountGroups
+    // 编辑回显不走账号列表（方案 B）：对话框挂载时经 getAccountGroups
     // 拉取，加载完成前禁用保存（防误发 [] 清空）。codex 凭据经 ext 拉取回显。
+    // 生命周期回显：倍率缺失按 ×1，缓存域缺失（null）按空串（= 私有域）。
     group_ids: [],
+    cost_multiplier: String(a.UpstreamCostMultiplier ?? 1),
+    cache_domain: a.CacheDomain ?? '',
     codex_oauth_token: '',
     codex_oauth_refresh_token: '',
     codex_oauth_expires_at: '',
     codex_pat_key: '',
     codex_email: '',
+    codex_account_id: '',
+    // 归属回显（AccountView 现含 supplier_user_id 列）：编辑态按当前归属回填，
+    // 空 = 平台自有；勾选 clearOwner 显式清空（发送 null）。
+    supplier_user_id: a.supplier_user_id != null ? String(a.supplier_user_id) : '',
+    clearOwner: false,
   }
 }
 
-// PUT 全量替换：重建 AccountCreate（只带契约字段，不带运行时字段）。
-// 编辑态总是发送 group_ids（含空数组 = 清空）；创建态仅已选时发送
-// （缺省 = 无分组，语义与 null 一致）。
-function toBody(f: FormState, editing: boolean, isCodex?: boolean): AccountCreate {
+// 三态字段模型（创建/PATCH/批量共用）的请求体：只带契约字段，不带运行时字段。
+// 缺席 = 不变（创建态 = 取后端缺省）；可空标量 null = 清空；group_ids 编辑态
+// 总是发送（含空数组 = 清空），创建态仅已选时发送。
+// 倍率/缓存域不是独立端点：随同一请求体一次落库（编辑态仅变化项才带）。
+function toBody(f: FormState, current: AccountView | null, isCodex?: boolean): AccountCreate {
   const body: AccountCreate = {
     name: f.name.trim(),
     template_id: Number(f.template_id),
     // 空串归一 null；Codex 强制 null（SDK default, non-empty forbidden)
     base_url: isCodex ? null : (f.base_url.trim() || null),
-    upstream_key: f.upstream_key,
-    status: f.status,
-    weight: f.weight === '' ? 0 : Number(f.weight),
-    max_concurrency: f.max_concurrency === '' ? 8 : Number(f.max_concurrency),
   }
-  if (editing || f.group_ids.length > 0) body.group_ids = f.group_ids
+  // upstream_key 缺席 = 不变；空值不发送（codex 模板本无静态 key；非 codex 模板
+  // 的空 key 由后端按模板类型条件必填拒绝为 400，不在此处伪造空串）。
+  if (f.upstream_key) body.upstream_key = f.upstream_key
+  // max_concurrency 缺席 = 不变 / 创建取后端配置缺省（不再硬编码 8）。
+  if (f.max_concurrency !== '') body.max_concurrency = Number(f.max_concurrency)
+  if (current || f.group_ids.length > 0) body.group_ids = f.group_ids
+  if (!current) {
+    const d = f.cache_domain.trim()
+    if (d) body.cache_domain = d
+  }
   return body
 }
 
@@ -253,49 +315,46 @@ function GroupMultiSelect({ groups, value, onChange, disabled }: {
   )
 }
 
-// 禁用/启用 quick action：取当前对象重建请求体 + status 翻转。
-// Codex 账号不发送 BaseURL
-function toggleBody(a: AccountView, next: AccountStatus): AccountCreate {
-  const codex = isCodexCt(a.Template?.CredentialType as string | undefined)
-  return {
-    name: a.Name ?? '',
-    template_id: a.TemplateID ?? 0,
-    base_url: codex ? null : (a.BaseURL ?? null),
-    upstream_key: a.UpstreamKey ?? '',
-    status: next,
-    weight: a.Weight ?? 0,
-    max_concurrency: a.MaxConcurrency ?? 8,
-  }
-}
-
 // 批量更新表单：空字段 = 不发送（保持原值）。
 interface BatchForm {
   name: string
   upstream_key: string
   base_url: string
-  status: BatchStatus
-  weight: string
   max_concurrency: string
   template_id: string
   group_ids: string[]
-  clearGroups: boolean // 评审 I-2：勾选发送 group_ids: [] 并禁用分组多选
-  clearBaseURL: boolean // C1 三态哨兵（对齐 clearGroups 先例）：勾选发送 base_url: "" = 清空；未勾选且输入非空 → 该值；未勾选且空 → 不变
+  clearGroups: boolean // 勾选发送 group_ids: [] 并禁用分组多选
+  clearBaseURL: boolean // 三态哨兵（对齐 clearGroups 先例）：勾选发送 base_url: "" = 清空；未勾选且输入非空 → 该值；未勾选且空 → 不变
+  enabled: 'all' | 'true' | 'false' // 三态：'all' = 不变（不发送）；true/false = 统一落值
+  cache_domain: string
+  clearCacheDomain: boolean // 三态哨兵（对齐 clearBaseURL）：勾选发送 cache_domain: null = 清空回账号私有域
+  multiplier: string // 空 = 不变（不发送）
 }
 
 const emptyBatchForm = (): BatchForm => ({
   name: '',
   upstream_key: '',
   base_url: '',
-  status: 'all',
-  weight: '',
   max_concurrency: '',
   template_id: 'all',
   group_ids: [],
   clearGroups: false,
   clearBaseURL: false,
+  enabled: 'all',
+  cache_domain: '',
+  clearCacheDomain: false,
+  multiplier: '',
 })
 
+// 作用域参数化（spec 2026-10-09 §6.1/§10）：**同一页面组件**在管理面（/app/accounts）与
+// 供应商控制台（/app 之外的 /user/supplier/accounts）复用，只切 API base 前缀——
+// 供应商面走 supplierApi（/api/user/supplier/*），管理面走 adminApi（/api/admin/*）。
+// 作用域（kind + 客户端）取自 ApiScopeProvider 的**单一对象**，不再有独立 scope prop。
+// 能力集完全一致（创建/编辑/批改/批删/启停/缓存域/倍率/ext Codex 凭据/批量导入/恢复/用量）；
+// 差异仅在：供应商面 `supplier_user_id` 不展示、不可编辑（服务端恒为 JWT 本人）。
 export default function Accounts() {
+  const { kind, api } = useAccountSurface()
+  const isSupplierScope = kind === 'supplier'
   const { t } = useTranslation()
   const qc = useQueryClient()
 
@@ -305,13 +364,13 @@ export default function Accounts() {
   const [order, setOrder] = useState<SortOrder>('desc')
   const [offset, setOffset] = useState(0)
   const [limit, setLimit] = useState(20)
-  const [statusFilter, setStatusFilter] = useState<AccountStatus[]>([])
   const [templateId, setTemplateId] = useState('all') // 'all' = 全部模板
+  const [enabledFilter, setEnabledFilter] = useState('all') // 'all' | 'true' | 'false'（管理面启停，与失效无关）
 
   const { data, isLoading, isError, error } = useQuery({
     queryKey: [
       'accounts',
-      { limit, offset, name, sort: activeSort ?? 'id', order, status: statusFilter.join(','), template_id: templateId === 'all' ? undefined : Number(templateId) },
+      { limit, offset, name, sort: activeSort ?? 'id', order, template_id: templateId === 'all' ? undefined : Number(templateId), enabled: enabledFilter === 'all' ? undefined : enabledFilter === 'true' },
     ],
     queryFn: () =>
       api.listAccounts({
@@ -320,8 +379,8 @@ export default function Accounts() {
         name: name || undefined,
         sort: activeSort ?? 'id',
         order,
-        status: statusFilter.length > 0 ? statusFilter.join(',') : undefined,
         template_id: templateId === 'all' ? undefined : Number(templateId),
+        enabled: enabledFilter === 'all' ? undefined : enabledFilter === 'true',
       }),
     refetchInterval: 10_000,
   })
@@ -329,7 +388,7 @@ export default function Accounts() {
   const templates = templatesQ.data?.rows ?? []
   const groupsQ = useQuery({ queryKey: ['groups'], queryFn: () => api.listGroups({ limit: 100 }) })
   const groups = groupsQ.data?.rows ?? []
-  const rows = data?.rows ?? []
+  const rows = useMemo(() => data?.rows ?? [], [data?.rows])
 
   // 行勾选（跨页保留，筛选/翻页后清空）——
   const [selected, setSelected] = useState<number[]>([])
@@ -355,7 +414,8 @@ export default function Accounts() {
   // —— 用量/额度聚合（0e77d2a）：**视口懒加载**（用户裁决 2026-08-19）——
   // 批量端点上限 100/次 → 块 100；滚动/缩放 rAF 节流 + 二分定位可视行；
   // useQueries 每块独立 key/缓存/轮询——块滚出视口即停轮询（数据留缓存，
-  // 滚回从缓存恢复）；usage 列隐藏时 enabled=false 全停。from/to 缺省 = 今日。
+  // 滚回从缓存恢复）；usage 列隐藏时 enabled=false 全停。列表格固定近 24h
+  //（相对窗口，服务端自持 now；不再有「缺省 = 当天」）。
   const tableRef = useRef<HTMLTableElement>(null)
   const [visibleRange, setVisibleRange] = useState<[number, number]>([0, 0])
   // IO 观察数据行（表格在 ScrollArea viewport 内滚动——window scroll 监听接不住；
@@ -400,8 +460,8 @@ export default function Accounts() {
   const usageQs = useQueries({
     queries: visibleBlocks.map(b => ({
       queryKey: ['accounts-usage-block', b.map(r => r.ID).join(','), browserTimeZone()],
-      // 无 from/to → 服务端按请求时区计算"当天"缺省窗（键含时区）。
-      queryFn: () => api.listAccountsUsage(b.map(r => r.ID!), { timezone: browserTimeZone() }),
+      // 列表格是固定近 24h 预设：发 window，不在客户端用墙钟算 from/to。
+      queryFn: () => api.listAccountsUsage(b.map(r => r.ID!), { window: '24h', timezone: browserTimeZone() }),
       enabled: isColVisible('usage') && pageIds.length > 0,
       // staleTime = 轮询周期：切回页面/滚回视口时缓存新鲜（<10s）零请求直显，
       // 避免 staleTime=0 默认的切回突刺 refetch；过期后按轮询节奏刷新。
@@ -421,29 +481,58 @@ export default function Accounts() {
     return m
   }, [visibleBlocks, usageQs])
 
-  // —— 用量明细弹窗（B-2）：三查询并行——汇总 = usage_logs 实时全窗（无聚合延迟，
+  // —— 用量明细弹窗：三查询并行——汇总 = usage_logs 实时全窗（无聚合延迟，
   // A/U 准确、含尾窗）；分桶 = stats-agg 离线聚合（watermark 滞后 Lag，末桶为进行中的
-  // 部分桶）→ 末桶被尾窗补行 [末桶起点, now) 原位替代（无双计无缺口）。
-  // from/to 每次渲染重算但查询 key 不含时间戳——渲染期不重取；弹窗打开（enabled
-  // 翻转触发 refetch）/切换范围（key 变化）时 queryFn 拿到当前时刻，滚动/轮询零请求。
+  // 部分桶）→ 末桶被尾窗补行 [末桶起点, 预设上界) 原位替代（无双计无缺口）。
+  // 预设发 window=（服务端自持 now，零平移）；尾窗的下界是末桶起点，不是预设，
+  // 故仍发绝对 from/to，上界取回显的生效上界（没有回显前不查尾窗）。
   const [usageDetail, setUsageDetail] = useState<AccountView | null>(null)
+  // 统计能力（本部署能查多久）：per-deployment 常量，按部署缓存（staleTime 无限）。
+  // 用途 = 预置范围裁剪：弹窗三条查询（usage_agg + entity_trend + 尾窗 usage_agg）
+  // 都必须成立，故取各 kind 下界——超过它的预置在任何存储上都会被拒，直接不提供
+  //（spec §4.4(a) 的前端用途：证据部署 R=2 下 30d/90d 预置不可服务）。
+  const capsQ = useQuery({
+    queryKey: ['stats-capabilities'],
+    queryFn: () => api.getStatsCapabilities(),
+    staleTime: Infinity,
+    // /stats/capabilities 不在供应商面路由子集内（spec §2.5/§6.1 只放行
+    // accounts + groups 只读 + templates 只读 + 供应商业务面）⇒ 供应商作用域下
+    // 不发该请求（否则必 404）；预置范围回落到全量 USAGE_RANGES。
+    enabled: !isSupplierScope,
+  })
+  const maxSpanSeconds = compositeMaxSpanSeconds(capsQ.data, ['usage_agg', 'entity_trend'])
+  const offeredRanges = useMemo(
+    () => (maxSpanSeconds === undefined
+      ? [...USAGE_RANGES]
+      : USAGE_RANGES.filter(r => r.hours * 3600 <= maxSpanSeconds)),
+    [maxSpanSeconds]
+  )
+  // 被裁掉的范围（例如能力未就绪时选了 30d、加载后发现只支持 2d）回落到最长的
+  // 可服务预置——**不**保留一个必然 400 的选择。
   const [rangeKey, setRangeKey] = useState<string>('7d')
-  const range = USAGE_RANGES.find(r => r.key === rangeKey) ?? USAGE_RANGES[1]
+  const offeredKeys: string[] = offeredRanges.map(r => r.key)
+  const activeKey = offeredKeys.includes(rangeKey) ? rangeKey : (offeredKeys[offeredKeys.length - 1] ?? USAGE_RANGES[0].key)
+  const range = USAGE_RANGES.find(r => r.key === activeKey) ?? USAGE_RANGES[1]
   // 分桶粒度（≤72h → hour，否则 day）——分桶表时间列按粒度截断（day 只显示日期）
   const granularity: 'hour' | 'day' = range.hours <= 72 ? 'hour' : 'day'
-  const from = new Date(Date.now() - range.hours * 3600_000).toISOString()
-  const to = new Date().toISOString()
+  // 预设是网格整倍数时长：发 window=，由服务端持有 now 算出双界整点（零平移）。
+  // 客户端不再用 new Date() 算 from/to——那会把首桶平移丢掉。
+  const presetWindow = `${range.hours}h`
   const detailQ = useQuery({
-    queryKey: ['account-usage-detail', usageDetail?.ID, rangeKey],
-    queryFn: () => api.listAccountsUsage([usageDetail!.ID!], { from, to }),
+    queryKey: ['account-usage-detail', usageDetail?.ID, activeKey],
+    queryFn: () => api.listAccountsUsage([usageDetail!.ID!], { window: presetWindow }),
     enabled: !!usageDetail,
   })
   const statsQ = useQuery({
-    // 分桶 = 按浏览器时区本地桶界聚合（30d/90d 窗跨 DST 或半小时偏移时区落在
-    // 原始行保留窗外 → 服务端 400，弹窗表格回落提示；键含时区防串台）。
-    queryKey: ['account-stats-detail', usageDetail?.ID, rangeKey, browserTimeZone()],
-    queryFn: () => api.getStatsEntityTrend({ entity: 'account', id: usageDetail!.ID!, from, to, granularity, timezone: browserTimeZone() }),
-    enabled: !!usageDetail,
+    // 分桶 = 按浏览器时区本地桶界聚合。恒整点无 DST 时区（含 UTC 与 +8 这类）
+    // 走卷积表；仅窗口跨 DST 跳变或时区偏移非整小时（:30/:45）时服务端才
+    // 回落原始明细行，那时超出保留期的窗口 → 400，弹窗表格回落错误提示。键含
+    // 时区防串台。
+    queryKey: ['account-stats-detail', usageDetail?.ID, activeKey, browserTimeZone()],
+    queryFn: () => api.getStatsEntityTrend({ entity: 'account', id: usageDetail!.ID!, window: presetWindow, granularity, timezone: browserTimeZone() }),
+    // /stats/entity-trend 不在供应商面路由子集内 ⇒ 供应商作用域关闭分桶趋势
+    //（明细弹窗的汇总与尾窗走 /accounts/usage，仍可用）。
+    enabled: !!usageDetail && !isSupplierScope,
   })
   // 统计桶按 BucketTime 升序（spec 钉死）：后端 day 合并按 map 迭代返回无序
   //（实测 17/18/19/16 乱序）——末桶判定/slice(0,-1) 依赖升序，必须显式排序。
@@ -453,10 +542,13 @@ export default function Accounts() {
   )
   // 切分点不假设「上一整点」——取 stats 升序数组末桶 BucketTime 为真实边界
   //（watermark 可停在任意整点）；stats 空数组 → 不查尾窗、分桶表无补行。
+  // 上界与预设的生效上界同一取整（ceil 到整点），弹窗打开时固定一次：尾窗下界
+  // 是末桶起点，不是时长预设，所以发绝对 from/to，而不是再发一个 window=。
+  const tailTo = useMemo(() => ceilHourISO(Date.now()), [usageDetail?.ID, activeKey])
   const tailFrom = statsBuckets.length > 0 ? statsBuckets[statsBuckets.length - 1].BucketTime : undefined
   const tailQ = useQuery({
-    queryKey: ['account-stats-tail', usageDetail?.ID, rangeKey, tailFrom],
-    queryFn: () => api.listAccountsUsage([usageDetail!.ID!], { from: tailFrom!, to }),
+    queryKey: ['account-stats-tail', usageDetail?.ID, activeKey, tailFrom, tailTo],
+    queryFn: () => api.listAccountsUsage([usageDetail!.ID!], { from: tailFrom!, to: tailTo }),
     enabled: !!usageDetail && !!tailFrom,
   })
   // 尾窗补行：末桶被尾窗行原位替代（slice(0,-1)）；tailQ 失败 → 恢复完整 buckets
@@ -466,7 +558,7 @@ export default function Accounts() {
   const tailFailed = tailQ.isError && statsBuckets.length > 0
   const shownBuckets = tailItem ? statsBuckets.slice(0, -1) : statsBuckets
 
-  // rows 变化清理已不存在的勾选（M2，templates 同款思路）：refetchInterval/操作
+  // rows 变化清理已不存在的勾选（templates 同款思路）：refetchInterval/操作
   // 刷新后把已删除的行移出 selected。账号页跨页勾选是既有语义（翻页不清空），
   // 故仅同视图（offset 未变）时清理到当前页可见 ID，翻页时跳过。
   const pageOffsetRef = useRef(offset)
@@ -499,16 +591,13 @@ export default function Accounts() {
       setOrder('desc')
     }
   }
-  const toggleStatusFilter = (s: AccountStatus) => {
-    setStatusFilter(cur => (cur.includes(s) ? cur.filter(x => x !== s) : [...cur, s]))
-    resetPage()
-  }
   const changeTemplate = (v: string) => { setTemplateId(v); resetPage() }
-  const hasFilters = name !== '' || statusFilter.length > 0 || templateId !== 'all'
+  const changeEnabled = (v: string) => { setEnabledFilter(v); resetPage() }
+  const hasFilters = name !== '' || templateId !== 'all' || enabledFilter !== 'all'
   const clearFilters = () => {
     setName('')
-    setStatusFilter([])
     setTemplateId('all')
+    setEnabledFilter('all')
     resetPage()
   }
 
@@ -524,18 +613,11 @@ export default function Accounts() {
     },
   })
   const batchUpdate = useMutation({
-    mutationFn: (p: { ids: number[]; fields: AccountPatch }) => api.updateAccountsBatch(p.ids, p.fields),
+    mutationFn: (p: { ids: number[]; fields: AccountConfigPatch }) => api.updateAccountsBatch(p.ids, p.fields),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['accounts'] })
       setSelected([])
       closeBatchUpdate('submitted')
-    },
-  })
-  const batchResetCooldown = useMutation({
-    mutationFn: (ids: number[]) => api.resetAccountsCooldown(ids),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['accounts'] })
-      setSelected([])
     },
   })
   // BatchBar 的 onUpdate 返回 promise：对话框关闭（提交成功/取消）时 resolve。
@@ -581,22 +663,39 @@ export default function Accounts() {
     }
   }, [isBatchCodex, batchForm.base_url, batchForm.clearBaseURL])
   const submitBatchUpdate = () => {
-    const fields: AccountPatch = {}
+    const fields: AccountConfigPatch = {}
     if (batchForm.name.trim()) fields.name = batchForm.name.trim()
     if (batchForm.upstream_key) fields.upstream_key = batchForm.upstream_key
-    // base_url 批量三态（C1）：勾选清空 → "" = 清空（回继承模板）；
+    // base_url 三态：勾选清空 → null = 清空（回继承模板）；
     // 未勾选且输入非空 → 落值；未勾选且空 → 不变（不发送）
     // 含 Codex 时禁止提交 base_url
     if (!isBatchCodex) {
-      if (batchForm.clearBaseURL) fields.base_url = ''
+      if (batchForm.clearBaseURL) fields.base_url = null
       else if (batchForm.base_url.trim()) fields.base_url = batchForm.base_url.trim()
     }
-    if (batchForm.status !== 'all') fields.status = batchForm.status
-    if (batchForm.weight !== '') fields.weight = Number(batchForm.weight)
     if (batchForm.max_concurrency !== '') fields.max_concurrency = Number(batchForm.max_concurrency)
     if (batchForm.template_id !== 'all') fields.template_id = Number(batchForm.template_id)
     if (batchForm.clearGroups) fields.group_ids = []
     else if (batchForm.group_ids.length > 0) fields.group_ids = batchForm.group_ids.map(Number)
+    // 启停/缓存域/倍率：AccountConfigPatch 的批量契约字段（API 侧全字段可批量，
+    // 无需改契约）。倍率/缓存域先做 UI 边界校验（镜像后端），非法则整单拒绝。
+    const dom = batchForm.cache_domain.trim()
+    if (dom && !validCacheDomain(dom)) {
+      setBatchFormErr(t('accounts.cacheDomain.invalid'))
+      return
+    }
+    let mult: number | null = null
+    if (batchForm.multiplier.trim()) {
+      mult = parseMultiplier(batchForm.multiplier)
+      if (mult === null) {
+        setBatchFormErr(t('accounts.multiplier.invalid'))
+        return
+      }
+    }
+    if (batchForm.enabled !== 'all') fields.enabled = batchForm.enabled === 'true'
+    if (batchForm.clearCacheDomain) fields.cache_domain = null
+    else if (dom) fields.cache_domain = dom
+    if (mult !== null) fields.upstream_cost_multiplier = mult
     if (Object.keys(fields).length === 0) {
       setBatchFormErr(t('accounts.batchUpdateEmpty'))
       return
@@ -611,7 +710,21 @@ export default function Accounts() {
   const [deleting, setDeleting] = useState<AccountView | null>(null)
   const [importOpen, setImportOpen] = useState(false)
 
-  // 编辑回显（评审 I-1 方案 B）：对话框挂载时拉取当前分组；数据未到前禁用
+  // —— 生命周期编辑弹窗（倍率/缓存域；各自独立 fenced 写，打开时取行内代际）——
+  const [multTarget, setMultTarget] = useState<AccountView | null>(null)
+  const [multValue, setMultValue] = useState('')
+  const [domainTarget, setDomainTarget] = useState<AccountView | null>(null)
+  const [domainValue, setDomainValue] = useState('')
+  const openMult = (a: AccountView) => {
+    setMultTarget(a)
+    setMultValue(String(a.UpstreamCostMultiplier ?? 1))
+  }
+  const openDomain = (a: AccountView) => {
+    setDomainTarget(a)
+    setDomainValue(a.CacheDomain ?? '')
+  }
+
+  // 编辑回显（方案 B）：对话框挂载时拉取当前分组；数据未到前禁用
   // 保存与分组多选（防未加载完提交误发 [] 清空）。
   const groupsEcho = useQuery({
     queryKey: ['account-groups', editing?.ID],
@@ -649,6 +762,7 @@ export default function Accounts() {
         codex_oauth_expires_at: d.codex_oauth_expires_at ? toLocalDT(d.codex_oauth_expires_at) : '',
         codex_pat_key: d.codex_pat_key ?? '',
         codex_email: d.codex_email ?? '',
+        codex_account_id: d.codex_account_id ?? '',
       }))
     }
   }, [editing, extEcho.isLoading, extEcho.data])
@@ -666,8 +780,16 @@ export default function Accounts() {
 
   // 表单直填凭据：codex 类型账号本体（upstream_key 可空）+ 链式 PUT account_ext
   // （codex_oauth_* 列组 / codex_pat_key 按模板类型分流；与「扩展配置」弹窗共用写路径）。
+  // 创建与编辑各一次请求落全部字段（含倍率与缓存域）：创建走 POST /accounts，
+  // 编辑走 PATCH /accounts/{id}（If-Match = 读到的代际，陈旧 → 412）。
+  // 失败 throw → 内联错误展示（对话框保持打开可重试）。
   const save = useMutation({
-    mutationFn: async (f: FormState) => {
+    mutationFn: async (f: FormState): Promise<void> => {
+      const mult = parseMultiplier(f.cost_multiplier)
+      if (mult === null) throw new Error(t('accounts.multiplier.invalid'))
+      const domTrim = f.cache_domain.trim()
+      if (domTrim !== '' && !validCacheDomain(domTrim)) throw new Error(t('accounts.cacheDomain.invalid'))
+      const newDom = domTrim === '' ? null : domTrim
       // 计算有效凭据：未改时以嵌入 Template 为准，变更时查替换模板，未解析时禁用
       const isUnchangedForF = !!(editing && String(editing.TemplateID) === String(f.template_id))
       const tplForF = isUnchangedForF ? null : templates.find(p => String(p.ID) === String(f.template_id))
@@ -677,16 +799,15 @@ export default function Accounts() {
       const unresolved = !!f.template_id && effCt == null
       const isCodexForBody = isCodexCt(effCt) || unresolved
       const ct = effCt
-      // structurally force base_url null for Codex/unresolved even if form still stale
-      const bodyForCreate = toBody(f, false, isCodexForBody)
-      const id = editing?.ID ?? (await api.createAccount(bodyForCreate)).ID
-      if (editing) await api.updateAccount(id!, toBody(f, true, isCodexForBody))
-      if (id && isCodexCt(ct)) {
+      const saveCodexExt = async (id: number) => {
+        if (!(id && isCodexCt(ct))) return
         const cur = extEcho.data
         const extBody: AccountExt = {
           account_id: id,
           credential_type: ct,
           codex_email: (f.codex_email?.trim() ?? cur?.codex_email ?? null) as string | null | undefined,
+          // PUT 全列更新：缺省字段按 NULL 落盘
+          codex_account_id: codexAccountIdBody(f.codex_account_id, cur?.codex_account_id),
           ...(ct === 'codex-oauth'
             ? {
                 codex_oauth_token: f.codex_oauth_token.trim() || null,
@@ -705,6 +826,37 @@ export default function Accounts() {
         }
         await api.putAccountExt(id, extBody)
       }
+      // 归属供应商（仅管理面作用域；供应商面恒隐含 JWT 本人）。空 = 不发送。
+      // 值由 SupplierPicker 唯一写入（只产出数字串或 ''），无需再校验。
+      const ownerRaw = isSupplierScope ? '' : f.supplier_user_id.trim()
+      const ownerUID = ownerRaw === '' ? null : Number(ownerRaw)
+      if (!editing) {
+        // 创建：一次 POST 落全部字段（倍率非 ×1 时随体带，无补写腿）
+        // structurally force base_url null for Codex/unresolved even if form still stale
+        const body = toBody(f, null, isCodexForBody)
+        if (mult !== 1) body.upstream_cost_multiplier = mult
+        if (ownerUID != null) body.supplier_user_id = ownerUID
+        const created = await api.createAccount(body)
+        await saveCodexExt(created.ID!)
+        return
+      }
+      // 编辑：一次 PATCH 落全部变更（仅变化项才带倍率/缓存域；缺席 = 不变）
+      const id = editing.ID!
+      const normMult = (v?: number | null) => Math.round((v ?? 1) * 10000) / 10000
+      const patch: AccountConfigPatch = toBody(f, editing, isCodexForBody)
+      if (mult !== normMult(editing.UpstreamCostMultiplier)) patch.upstream_cost_multiplier = mult
+      if (newDom !== (editing.CacheDomain ?? null)) patch.cache_domain = newDom
+      // 归属三态（AccountView 现回显）：勾选清空 ⇒ null；显式填值 ⇒ 分配；
+      // 字段被清空且原有归属 ⇒ 清空；其余 ⇒ 缺席（保持原归属不变）。
+      if (!isSupplierScope) {
+        const currentOwner = editing.supplier_user_id ?? null
+        if (f.clearOwner) patch.supplier_user_id = null
+        else if (ownerUID != null) patch.supplier_user_id = ownerUID
+        else if (currentOwner != null) patch.supplier_user_id = null
+      }
+      await api.updateAccount(id, patch, editing.LifecycleRevision)
+      await saveCodexExt(id)
+      return
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['accounts'] })
@@ -712,10 +864,59 @@ export default function Accounts() {
       toast.add({ title: t('accounts.saveSuccess'), type: 'success' })
     },
   })
-  const toggle = useMutation({
+  // —— 生命周期 fenced 动作（CAS：expected_revision = 读到的 LifecycleRevision；
+  // 409 = 他端已变更 → 提示 + 重读列表后重试；revision 缺失 → 按钮禁用 fail-closed）——
+  const lifecycleErr = (e: unknown) => {
+    if (e instanceof ApiUnauthorized) return // 401 全局拦截收敛，不叠加 toast
+    if (e instanceof ApiError && (e.status === 409 || e.status === 412)) {
+      toast.add({ title: t('accounts.conflict'), type: 'error' })
+      qc.invalidateQueries({ queryKey: ['accounts'] })
+      return
+    }
+    toast.add({ title: (e as Error)?.message ?? String(e), type: 'error' })
+  }
+  // 管理面启停（PATCH 的 enabled 字段）：与运行时失效恢复（/recover）语义分离——
+  // enable 不清失效。
+  const setEnabled = useMutation({
     mutationFn: (a: AccountView) =>
-      api.updateAccount(a.ID!, toggleBody(a, a.Status === 'disabled' ? 'active' : 'disabled')),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['accounts'] }),
+      api.updateAccount(a.ID!, { enabled: a.Enabled !== true }, a.LifecycleRevision),
+    onSuccess: (_acc, a) => {
+      qc.invalidateQueries({ queryKey: ['accounts'] })
+      toast.add({ title: t(a.Enabled !== true ? 'accounts.enableSuccess' : 'accounts.disableSuccess'), type: 'success' })
+    },
+    onError: lifecycleErr,
+  })
+  // 失效恢复唯一入口（/recover）：清 failed_at/last_error/failure_source + revision +1
+  // → 新代际 PROBING（探针环接管，READY 前不吃正常流量）。
+  const recover = useMutation({
+    mutationFn: (a: AccountView) => api.recoverAccount(a.ID!, { expected_revision: a.LifecycleRevision ?? 0 }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['accounts'] })
+      toast.add({ title: t('accounts.recoverSuccess'), type: 'success' })
+    },
+    onError: lifecycleErr,
+  })
+  // 采购成本倍率（PATCH 的 upstream_cost_multiplier；正常值 ×0–×10，UI 边界校验镜像后端）
+  const multSave = useMutation({
+    mutationFn: (p: { id: number; multiplier: number; expectedRevision: number }) =>
+      api.updateAccount(p.id, { upstream_cost_multiplier: p.multiplier }, p.expectedRevision),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['accounts'] })
+      setMultTarget(null)
+      toast.add({ title: t('accounts.multiplier.saveSuccess'), type: 'success' })
+    },
+    onError: lifecycleErr,
+  })
+  // 缓存域（PATCH 的 cache_domain；null = 清空回账号私有域）
+  const domainSave = useMutation({
+    mutationFn: (p: { id: number; cacheDomain: string | null; expectedRevision: number }) =>
+      api.updateAccount(p.id, { cache_domain: p.cacheDomain }, p.expectedRevision),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['accounts'] })
+      setDomainTarget(null)
+      toast.add({ title: t('accounts.cacheDomain.saveSuccess'), type: 'success' })
+    },
+    onError: lifecycleErr,
   })
   const remove = useMutation({
     mutationFn: (id: number) => api.deleteAccount(id),
@@ -733,6 +934,9 @@ export default function Accounts() {
     // Use effectiveSelCt (fail-closed) so delayed template query does not bypass validation
     if (!form.name.trim() || !form.template_id) return
     if (isSelUnresolved) return // fail-closed: do not submit while unresolved
+    if (parseMultiplier(form.cost_multiplier) === null) return
+    const domTrim = form.cache_domain.trim()
+    if (domTrim !== '' && !validCacheDomain(domTrim)) return
     const ct = effectiveSelCt
     if (ct === 'codex-oauth' && !form.codex_oauth_token.trim()) return
     if (ct === 'codex-pat' && !form.codex_pat_key.trim()) return
@@ -742,7 +946,7 @@ export default function Accounts() {
 
   // —— 扩展配置（codex-oauth/codex-pat 模板；GET 404 = 无 ext 行 → 空表单，credential_type 预填模板类型） ——
   const [extTarget, setExtTarget] = useState<AccountView | null>(null)
-  const [extForm, setExtForm] = useState({ codex_oauth_token: '', codex_oauth_refresh_token: '', codex_oauth_expires_at: '', codex_pat_key: '', codex_email: '' })
+  const [extForm, setExtForm] = useState({ codex_oauth_token: '', codex_oauth_refresh_token: '', codex_oauth_expires_at: '', codex_pat_key: '', codex_email: '', codex_account_id: '' })
   const extQ = useQuery({
     queryKey: ['account-ext', extTarget?.ID],
     queryFn: async () => {
@@ -757,7 +961,7 @@ export default function Accounts() {
   })
   const openExt = (a: AccountView) => {
     setExtTarget(a)
-    setExtForm({ codex_oauth_token: '', codex_oauth_refresh_token: '', codex_oauth_expires_at: '', codex_pat_key: '', codex_email: '' })
+    setExtForm({ codex_oauth_token: '', codex_oauth_refresh_token: '', codex_oauth_expires_at: '', codex_pat_key: '', codex_email: '', codex_account_id: '' })
   }
   // 读回显填充（404/无数据 = 保持空表单）
   useEffect(() => {
@@ -769,6 +973,7 @@ export default function Accounts() {
         codex_oauth_expires_at: d.codex_oauth_expires_at ? toLocalDT(d.codex_oauth_expires_at) : '',
         codex_pat_key: d.codex_pat_key ?? '',
         codex_email: d.codex_email ?? '',
+        codex_account_id: d.codex_account_id ?? '',
       })
     }
   }, [extTarget, extQ.isLoading, extQ.data])
@@ -783,6 +988,8 @@ export default function Accounts() {
         account_id: a.ID,
         credential_type: ct,
         codex_email: extForm.codex_email.trim() || null,
+        // PUT 全列更新：缺省字段按 NULL 落盘
+        codex_account_id: codexAccountIdBody(extForm.codex_account_id, cur?.codex_account_id),
         // 类型-列组约束（service 校验）：oauth 只允许 codex_oauth_* 列组；pat 只允许 codex_pat_key（其余置 NULL）
         ...(ct === 'codex-oauth'
           ? {
@@ -843,34 +1050,17 @@ export default function Accounts() {
         </div>
       </div>
 
+      {/* 必须提示（spec §6.1 L178/L838）：「未分配分组的账号不接流量」——
+          新账号默认无分组；无分组账号不入任何快照、对流量是空集 no-op。
+          「无需审核」≠「自动可用」：供应商若以为提交即生效会长期零收益。 */}
+      <Alert data-od-id="accounts-ungrouped-notice" className="border-amber-500/30 bg-amber-500/5">
+        <AlertDescription className="text-sm">{t('accounts.ungroupedNotice')}</AlertDescription>
+      </Alert>
+
       <ListToolbar
         name={name}
         onNameChange={changeName}
       >
-        {/* status 多选筛选（逗号拼接传参） */}
-        <Popover>
-          <PopoverTrigger render={<Button variant="outline" size="lg" />}>
-            <Filter />
-            {statusFilter.length > 0
-              ? statusFilter.map(s => t(`status.${s}`)).join(', ')
-              : t('accounts.filterStatus')}
-          </PopoverTrigger>
-          <PopoverContent className="w-48 p-2">
-            <div className="space-y-0.5">
-              {STATUSES.map(s => (
-                <label key={s} className="flex cursor-pointer items-center gap-2.5 rounded-md px-2 py-1.5 hover:bg-muted">
-                  <Checkbox checked={statusFilter.includes(s)} onCheckedChange={() => toggleStatusFilter(s)} />
-                  <span className="text-sm">{t(`status.${s}`)}</span>
-                </label>
-              ))}
-            </div>
-            {statusFilter.length > 0 && (
-              <Button variant="ghost" size="sm" className="mt-1 w-full" onClick={clearFilters}>
-                {t('list.reset')}
-              </Button>
-            )}
-          </PopoverContent>
-        </Popover>
         {/* template 精确筛选 */}
         <Select
           items={Object.fromEntries([['all', t('accounts.allTemplates')], ...templates.map(tp => [String(tp.ID), tp.Name ?? `#${tp.ID}`])])}
@@ -887,13 +1077,28 @@ export default function Accounts() {
             ))}
           </SelectContent>
         </Select>
+        {/* 启停三态筛选（管理面 enabled；与运行时失效 failed_at 无关） */}
+        <Select
+          items={{ all: t('accounts.state.all'), true: t('accounts.state.enabled'), false: t('accounts.state.disabled') }}
+          value={enabledFilter}
+          onValueChange={changeEnabled}
+        >
+          <SelectTrigger size="default" className="w-36 data-[size=default]:h-9" aria-label={t('accounts.filterState')}>
+            <SelectValue placeholder={t('accounts.filterState')} />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all" label={t('accounts.state.all')}>{t('accounts.state.all')}</SelectItem>
+            <SelectItem value="true" label={t('accounts.state.enabled')}>{t('accounts.state.enabled')}</SelectItem>
+            <SelectItem value="false" label={t('accounts.state.disabled')}>{t('accounts.state.disabled')}</SelectItem>
+          </SelectContent>
+        </Select>
       </ListToolbar>
 
       {/* 列设置（usage 列开关控制懒加载查询） */}
       <div className="flex justify-end">
         <DropdownMenu>
           <DropdownMenuTrigger render={<Button variant="outline" size="sm"><SlidersHorizontal className="size-4" />{t('accounts.columnSettings')}</Button>} />
-          <DropdownMenuContent align="end" className="max-h-80 w-48">
+          <DropdownMenuContent align="end" className="w-48">
             <DropdownMenuGroup>
               <DropdownMenuLabel>{t('accounts.columnSettings')}</DropdownMenuLabel>
               {ACCOUNTS_HIDDENABLE_COLS.map(key => (
@@ -916,9 +1121,6 @@ export default function Accounts() {
           batchResolve.current = resolve
           openBatchUpdate()
         })}
-        onResetCooldown={async () => {
-          await batchResetCooldown.mutateAsync(selected)
-        }}
       />
 
       {isError ? (
@@ -943,8 +1145,8 @@ export default function Accounts() {
       ) : (
         <>
           <Card className="bg-transparent border-0 shadow-none backdrop-blur-none p-0 gap-0">
-          <ScrollArea className="rounded-[14px] border border-transparent bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] after:pointer-events-none after:absolute after:inset-0 after:z-20 after:rounded-[14px] after:border after:border-[rgba(19,45,83,0.26)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:after:border-[rgba(148,180,220,0.32)]" showHorizontal>
-            <Table ref={tableRef} containerClassName="overflow-x-visible border-0 shadow-none rounded-none bg-transparent backdrop-blur-none" className="min-w-[1080px]">
+          <ScrollArea className="rounded-[14px] border border-[rgba(19,45,83,0.26)] bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:border-[rgba(148,180,220,0.32)]" showHorizontal>
+            <Table ref={tableRef} containerClassName="overflow-x-visible border-0 shadow-none rounded-none bg-transparent backdrop-blur-none" className="min-w-[1400px]">
               <TableHeader>
                 <TableRow>
                   <TableHead className="w-10">
@@ -955,15 +1157,17 @@ export default function Accounts() {
                     />
                   </TableHead>
                   <SortableHeader field="id" label="ID" active={activeSort === 'id'} order={order} onToggle={onColumnToggle} />
-                  <SortableHeader field="name" label={t('accounts.table.name')} active={activeSort === 'name'} order={order} onToggle={onColumnToggle} />
-                  <SortableHeader field="template_id" label={t('accounts.table.template')} active={activeSort === 'template_id'} order={order} onToggle={onColumnToggle} />
-                  <SortableHeader field="status" label={t('accounts.table.status')} active={activeSort === 'status'} order={order} onToggle={onColumnToggle} />
-                  <SortableHeader field="weight" label={t('accounts.table.weight')} active={activeSort === 'weight'} order={order} onToggle={onColumnToggle} className="text-right [&_button]:justify-end" />
-                  <SortableHeader field="max_concurrency" label={t('accounts.table.maxConcurrency')} active={activeSort === 'max_concurrency'} order={order} onToggle={onColumnToggle} className="text-right [&_button]:justify-end" />
-                  <TableHead className="text-right">{t('accounts.table.curConcurrency')}</TableHead>
-                  <TableHead className="text-right">{t('accounts.table.errRate')}</TableHead>
-                  <TableHead className="text-right">{t('accounts.table.errCount')}</TableHead>
-                  <TableHead>{t('accounts.table.lastError')}</TableHead>
+                  {isColVisible('name') && <SortableHeader field="name" label={t('accounts.table.name')} active={activeSort === 'name'} order={order} onToggle={onColumnToggle} />}
+                  {isColVisible('template') && <SortableHeader field="template_id" label={t('accounts.table.template')} active={activeSort === 'template_id'} order={order} onToggle={onColumnToggle} />}
+                  {isColVisible('state') && <TableHead>{t('accounts.table.state')}</TableHead>}
+                  {isColVisible('maxConcurrency') && <SortableHeader field="max_concurrency" label={t('accounts.table.maxConcurrency')} active={activeSort === 'max_concurrency'} order={order} onToggle={onColumnToggle} className="text-right [&_button]:justify-end" />}
+                  {isColVisible('curConcurrency') && <TableHead className="text-right">{t('accounts.table.curConcurrency')}</TableHead>}
+                  {isColVisible('errRate') && <TableHead className="text-right">{t('accounts.table.errRate')}</TableHead>}
+                  {isColVisible('errCount') && <TableHead className="text-right">{t('accounts.table.errCount')}</TableHead>}
+                  {isColVisible('costMultiplier') && <TableHead className="text-right">{t('accounts.table.costMultiplier')}</TableHead>}
+                  {isColVisible('cacheDomain') && <TableHead>{t('accounts.table.cacheDomain')}</TableHead>}
+                  {isColVisible('revision') && <TableHead className="text-right" title={t('accounts.table.revisionHint')}>{t('accounts.table.revision')}</TableHead>}
+                  {isColVisible('lastError') && <TableHead>{t('accounts.table.lastError')}</TableHead>}
                   {isColVisible('usage') && <TableHead className="text-center">{t('accounts.table.usage')}</TableHead>}
                   <TableHead className="text-right">{t('accounts.table.actions')}</TableHead>
                 </TableRow>
@@ -975,32 +1179,50 @@ export default function Accounts() {
                       <Checkbox checked={selected.includes(a.ID!)} onCheckedChange={() => toggleRow(a.ID!)} />
                     </TableCell>
                     <TableCell className="tabular-nums">{a.ID}</TableCell>
-                    <TableCell className="max-w-32 truncate" title={a.Name}>{a.Name}</TableCell>
-                    <TableCell className="max-w-32 truncate" title={templateName(a)}>{templateName(a)}</TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-1.5">
-                        <StatusBadge status={a.Status} />
-                        {/* A-4：冷却标识（CooldownUntil 未过期即标出，status=active 也显示） */}
-                        <CooldownBadge cooldownUntil={a.CooldownUntil} />
-                      </div>
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">{a.Weight ?? 0}</TableCell>
-                    <TableCell className="text-right tabular-nums">{a.MaxConcurrency ?? 8}</TableCell>
-                    <TableCell className="text-right tabular-nums">{a.concurrency ?? 0}</TableCell>
-                    <TableCell className="text-right tabular-nums">{formatPercent(a.err_rate)}</TableCell>
-                    <TableCell className="text-right tabular-nums">{a.err_count ?? 0}</TableCell>
-                    <TableCell className="max-w-40">
-                      {a.LastError ? (
-                        <Tooltip>
-                          <TooltipTrigger render={<span className="block cursor-help truncate text-xs text-muted-foreground" />}>
-                            {truncate(a.LastError, 20)}
-                          </TooltipTrigger>
-                          <TooltipContent>{a.LastError}</TooltipContent>
-                        </Tooltip>
-                      ) : (
-                        <span className="text-xs text-muted-foreground">—</span>
-                      )}
-                    </TableCell>
+                    {isColVisible('name') && <TableCell className="max-w-32 truncate" title={a.Name}>{a.Name}</TableCell>}
+                    {isColVisible('template') && <TableCell className="max-w-32 truncate" title={templateName(a)}>{templateName(a)}</TableCell>}
+                    {isColVisible('state') && (
+                      <TableCell>
+                        <LifecycleBadges a={a} />
+                      </TableCell>
+                    )}
+                    {isColVisible('maxConcurrency') && <TableCell className="text-right tabular-nums">{a.MaxConcurrency ?? 8}</TableCell>}
+                    {isColVisible('curConcurrency') && <TableCell className="text-right tabular-nums">{a.concurrency ?? 0}</TableCell>}
+                    {isColVisible('errRate') && <TableCell className="text-right tabular-nums">{formatPercent(a.err_rate)}</TableCell>}
+                    {isColVisible('errCount') && <TableCell className="text-right tabular-nums">{a.err_count ?? 0}</TableCell>}
+                    {isColVisible('costMultiplier') && (
+                      <TableCell
+                        className="cursor-pointer text-right tabular-nums"
+                        title={t('accounts.multiplier.hint')}
+                        onClick={() => openMult(a)}
+                      >
+                        {fmtMult(a.UpstreamCostMultiplier)}
+                      </TableCell>
+                    )}
+                    {isColVisible('cacheDomain') && (
+                      <TableCell
+                        className="max-w-40 cursor-pointer truncate"
+                        title={t('accounts.cacheDomain.hint')}
+                        onClick={() => openDomain(a)}
+                      >
+                        {a.CacheDomain ?? <span className="text-xs text-muted-foreground">{t('accounts.cacheDomain.private')}</span>}
+                      </TableCell>
+                    )}
+                    {isColVisible('revision') && <TableCell className="text-right tabular-nums text-muted-foreground">{a.LifecycleRevision ?? '—'}</TableCell>}
+                    {isColVisible('lastError') && (
+                      <TableCell className="max-w-40">
+                        {a.LastError ? (
+                          <Tooltip>
+                            <TooltipTrigger render={<span className="block cursor-help truncate text-xs text-muted-foreground" />}>
+                              {truncate(a.LastError, 20)}
+                            </TooltipTrigger>
+                            <TooltipContent>{a.LastError}</TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">—</span>
+                        )}
+                      </TableCell>
+                    )}
                     {isColVisible('usage') && (
                       <TableCell
                         className="cursor-pointer text-center"
@@ -1020,17 +1242,31 @@ export default function Accounts() {
                         <Button
                           variant="ghost"
                           size="icon-sm"
-                          title={a.Status === 'disabled' ? t('accounts.enable') : t('accounts.disable')}
-                          onClick={() => toggle.mutate(a)}
-                          disabled={toggle.isPending}
+                          title={a.Enabled === true ? t('accounts.disable') : t('accounts.enable')}
+                          aria-label={a.Enabled === true ? t('accounts.disable') : t('accounts.enable')}
+                          onClick={() => setEnabled.mutate(a)}
+                          disabled={setEnabled.isPending || a.LifecycleRevision == null}
                         >
-                          {a.Status === 'disabled' ? <CircleCheck /> : <Ban />}
+                          {a.Enabled === true ? <Ban /> : <CircleCheck />}
                         </Button>
+                        {/* 失效恢复与启停语义分离：仅 failed_at 置位时出现（enable 不清失效） */}
+                        {a.FailedAt && (
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            title={t('accounts.recover')}
+                            aria-label={t('accounts.recover')}
+                            onClick={() => recover.mutate(a)}
+                            disabled={recover.isPending || a.LifecycleRevision == null}
+                          >
+                            <RotateCcw />
+                          </Button>
+                        )}
                         {isCodexTemplate(a) && (
                           <Button variant="ghost" size="icon-sm" title={t('accounts.ext.button')} onClick={() => openExt(a)}><Settings2 /></Button>
                         )}
-                        <Button variant="ghost" size="icon-sm" title={t('common.edit')} onClick={() => openEdit(a)}><Pencil /></Button>
-                        <Button variant="ghost" size="icon-sm" className="text-destructive" title={t('common.delete')} onClick={() => setDeleting(a)}><Trash2 /></Button>
+                        <Button variant="ghost" size="icon-sm" title={t('common.edit')} aria-label={t('common.edit')} onClick={() => openEdit(a)}><Pencil /></Button>
+                        <Button variant="ghost" size="icon-sm" className="text-destructive" title={t('common.delete')} aria-label={t('common.delete')} onClick={() => setDeleting(a)}><Trash2 /></Button>
                       </div>
                     </TableCell>
                   </TableRow>
@@ -1047,7 +1283,7 @@ export default function Accounts() {
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>{editing ? t('accounts.editTitle', { id: editing.ID }) : t('accounts.newTitle')}</DialogTitle>
+            <DialogTitle>{editing ? t('accounts.editTitle', { id: editing.ID ?? 0 }) : t('accounts.newTitle')}</DialogTitle>
             <DialogDescription>{t('accounts.dialogDesc')}</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
@@ -1055,6 +1291,31 @@ export default function Accounts() {
               <Label htmlFor="acc-name">{t('accounts.nameLabel')}</Label>
               <Input id="acc-name" value={form.name} placeholder={t('accounts.namePlaceholder')} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} />
             </div>
+            {/* 归属供应商（仅管理面作用域）：把账号分配给供应商的唯一入口（spec §6.1 L834）。
+                供应商面不展示（服务端把归属恒定为 JWT 本人）。 */}
+            {!isSupplierScope && (
+              <div className="space-y-1.5">
+                <Label htmlFor="acc-owner">{t('accounts.owner.label')}</Label>
+                <SupplierPicker
+                  id="acc-owner"
+                  value={form.supplier_user_id}
+                  onChange={v => setForm(f => ({ ...f, supplier_user_id: v }))}
+                  placeholder={t('accounts.owner.placeholder')}
+                  disabled={form.clearOwner}
+                  disableInactive
+                />
+                <p className="text-xs text-muted-foreground">{t('accounts.owner.hint')}</p>
+                {editing && (
+                  <label className="flex items-center gap-2">
+                    <Checkbox
+                      checked={form.clearOwner}
+                      onCheckedChange={c => setForm(f => ({ ...f, clearOwner: c === true }))}
+                    />
+                    <span className="text-sm">{t('accounts.owner.clear')}</span>
+                  </label>
+                )}
+              </div>
+            )}
             <div className="space-y-1.5">
               <Label>{t('accounts.templateLabel')}</Label>
               <Select
@@ -1145,6 +1406,17 @@ export default function Accounts() {
                 <Input id="acc-key" type="password" value={form.upstream_key} placeholder="sk-..." onChange={e => setForm(f => ({ ...f, upstream_key: e.target.value }))} />
               </div>
             )}
+            {isCodexCt(effectiveSelCt) && (
+              <div className="space-y-1.5">
+                <Label htmlFor="acc-account-id">{t('accounts.ext.accountId')}</Label>
+                <Input
+                  id="acc-account-id"
+                  value={form.codex_account_id}
+                  placeholder={t('accounts.ext.accountIdPlaceholder')}
+                  onChange={e => setForm(f => ({ ...f, codex_account_id: e.target.value }))}
+                />
+              </div>
+            )}
             {/* Codex 不可配置 BaseURL，隐藏并清空；其他类型保留覆盖 */}
             {isSelCodex ? (
               <p className="text-xs text-muted-foreground">{t('accounts.baseUrlCodexHidden')}</p>
@@ -1160,28 +1432,41 @@ export default function Accounts() {
                 <p className="text-xs text-muted-foreground">{t('accounts.baseUrlHint')}</p>
               </div>
             )}
-            <div className="grid grid-cols-3 gap-3">
-              <div className="space-y-1.5">
-                <Label>{t('accounts.statusLabel')}</Label>
-                <Select
-                  items={Object.fromEntries(STATUSES.map(s => [s, t(`status.${s}`)]))}
-                  value={form.status}
-                  onValueChange={v => setForm(f => ({ ...f, status: v as AccountStatus }))}
-                >
-                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    {STATUSES.map(s => <SelectItem key={s} value={s} label={t(`status.${s}`)}>{t(`status.${s}`)}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="acc-weight">{t('accounts.weightLabel')}</Label>
-                <Input id="acc-weight" type="number" min={0} value={form.weight} onChange={e => setForm(f => ({ ...f, weight: e.target.value }))} />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="acc-max">{t('accounts.maxLabel')}</Label>
-                <Input id="acc-max" type="number" min={1} value={form.max_concurrency} onChange={e => setForm(f => ({ ...f, max_concurrency: e.target.value }))} />
-              </div>
+            {/* 生命周期直配（创建/编辑表单）：倍率默认 ×1，缓存域留空 =
+                账号私有域。随创建/PATCH 请求体一次落库（编辑态仅变化项才带）；
+                列表行内弹窗保留（点击倍率/缓存域单元格）。 */}
+            <div className="space-y-1.5 max-w-40">
+              <Label htmlFor="acc-max">{t('accounts.maxLabel')}</Label>
+              <Input id="acc-max" type="number" min={1} value={form.max_concurrency} onChange={e => setForm(f => ({ ...f, max_concurrency: e.target.value }))} />
+            </div>
+            <div className="space-y-1.5 max-w-40">
+              <Label htmlFor="acc-form-mult">{t('accounts.multiplier.label')}</Label>
+              <Input
+                id="acc-form-mult"
+                type="number"
+                min={0}
+                max={10}
+                step={0.0001}
+                value={form.cost_multiplier}
+                onChange={e => setForm(f => ({ ...f, cost_multiplier: e.target.value }))}
+              />
+              <p className="text-xs text-muted-foreground">{t('accounts.multiplier.rangeHint')}</p>
+              {form.cost_multiplier.trim() !== '' && parseMultiplier(form.cost_multiplier) === null && (
+                <p className="text-sm text-destructive">{t('accounts.multiplier.invalid')}</p>
+              )}
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="acc-form-domain">{t('accounts.cacheDomain.label')}</Label>
+              <Input
+                id="acc-form-domain"
+                value={form.cache_domain}
+                placeholder={t('accounts.cacheDomain.placeholder')}
+                onChange={e => setForm(f => ({ ...f, cache_domain: e.target.value }))}
+              />
+              <p className="text-xs text-muted-foreground">{form.cache_domain.trim() === '' ? t('accounts.cacheDomain.currentPrivate') : t('accounts.cacheDomain.currentShared')}</p>
+              {form.cache_domain.trim() !== '' && !validCacheDomain(form.cache_domain.trim()) && (
+                <p className="text-sm text-destructive">{t('accounts.cacheDomain.invalid')}</p>
+              )}
             </div>
             <div className="space-y-1.5">
               <Label>{t('accounts.groupLabel')}</Label>
@@ -1189,7 +1474,7 @@ export default function Accounts() {
                 groups={groups}
                 value={form.group_ids}
                 onChange={v => setForm(f => ({ ...f, group_ids: v }))}
-                disabled={editing && !groupsLoaded}
+                disabled={!!editing && !groupsLoaded}
               />
               <p className="text-xs text-muted-foreground">{t('accounts.groupHint')}</p>
               {editing && groupsEcho.isError && (
@@ -1209,10 +1494,15 @@ export default function Accounts() {
                 !form.name.trim() ||
                 !form.template_id ||
                 isSelUnresolved ||
+                parseMultiplier(form.cost_multiplier) === null ||
+                (form.cache_domain.trim() !== '' && !validCacheDomain(form.cache_domain.trim())) ||
                 (effectiveSelCt === 'codex-oauth' && !form.codex_oauth_token.trim()) ||
                 (effectiveSelCt === 'codex-pat' && !form.codex_pat_key.trim()) ||
                 (!isCodexCt(effectiveSelCt) && form.upstream_key === '') ||
-                (editing && !groupsLoaded)
+                (!!editing && !groupsLoaded) ||
+                // codex 编辑时 ext 回显未到先禁用保存：echo 行 cur 为 undefined
+                // 会使 account id 回退到 null，PUT 全列更新将清空已存值（groups 同款门禁）
+                (!!editing && isSelCodex && extEcho.isLoading)
               }
             >
               {save.isPending ? t('common.saving') : editing ? t('common.saveChanges') : t('common.create')}
@@ -1227,7 +1517,7 @@ export default function Accounts() {
           <DialogHeader>
             <DialogTitle>{t('accounts.deleteTitle')}</DialogTitle>
             <DialogDescription>
-              {t('accounts.deleteDesc', { name: deleting?.Name })}
+              {t('accounts.deleteDesc', { name: deleting?.Name ?? '' })}
             </DialogDescription>
           </DialogHeader>
           {remove.isError && errMsg(remove.error) && (
@@ -1242,7 +1532,7 @@ export default function Accounts() {
         </DialogContent>
       </Dialog>
 
-      {/* —— 批量更新对话框：AccountPatch 字段子集（空 = 保持原值） —— */}
+      {/* —— 批量更新对话框：AccountConfigPatch 字段子集（缺席 = 保持原值） —— */}
       <Dialog open={batchUpdateOpen} onOpenChange={o => { if (!o) closeBatchUpdate() }}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
@@ -1273,21 +1563,9 @@ export default function Accounts() {
                 <span className="text-sm">{t('accounts.clearBaseUrl')}</span>
               </label>
             </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-1.5">
-                <Label>{t('accounts.statusLabel')}</Label>
-                <Select
-                  items={Object.fromEntries([['all', t('list.unchanged')], ...STATUSES.map(s => [s, t(`status.${s}`)])])}
-                  value={batchForm.status}
-                  onValueChange={v => setBatchForm(f => ({ ...f, status: v as BatchStatus }))}
-                >
-                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all" label={t('list.unchanged')}>{t('list.unchanged')}</SelectItem>
-                    {STATUSES.map(s => <SelectItem key={s} value={s} label={t(`status.${s}`)}>{t(`status.${s}`)}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-              </div>
+            {/* 批量面携带 AccountConfigPatch 全字段（模板/并发/启停/倍率/缓存域）；
+                失效恢复是逐账号 fenced 端点，不在批量面 */}
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="space-y-1.5">
                 <Label>{t('accounts.templateLabel')}</Label>
                 <Select
@@ -1301,12 +1579,6 @@ export default function Accounts() {
                     {templates.map(tp => <SelectItem key={tp.ID} value={String(tp.ID)} label={tp.Name ?? `#${tp.ID}`}>{tp.Name ?? `#${tp.ID}`}</SelectItem>)}
                   </SelectContent>
                 </Select>
-              </div>
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-1.5">
-                <Label htmlFor="ba-weight">{t('accounts.weightLabel')}</Label>
-                <Input id="ba-weight" type="number" min={0} value={batchForm.weight} placeholder="0" onChange={e => setBatchForm(f => ({ ...f, weight: e.target.value }))} />
               </div>
               <div className="space-y-1.5">
                 <Label htmlFor="ba-max">{t('accounts.maxLabel')}</Label>
@@ -1327,6 +1599,36 @@ export default function Accounts() {
                 <span className="text-sm">{t('accounts.clearGroups')}</span>
               </label>
             </div>
+            {/* 生命周期配置（启停/倍率/缓存域）——同为批量契约字段，留空/不变 = 不修改 */}
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label>{t('accounts.enabledLabel')}</Label>
+                <Select
+                  items={{ all: t('list.unchanged'), true: t('accounts.state.enabled'), false: t('accounts.state.disabled') }}
+                  value={batchForm.enabled}
+                  onValueChange={v => setBatchForm(f => ({ ...f, enabled: v as BatchForm['enabled'] }))}
+                >
+                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all" label={t('list.unchanged')}>{t('list.unchanged')}</SelectItem>
+                    <SelectItem value="true" label={t('accounts.state.enabled')}>{t('accounts.state.enabled')}</SelectItem>
+                    <SelectItem value="false" label={t('accounts.state.disabled')}>{t('accounts.state.disabled')}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="ba-mult">{t('accounts.multiplier.label')}</Label>
+                <Input id="ba-mult" type="number" min={0} max={10} step="0.0001" value={batchForm.multiplier} placeholder={t('list.unchanged')} onChange={e => setBatchForm(f => ({ ...f, multiplier: e.target.value }))} />
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="ba-domain">{t('accounts.cacheDomain.label')}</Label>
+              <Input id="ba-domain" value={batchForm.cache_domain} disabled={batchForm.clearCacheDomain} placeholder={t('accounts.cacheDomain.placeholder')} onChange={e => setBatchForm(f => ({ ...f, cache_domain: e.target.value }))} />
+              <label className="flex cursor-pointer items-center gap-2.5 py-0.5">
+                <Checkbox checked={batchForm.clearCacheDomain} onCheckedChange={c => setBatchForm(f => ({ ...f, clearCacheDomain: c === true }))} />
+                <span className="text-sm">{t('accounts.clearCacheDomain')}</span>
+              </label>
+            </div>
             {batchFormErr && <p className="text-sm text-destructive">{batchFormErr}</p>}
             {batchUpdate.isError && errMsg(batchUpdate.error) && (
               <p className="text-sm text-destructive">{errMsg(batchUpdate.error)}</p>
@@ -1345,7 +1647,7 @@ export default function Accounts() {
       <Dialog open={!!extTarget} onOpenChange={o => { if (!o && !extSave.isPending) setExtTarget(null) }}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>{t('accounts.ext.title', { id: extTarget?.ID })}</DialogTitle>
+            <DialogTitle>{t('accounts.ext.title', { id: extTarget?.ID ?? 0 })}</DialogTitle>
             <DialogDescription>{t('accounts.ext.desc')}</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
@@ -1360,6 +1662,15 @@ export default function Accounts() {
                 value={extForm.codex_email}
                 placeholder={t('accounts.ext.emailPlaceholder')}
                 onChange={e => setExtForm(f => ({ ...f, codex_email: e.target.value }))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="acc-ext-account-id">{t('accounts.ext.accountId')}</Label>
+              <Input
+                id="acc-ext-account-id"
+                value={extForm.codex_account_id}
+                placeholder={t('accounts.ext.accountIdPlaceholder')}
+                onChange={e => setExtForm(f => ({ ...f, codex_account_id: e.target.value }))}
               />
             </div>
             {extCredentialType === 'codex-oauth' ? (
@@ -1403,14 +1714,11 @@ export default function Accounts() {
                 />
               </div>
             )}
-            {/* 身份四元组：只读展示（首次写入自动生成、恒等约束——不提供编辑） */}
+            {/* 持久身份：只读展示（首次写入自动生成——不提供编辑） */}
             <div className="space-y-1">
               <p className="text-xs text-muted-foreground">{t('accounts.ext.identityNote')}</p>
               <div className="space-y-0.5 font-mono text-xs text-muted-foreground">
                 <p>{t('accounts.ext.installationId')}: {extQ.data?.codex_identity?.installation_id ?? '—'}</p>
-                <p>{t('accounts.ext.sessionId')}: {extQ.data?.codex_identity?.session_id ?? '—'}</p>
-                <p>{t('accounts.ext.threadId')}: {extQ.data?.codex_identity?.thread_id ?? '—'}</p>
-                <p>{t('accounts.ext.windowId')}: {extQ.data?.codex_identity?.window_id ?? '—'}</p>
               </div>
             </div>
             {extQ.isError && (
@@ -1432,26 +1740,26 @@ export default function Accounts() {
         </DialogContent>
       </Dialog>
 
-      {/* —— 用量明细弹窗（B-2）：汇总 = usage_logs 实时全窗；分桶 = stats-agg 离线
+      {/* —— 用量明细弹窗：汇总 = usage_logs 实时全窗；分桶 = stats-agg 离线
           聚合（watermark 滞后）——末桶（进行中部分桶）被「当前」尾窗补行原位替代；
           弹窗内数据不轮询（打开时点快照，切换范围手动刷新） —— */}
       <Dialog open={!!usageDetail} onOpenChange={o => { if (!o) setUsageDetail(null) }}>
         <DialogContent className="flex max-h-[85vh] w-[calc(100vw-2rem)] flex-col overflow-hidden p-0 sm:max-w-2xl">
           <DialogHeader className="shrink-0 px-6 pt-6">
-            <DialogTitle>{t('accounts.usageDetail.title', { name: usageDetail?.Name ?? '—', id: usageDetail?.ID })}</DialogTitle>
-            <DialogDescription>{t(`accounts.usageDetail.range.${rangeKey}`)}</DialogDescription>
+            <DialogTitle>{t('accounts.usageDetail.title', { name: usageDetail?.Name ?? '—', id: usageDetail?.ID ?? 0 })}</DialogTitle>
+            <DialogDescription>{t(`accounts.usageDetail.range.${activeKey}` as DynamicKey)}</DialogDescription>
           </DialogHeader>
           <div className="flex-1 overflow-y-auto px-6 py-4">
             <div className="space-y-4">
             <div className="flex justify-end">
               <Select
-                items={Object.fromEntries(USAGE_RANGES.map(r => [r.key, t(`accounts.usageDetail.range.${r.key}`)]))}
-                value={rangeKey}
+                items={Object.fromEntries(offeredRanges.map(r => [r.key, t(`accounts.usageDetail.range.${r.key}`)]))}
+                value={activeKey}
                 onValueChange={setRangeKey}
               >
                 <SelectTrigger size="sm" className="w-36"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  {USAGE_RANGES.map(r => (
+                  {offeredRanges.map(r => (
                     <SelectItem key={r.key} value={r.key} label={t(`accounts.usageDetail.range.${r.key}`)}>
                       {t(`accounts.usageDetail.range.${r.key}`)}
                     </SelectItem>
@@ -1461,7 +1769,10 @@ export default function Accounts() {
             </div>
             {/* 汇总卡片（A/U 金额口径与单元格一致：≥$0.01 两位、更小四位，0 → $0.00） */}
             {detailQ.isError ? (
-              <p className="text-sm text-destructive">{t('common.loadFailed', { message: (detailQ.error as Error).message })}</p>
+              <div>
+                <p className="text-sm text-destructive">{t('common.loadFailed', { message: (detailQ.error as Error).message })}</p>
+                <StatsWindowNotice error={detailQ.error} />
+              </div>
             ) : detailQ.isPending ? (
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
                 {Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-20" />)}
@@ -1477,7 +1788,10 @@ export default function Accounts() {
             {/* 分桶表：A 列来自 raw_cost_usd（与汇总同口径）；末桶被尾窗行原位替代；
                 尾窗失败 → 恢复完整 buckets 渲染（末桶保留）+ 错误行提示（O 级裁决） */}
             {statsQ.isError ? (
-              <p className="text-sm text-destructive">{t('common.loadFailed', { message: (statsQ.error as Error).message })}</p>
+              <div>
+                <p className="text-sm text-destructive">{t('common.loadFailed', { message: (statsQ.error as Error).message })}</p>
+                <StatsWindowNotice error={statsQ.error} />
+              </div>
             ) : statsQ.isPending ? (
               <div className="space-y-2">
                 {Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-9" />)}
@@ -1536,8 +1850,80 @@ export default function Accounts() {
             )}
             </div>
           </div>
-          <DialogFooter className="shrink-0 rounded-b-[14px] border-t bg-muted/10 px-6 py-5">
+          {/* mx-0 mb-0：本弹窗是 p-0（自管内边距），DialogFooter 默认的 -mx-4 -mb-4 是为
+              DialogContent 默认 p-4 抵消用的；不抵消会让页脚比弹窗宽 32px，被 overflow-hidden 裁掉两侧 */}
+          <DialogFooter className="mx-0 mb-0 shrink-0 rounded-b-[14px] border-t bg-muted/10 px-6 py-5">
             <Button variant="outline" onClick={() => setUsageDetail(null)}>{t('common.cancel')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      {/* —— 采购成本倍率（账号配置唯一写面 PATCH /accounts/{id} 的 upstream_cost_multiplier；
+          正常值 ×0–×10，UI 边界校验镜像后端 bp 换算；陈旧前置条件 → 提示重读重试） —— */}
+      <Dialog open={!!multTarget} onOpenChange={o => { if (!o && !multSave.isPending) setMultTarget(null) }}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>{t('accounts.multiplier.title', { name: multTarget?.Name ?? '—', id: multTarget?.ID ?? 0 })}</DialogTitle>
+            <DialogDescription>{t('accounts.multiplier.desc')}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-1.5">
+            <Label htmlFor="acc-mult">{t('accounts.multiplier.label')}</Label>
+            <Input
+              id="acc-mult"
+              type="number"
+              min={0}
+              max={10}
+              step={0.0001}
+              value={multValue}
+              onChange={e => setMultValue(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">{t('accounts.multiplier.rangeHint')}</p>
+            {multValue.trim() !== '' && parseMultiplier(multValue) === null && (
+              <p className="text-sm text-destructive">{t('accounts.multiplier.invalid')}</p>
+            )}
+            <p className="text-xs text-muted-foreground">{t('accounts.lifecycleRevisionNote', { revision: multTarget?.LifecycleRevision ?? '—' })}</p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setMultTarget(null)} disabled={multSave.isPending}>{t('common.cancel')}</Button>
+            <Button
+              onClick={() => multTarget && multSave.mutate({ id: multTarget.ID!, multiplier: parseMultiplier(multValue)!, expectedRevision: multTarget.LifecycleRevision ?? 0 })}
+              disabled={multSave.isPending || parseMultiplier(multValue) === null || multTarget?.LifecycleRevision == null}
+            >
+              {multSave.isPending ? t('common.saving') : t('common.save')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* —— 缓存域（账号配置唯一写面 PATCH /accounts/{id} 的 cache_domain；
+          空 → null = 清空回账号私有域，不走空串） —— */}
+      <Dialog open={!!domainTarget} onOpenChange={o => { if (!o && !domainSave.isPending) setDomainTarget(null) }}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>{t('accounts.cacheDomain.title', { name: domainTarget?.Name ?? '—', id: domainTarget?.ID ?? 0 })}</DialogTitle>
+            <DialogDescription>{t('accounts.cacheDomain.desc')}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-1.5">
+            <Label htmlFor="acc-domain">{t('accounts.cacheDomain.label')}</Label>
+            <Input
+              id="acc-domain"
+              value={domainValue}
+              placeholder={t('accounts.cacheDomain.placeholder')}
+              onChange={e => setDomainValue(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">{domainValue.trim() === '' ? t('accounts.cacheDomain.currentPrivate') : t('accounts.cacheDomain.currentShared')}</p>
+            {domainValue.trim() !== '' && !validCacheDomain(domainValue.trim()) && (
+              <p className="text-sm text-destructive">{t('accounts.cacheDomain.invalid')}</p>
+            )}
+            <p className="text-xs text-muted-foreground">{t('accounts.lifecycleRevisionNote', { revision: domainTarget?.LifecycleRevision ?? '—' })}</p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDomainTarget(null)} disabled={domainSave.isPending}>{t('common.cancel')}</Button>
+            <Button
+              onClick={() => domainTarget && domainSave.mutate({ id: domainTarget.ID!, cacheDomain: domainValue.trim() || null, expectedRevision: domainTarget.LifecycleRevision ?? 0 })}
+              disabled={domainSave.isPending || domainTarget?.LifecycleRevision == null || (domainValue.trim() !== '' && !validCacheDomain(domainValue.trim()))}
+            >
+              {domainSave.isPending ? t('common.saving') : t('common.save')}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

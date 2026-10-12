@@ -4,7 +4,7 @@
 
 package proxy
 
-// 错误文本落盘（部署故障修复 #20）：连接级失败 / 4xx / 5xx 的 usage log
+// 错误文本落盘（部署故障修复）：连接级失败 / 4xx / 5xx 的 usage log
 // ErrorMessage 语义 + 连接级 Warn（err 全文）。成功路径 ErrorMessage 恒空
 // （热路径零新增分配）。
 
@@ -43,7 +43,7 @@ func newTestProxyWarn(t *testing.T, upstream string, accountID int64, format dom
 	}
 	accs := map[int64][]*domain.Account{10: {{
 		ID: accountID, TemplateID: tpl.ID, Template: tpl, UpstreamKey: "sk-upstream",
-		Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4,
+		Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4,
 	}}}
 	cfg := Config{
 		MaxBodySize: 1 << 20, FailoverAttempts: 2,
@@ -51,19 +51,21 @@ func newTestProxyWarn(t *testing.T, upstream string, accountID int64, format dom
 		UpstreamStreamTimeout: 30 * time.Second,
 		UsageCapture:          true,
 	}
-	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil)
+	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil, testHealthSink, nil)
 	require.NoError(t, re.Reload(context.Background()))
 	sched := scheduler.New(scheduler.Config{
-		DefaultMaxConcurrency: 4, SyncInterval: time.Hour,
-	}, noopLoader{accs: accs}, re, nil)
+		SyncInterval: time.Hour,
+	}, noopLoader{accs: accs}, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
+	publishTestRoutes(t, sched)
+
 	rec := usage.New(usage.UsageConfig{
 		BatchSize: 100, FlushInterval: time.Hour,
 		QuotaFlushInterval: time.Hour,
 	}, logs, nil)
 	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{
 		"ck-1": activeKey(1, 1, 10),
-	}}, noopUserLoader{}, nil, true)
+	}}, noopUserLoader{}, nil, nil, true)
 	require.NoError(t, auth.Reload(context.Background())) // 构造不再自载——测试显式首刷（快照注册表单一入口）
 	hc := &http.Client{Transport: http.DefaultTransport}
 	clients := aiclient.NewFactory(hc, aiclient.Config{
@@ -75,7 +77,7 @@ func newTestProxyWarn(t *testing.T, upstream string, accountID int64, format dom
 	// errlog worker（分表设计）：错误明细与 usage_logs 共用捕获 store——错误
 	// 文本断言经 p.errlog.Close 显式排空后同 store 读取。
 	errlogW := usage.NewErrLogWorker(usage.ErrLogConfig{QueueSize: 4096, FlushInterval: time.Hour}, errLogStoreFrom(logs), nil)
-	return New(cfg, sched, credential.New(), rec, clients, auth, logger, nil, errlogW)
+	return New(cfg, sched, credential.New(), rec, clients, auth, logger, nil, errlogW, Deps{})
 }
 
 // 连接级失败（fake 上游断连）：耗尽路径 usage log ErrorMessage = err.Error()
@@ -292,11 +294,12 @@ func TestProxyFailureRowsNeverInUsageLogs(t *testing.T) {
 	}
 }
 
-// 分类正确性（#20 E 项，用户实证）：客户端在上游首字节前断开（模型思考期
+// 分类正确性（E 项，用户实证）：客户端在上游首字节前断开（模型思考期
 // 取消）→ r.Context() 已取消、SDK 返回 context.Canceled（statusOf=0）——
 // 不得按连接级网络错误处理：不 failover、不 MarkResult/冷却；记 499
 // （nginx client closed request 约定）+ ErrAbort + error_message，立即返回。
 func TestProxyClientDisconnectBeforeFirstByte(t *testing.T) {
+	testHealthSink.reset()
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 模拟上游思考期：首字节前长时间不响应；客户端断开时服务器 ctx 也取消
 		select {
@@ -323,7 +326,7 @@ func TestProxyClientDisconnectBeforeFirstByte(t *testing.T) {
 	ri, ok := p.sched.Runtime(1)
 	require.True(t, ok)
 	require.Equal(t, domain.StatusActive, ri.Status, "客户端断连不得冷却账号")
-	require.Nil(t, ri.CooldownUntil, "客户端断连不得设冷却")
+	require.Zero(t, testHealthSink.throttleCount(), "客户端断连不得投递惩罚")
 	require.Zero(t, ri.Concurrency, "断连路径必须释放并发槽")
 
 	require.NoError(t, p.rec.Close(context.Background()))
@@ -339,7 +342,7 @@ func TestProxyClientDisconnectBeforeFirstByte(t *testing.T) {
 	require.Equal(t, l.RequestID, store.logs[1].RequestID, "双轨行 request_id 关联")
 }
 
-// SDK 本地校验错误归 4xx（spec 2026-08-16-anthropic-stream-accept-design A-1）：
+// SDK 本地校验错误归 4xx（spec 2026-08-16-anthropic-stream-accept-design）：
 // anthropic 非流式 + max_tokens 大（80000：expectedTime = 1h×80000/128000
 // = 2250s > 10min）→ SDK CalculateNonStreamingTimeout（client.go:316 固定文本）
 // 本地拒绝——无网络请求、无状态码（code=0），此前误归 network（err_logs 记
@@ -347,6 +350,7 @@ func TestProxyClientDisconnectBeforeFirstByte(t *testing.T) {
 // Warn 留痕保留（不因识别而丢留痕）、不 failover 不 MarkResult（确定性错误
 // §5.3，与 4xx 分支现状一致）、响应文案含原因。
 func TestProxySDKValidationErrorClassified4xx(t *testing.T) {
+	testHealthSink.reset()
 	var hits atomic.Int64
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
@@ -382,7 +386,7 @@ func TestProxySDKValidationErrorClassified4xx(t *testing.T) {
 	ri, ok := p.sched.Runtime(1)
 	require.True(t, ok)
 	require.Equal(t, domain.StatusActive, ri.Status)
-	require.Nil(t, ri.CooldownUntil)
+	require.Zero(t, testHealthSink.throttleCount(), "确定性 4xx 不投递惩罚")
 	require.Zero(t, ri.Concurrency, "识别路径必须释放并发槽")
 	require.Zero(t, p.rec.Pending(), "失败行不入 usage_logs（分表：err_logs 承载）")
 
@@ -412,5 +416,5 @@ func TestProxySDKValidationErrorClassified4xx(t *testing.T) {
 
 // sdkStreamingRequiredText 为 anthropic-sdk-go v1.62.0 client.go:316
 // （CalculateNonStreamingTimeout）硬编码错误文本——升级 SDK 若改文案须同步
-// 本测试与 caller.go 识别点（A-1 版本依赖标注）。
+// 本测试与 caller.go 识别点（版本依赖标注）。
 const sdkStreamingRequiredText = "streaming is required for operations that may take longer than 10 minutes"

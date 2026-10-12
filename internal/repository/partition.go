@@ -19,12 +19,13 @@ import (
 	"entgo.io/ent/dialect/sql/schema"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/ent/errlog"
 	"github.com/is7qin/c3api/internal/ent/usagelog"
 	"github.com/is7qin/c3api/internal/ent/usagestat"
 )
 
-// PartitionRepo 管理按日分区表（Phase 5 T4.5，用户决策 2026-08-09；err_logs/
+// PartitionRepo 管理按日分区表（用户决策 2026-08-09；err_logs/
 // usage_stats 分区复用同路线，用户决策 2026-08-11）：50k 并发量级 usage_logs
 // 增长 ~4.3 亿行/天——逐行 DELETE 清理不可行，按月分区单分区 26 亿行仍不可行
 // → PostgreSQL 原生分区表 PARTITION BY RANGE (分区键)，每日一区（usage_logs
@@ -44,13 +45,17 @@ import (
 // 表列 → DROP TABLE 级联回收。
 //
 // Ensure/Drop 均按表参数化（表名 + 分区键 + 日期）——四表共用一套实现（单一
-// 实现防漂移，P1 教训同款）；幂等语义全表通用（IF NOT EXISTS / IF EXISTS、
+// 实现防漂移，教训同款）；幂等语义全表通用（IF NOT EXISTS / IF EXISTS、
 // 42P07/duplicate_object 容忍、并发实例安全）。升级策略（用户裁决
 // 2026-08-23）：beta 全新库自举，无迁移，bootstrap 对已分区表 no-op 预期。
 type PartitionRepo struct {
 	// driver 为 raw SQL 入口（ent 无分区 DDL 能力；bootstrap/retention 均走
 	// dialect.Driver.Exec/Query —— execUpdate 同构，txDriver 下同连接）。
 	driver dialect.Driver
+	// routingObservationDays 观测保留天数（main 经
+	// SetRoutingObservationRetentionDays 装配 cfg.Routing.ObservationRetentionDays）：
+	// 写面据此拒早于截止的快照（routing.go UpsertFlowSnapshot 守卫）。0 = 未装配。
+	routingObservationDays int
 }
 
 // 分区名 = {table}_{YYYYMMDD}（UTC 日；分区边界按 UTC 零点对齐，避免会话
@@ -65,6 +70,10 @@ func tablePartitionRe(table string) *regexp.Regexp {
 }
 
 func tablePartitionDate(table, name string) (time.Time, bool) {
+	// 名解析失败 = 该分区既不被计数也不被 DROP：分区名即日期是保留口径的唯一
+	// 依据（DROP 按名判定过期），无日期即无法判定过期——误删的风险大于残留。
+	// 此类分区只能由 RoutingFactPartitionStats 计入 UndatedCount 暴露，运维人工
+	// 介入（自动 DROP 一个不知日期的分区等于丢未知数据，不可接受）。
 	m := tablePartitionRe(table).FindStringSubmatch(name)
 	if m == nil {
 		return time.Time{}, false
@@ -89,7 +98,7 @@ func partitionedCreateDDL(table, partitionCol string, columnDefs []string) strin
 		") PARTITION BY RANGE (" + partitionCol + ")"
 }
 
-// usageLogColumnDefs usage_logs 分区表列定义（单一事实源，评审 I-1 锚）：
+// usageLogColumnDefs usage_logs 分区表列定义（单一事实源，锚）：
 // 建表 DDL 由本列表生成（partitionedCreateDDL）——列集合一致性由
 // TestUsageLogColumnDefsMatchCreateDDL 锚定（防"向静态 DDL 加列忘加事实源"
 // 漂移，含类型漂移——列定义字符串整体生成）。列定义与 ent schema 完全一致，
@@ -139,10 +148,17 @@ var usageLogColumnDefs = []string{
 	`billing_tier varchar NULL`,
 	`above_hit boolean NOT NULL DEFAULT false`,
 	`overdraft boolean NOT NULL DEFAULT false`,
-	// billed（F2 ledger-cursor，spec 2026-08-23 §一/§三）：扣费收敛标记——
+	// billed（ledger-cursor，spec 2026-08-23 §一/§三）：扣费收敛标记——
 	// false=待对账消费（出生未扣，计费游标子集）；true=已结算（billing worker
 	// 扣费事务内原子标记，或关闭计费/匿名行的出生吸收态）。
 	`billed boolean NOT NULL DEFAULT false`,
+	// 供应商收益快照（spec 2026-10-09 §3.3）：三列——归属 uid 快照（请求时点，
+	// NULL = 平台自有/未归属）、收益额快照（毫分）、记账游标（出生定态）。
+	// **无 supplier_share_bp**（分成率不落列，§2.3）。新列仅全新部署（分区表
+	// 首次创建）时建立——升级路径见 §3.3，已装库不补齐（beta 哲学）。
+	`supplier_user_id bigint NULL`,
+	`supplier_earn_millis bigint NOT NULL DEFAULT 0`,
+	`supplier_credited boolean NOT NULL DEFAULT false`,
 	`created_at timestamptz NOT NULL`,
 }
 
@@ -150,7 +166,7 @@ var usageLogCreateDDL = partitionedCreateDDL("usage_logs", "created_at", usageLo
 
 // usageLogIndexDDLs 对齐 ent schema Indexes（同名同列；分区表父表索引为
 // 分区索引，子分区自动继承）。唯一索引含分区键 created_at（分区表硬约束，
-// 见本文件头注释）：request_id 幂等键（方向 A 批次 1a，A-P2-3）——COMMIT
+// 见本文件头注释）：request_id 幂等键——COMMIT
 // 歧义窗口重试撞 23505 由 flusher 按成功处理（防双扣，见
 // internal/billing/flusher.go isUniqueLogConflict）。索引随 bootstrap 重建
 // 路径必建（全新安装恒齐，无手动补建面）。
@@ -161,21 +177,35 @@ var usageLogIndexDDLs = []string{
 	`CREATE INDEX usagelog_user_id_created_at ON usage_logs (user_id, created_at)`,
 	`CREATE INDEX usagelog_key_id_created_at ON usage_logs (key_id, created_at)`,
 	`CREATE UNIQUE INDEX usagelog_request_id_created_at ON usage_logs (request_id, created_at)`,
-	// F2 ledger-cursor 计费游标（spec 2026-08-23 §一）：部分索引 (id) WHERE NOT
+	// ledger-cursor 计费游标（spec 2026-08-23 §一）：部分索引 (id) WHERE NOT
 	// billed 即计费游标本体——取批只扫未扣子集，行标记 billed=true 后自动退出
 	// 索引（重启天然续传，无 watermark 表）；分区表父表索引为分区索引，子分区
 	// 自动继承。ent 无部分索引表达力，仅存于本事实源。
-	// wave3 D-A（spec-f2opt-wave3 §一）：usagelog_unbilled_created (created_at)
+	// （spec-f2opt-wave3 §一）：usagelog_unbilled_created (created_at)
 	// WHERE NOT billed 已删除——唯一消费者 UnbilledLag 的 MIN(created_at) 改队头
 	// 两步法（部分 id 索引定位 + pkey 回表），marked 步索引维护 -33%。不建
-	// (id) WHERE NOT billed AND cost=0——D1 已消灭该查询类，索引是写放大负债。
+	// (id) WHERE NOT billed AND cost=0——已消灭该查询类，索引是写放大负债。
 	`CREATE INDEX usagelog_unbilled_id ON usage_logs (id) WHERE NOT billed`,
+	// 供应商记账游标（spec 2026-10-09 §3.3①）：部分索引 (id) WHERE NOT
+	// supplier_credited AND supplier_earn_millis > 0——取批 ORDER BY id LIMIT
+	// 只扫未记账正收益子集。**键序必须是 (id)**（报表索引不保证有序取前 N）。
+	// **部分索引是 G1 的落地载体**：关闭态下行全为 supplier_user_id IS NULL、
+	// earn = 0 ⇒ 谓词恒假 ⇒ 新写入不产生条目。I3 backlog 探测须写同一组谓词
+	// 才享索引资格（逻辑蕴含，非逐字一致）。
+	`CREATE INDEX usagelog_uncredited_earn_id ON usage_logs (id) WHERE NOT supplier_credited AND supplier_earn_millis > 0`,
+	// 供应商报表索引（spec 2026-10-09 §3.3②）：(supplier_user_id, created_at)
+	// WHERE supplier_user_id IS NOT NULL AND supplier_earn_millis > 0——收益明细
+	// （§6.1 earnings 唯一消费者：`WHERE supplier_user_id=$1 AND supplier_earn_millis>0
+	// ORDER BY created_at DESC`）按供应商 + 时间窗口。谓词与查询**逐字对齐** ⇒ 只索引
+	// **有收益**的行（cost=0 ⇒ earn=0 的供应商行不入索引），显著降低索引尺寸与 INSERT/
+	// 标记写放大。**不向后兼容**：仅 bootstrap 建，存量库不自动重建（无迁移逻辑）。
+	`CREATE INDEX usagelog_supplier_created_at ON usage_logs (supplier_user_id, created_at) WHERE supplier_user_id IS NOT NULL AND supplier_earn_millis > 0`,
 }
 
 // errLogColumnDefs err_logs 分区表列定义（单一事实源，与 ent schema 完全一致，
 // 锚测试 TestErrLogColumnDefsMatchCreateDDL 断言列集合一致）：错误审计瘦表——
 // 无 token/价格列；status_code/error_message（usage_logs 瘦身去掉的排障列）+
-// 审计归属（group/account/template/api/user/key）+ billing_tier（评审 I-3：tier
+// 审计归属（group/account/template/api/user/key）+ billing_tier（tier
 // reject 的 tier 维度审计保留）。
 var errLogColumnDefs = []string{
 	`id bigint NOT NULL DEFAULT nextval('err_logs_id_seq'::regclass)`,
@@ -202,7 +232,7 @@ var errLogCreateDDL = partitionedCreateDDL("err_logs", "created_at", errLogColum
 
 // errLogIndexDDLs 对齐 ent schema Indexes（同名同列；分区表父表索引为分区
 // 索引，子分区自动继承）：created_at 时间窗口查询/清理 + (group_id/user_id,
-// created_at) 查询面（架构审查 S1——/err_logs 按用户/组过滤）。
+// created_at) 查询面（架构审查——/err_logs 按用户/组过滤）。
 var errLogIndexDDLs = []string{
 	`CREATE INDEX errlog_created_at ON err_logs (created_at)`,
 	`CREATE INDEX errlog_group_id_created_at ON err_logs (group_id, created_at)`,
@@ -215,7 +245,7 @@ var errLogIndexDDLs = []string{
 // call_count（按次调用）+ TTFT 四列（ttft_total_ms/ttft_count/ttft_max_ms/
 // ttft_hist bigint[10] 直方图）保留。列定义与 ent schema 一致**除 ttft_hist**
 // ——PG bigint[] 数组列 ent 无类型（field.Ints 等是 JSON 语义，无法扫描 PG
-// 数组），数组列 carve-out 不进 ent schema（评审 P1-1），统计读取面
+// 数组），数组列 carve-out 不进 ent schema，统计读取面
 // （ScanStatsDays/StatsTrend 族）走 pgx 直查扫描 []int64。分区键 bucket_time（小时桶聚合 24 桶/区）。id 走
 // usage_stats_id_seq（ent bigserial 同款语义——INSERT 不带 id 列走 DEFAULT
 // nextval；该表经 bootstrap 建表（表不存在则建，全新安装唯一路径），零迁移
@@ -385,7 +415,7 @@ func isDuplicateObject(err error) bool {
 }
 
 // isMissingObject 判断"目标对象不存在"竞态错误（42P01 undefined_table）：
-// 并发 bootstrap 的 **stale-DROP 窗口**专用（评审 I-1 已接受的窗口，见
+// 并发 bootstrap 的 **stale-DROP 窗口**专用（已接受的窗口，见
 // ensureTablePartitioned 注释）——实例基于过期的"未分区"判定执行 DROP TABLE
 // IF EXISTS，可能误删对方刚建的表（含 OWNED BY 级联的序列）；被删侧后续步骤
 // 短暂撞 42P01：OWNED BY/索引/分区引用缺失的表、CREATE TABLE 引用被级联
@@ -427,7 +457,7 @@ func (r *PartitionRepo) execDDLTolerateRace(ctx context.Context, query string) e
 // TABLE（IF EXISTS 恒 no-op）+ 重建分区表/序列/索引 + 预建分区（表结构终态由
 // 列事实源定义）；已是分区表 → 仅确保 当日→明日 分区存在后返回。
 //
-// 多实例语义（评审 I-1）：两实例同时启动时，"是否已分区"判定与 CREATE 之间
+// 多实例语义：两实例同时启动时，"是否已分区"判定与 CREATE 之间
 // 另一实例可能已建对象——所有 CREATE 步骤（分区表/索引/日分区）对撞名类错误
 // （42P07/42710/23505）容忍后继续，双方幂等收敛。DROP 为 IF EXISTS 不报错；
 // 理论窗口下并发实例的 DROP 误删对方刚建的分区表时（stale-DROP 窗口），被删
@@ -507,7 +537,7 @@ func (r *PartitionRepo) EnsureUsageStatsPartitioned(ctx context.Context, now tim
 // （幂等：已存在跳过；until 早于 now → 仅 now 当日）。bootstrap 与 retention
 // worker 共用——防日界竞态：分区未建时插入跨日 row 会整体失败（PG 对分区表
 // 无自动建分区），必须预留未来分区。start/end 边界统一由调用方传入的 now
-// 推导（评审 I-2：不内部取 time.Now()，测试可注入任意时钟；worker 每轮
+// 推导（不内部取 time.Now()，测试可注入任意时钟；worker 每轮
 // 现取 now 传入）。
 func (r *PartitionRepo) EnsureTablePartitions(ctx context.Context, table string, now, until time.Time) error {
 	start := now.UTC().Truncate(24 * time.Hour)
@@ -581,12 +611,8 @@ func (r *PartitionRepo) EnsureUsageEntityStatsPartitions(ctx context.Context, no
 // DropTablePartitionsBefore DROP 指定表分区下界日期早于 cutoff 的分区（O(1)，
 // 按分区名日期判定，无需查元数据）；返回删除个数。保留 >= cutoff 的分区。
 func (r *PartitionRepo) DropTablePartitionsBefore(ctx context.Context, table string, cutoff time.Time) (int, error) {
-	rows := &entsql.Rows{}
-	if err := r.driver.Query(ctx, `SELECT c.relname FROM pg_class c JOIN pg_inherits i ON i.inhrelid = c.oid JOIN pg_class p ON p.oid = i.inhparent JOIN pg_namespace n ON n.oid = c.relnamespace WHERE p.relname = $1 AND n.nspname = current_schema()`, []any{table}, rows); err != nil {
-		return 0, err
-	}
-	names := []string{}
-	if err := entsql.ScanSlice(rows, &names); err != nil {
+	names, err := r.tablePartitionNames(ctx, table)
+	if err != nil {
 		return 0, err
 	}
 	cut := cutoff.UTC().Truncate(24 * time.Hour)
@@ -606,10 +632,269 @@ func (r *PartitionRepo) DropTablePartitionsBefore(ctx context.Context, table str
 	return dropped, nil
 }
 
+// tablePartitionNames 当前 schema 下指定父表的分区名（不含父表自身）。只读
+// 元数据；DROP 与兜底观测（RoutingFactPartitionStats）共用同一取数口径。
+func (r *PartitionRepo) tablePartitionNames(ctx context.Context, table string) ([]string, error) {
+	rows := &entsql.Rows{}
+	if err := r.driver.Query(ctx, `SELECT c.relname FROM pg_class c JOIN pg_inherits i ON i.inhrelid = c.oid JOIN pg_class p ON p.oid = i.inhparent JOIN pg_namespace n ON n.oid = c.relnamespace WHERE p.relname = $1 AND n.nspname = current_schema()`, []any{table}, rows); err != nil {
+		return nil, err
+	}
+	names := []string{}
+	if err := entsql.ScanSlice(rows, &names); err != nil {
+		return nil, err
+	}
+	return names, nil
+}
+
 // DropUsageLogPartitionsBefore usage_logs DROP 分区下界早于 cutoff 的分区
 // （既有 API；O(1)）。保留 >= cutoff 的分区。
 func (r *PartitionRepo) DropUsageLogPartitionsBefore(ctx context.Context, cutoff time.Time) (int, error) {
 	return r.DropTablePartitionsBefore(ctx, "usage_logs", cutoff)
+}
+
+// retireLockTimeout 分区退休屏障内封闭迟到写入的锁等待上界（§3.11 步骤 4
+// "限定锁等待"；OpenPG 的 lock_timeout=5s 只是默认兜底，这里显式 SET LOCAL）。
+const retireLockTimeout = "5s"
+
+// RetireUsageLogPartitions usage_logs 分区退休屏障（spec 2026-10-09 §3.11，
+// C2）：DROP 前置检查——未确认资金事件不得随 retention 删除。
+//
+// 对每个候选分区（下界日期 < cutoff）：
+//  1. 候选分区按分区名日期选出（同 DropTablePartitionsBefore）；
+//  2. 在限定锁等待的事务内对分区取 ACCESS EXCLUSIVE（封闭迟到写入，
+//     使检查与 DROP 间无新行）；
+//  3. 未确认检查：用消费索引 ① 的同一组谓词 EXISTS / COUNT（NOT
+//     supplier_credited AND supplier_earn_millis > 0），并保护既有未扣费事件
+//     （NOT billed）；
+//     3b. 源日封账核对（§3.10）：按 earn>0、uid、UTC 源日聚合 Σcost/Σearn/
+//     row_count，与 supplier_reconciliation FULL JOIN 核缺键/多键/数值/状态；
+//     3c. 一致 ⇒ 原子置 state='closed' + closed_revision/closed_at（影响行数 ==
+//     需封账源日键数）；
+//  4. 锁内复检通过（未确认为空 + 封账一致）⇒ 同事务 DROP；否则**禁止 DROP**，
+//     记入 Blocked（不一致 / 仍 open 均 blocked 并持久留证）；
+//  5. 不得"先查空、再任意时间 DROP"（检查、封账、锁、DROP 同一事务）。
+//
+// 被挡分区由调用方（retention worker）呈现为独立持久告警 + ETA（Step 5）。
+func (r *PartitionRepo) RetireUsageLogPartitions(ctx context.Context, cutoff time.Time) (domain.UsageLogRetireResult, error) {
+	var res domain.UsageLogRetireResult
+	names, err := r.tablePartitionNames(ctx, "usage_logs")
+	if err != nil {
+		return res, err
+	}
+	cut := cutoff.UTC().Truncate(24 * time.Hour)
+	for _, name := range names {
+		d, ok := tablePartitionDate("usage_logs", name)
+		if !ok {
+			continue
+		}
+		if !d.Before(cut) {
+			continue
+		}
+		blocked, dropped, err := r.retireOneUsageLogPartition(ctx, name)
+		if err != nil {
+			return res, err
+		}
+		if blocked != nil {
+			res.Blocked = append(res.Blocked, *blocked)
+			continue
+		}
+		if dropped {
+			res.Dropped++
+		}
+	}
+	return res, nil
+}
+
+// retireOneUsageLogPartition 单分区屏障判定 + DROP（见 RetireUsageLogPartitions）。
+// 返回 (blocked, dropped, err)：blocked != nil ⇒ 禁止 DROP（已记阻断证据）；
+// dropped=true ⇒ 已成功 DROP；分区已消失或不存在 ⇒ 均返回 (nil,false,nil)。
+func (r *PartitionRepo) retireOneUsageLogPartition(ctx context.Context, name string) (*domain.BlockedPartition, bool, error) {
+	tx, err := r.driver.Tx(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	// Commit 成功后 Rollback 返回 ErrTxClosed，忽略（与 settlePGX 同款）。
+	defer func() { _ = tx.Rollback() }()
+
+	var res sql.Result
+	if err := tx.Exec(ctx, `SET LOCAL lock_timeout = '`+retireLockTimeout+`'`, []any{}, &res); err != nil {
+		return nil, false, err
+	}
+	// 2. 封闭迟到写入：ACCESS EXCLUSIVE 锁分区。分区已消失（stale）⇒ 视为已退休。
+	if err := tx.Exec(ctx, `LOCK TABLE `+name+` IN ACCESS EXCLUSIVE MODE`, []any{}, &res); err != nil {
+		if isMissingObject(err) {
+			return nil, false, nil
+		}
+		if isLockNotAvailable(err) {
+			// 锁等待超时：无法封闭写入 ⇒ 禁止 DROP（保守），记 blocked（计数未知 -1）。
+			return &domain.BlockedPartition{Name: name, UncreditedEarnRows: -1, UnbilledRows: -1}, false, nil
+		}
+		return nil, false, err
+	}
+	// 3. 未确认检查（与消费索引 ① 逻辑蕴含的同一组谓词）+ 未扣费事件保护。
+	//    持锁事实由 readPendingPartitionFacts 在**同一 tx** 内读取。
+	facts, err := readPendingPartitionFacts(ctx, tx, name)
+	if err != nil {
+		return nil, false, err
+	}
+	if facts.UncreditedEarnRows > 0 || facts.UnbilledRows > 0 {
+		// 4. 未通过检查 ⇒ 禁止 DROP（事务仍持有锁，defer Rollback 释放）。
+		bp := &domain.BlockedPartition{Name: name, UncreditedEarnRows: facts.UncreditedEarnRows, UnbilledRows: facts.UnbilledRows}
+		if facts.OldestUncredited.Valid {
+			ms := facts.OldestUncredited.Time.UnixMilli()
+			bp.OldestUncredited = &ms
+		}
+		return bp, false, nil
+	}
+	// 3b. 源日封账核对（§3.10/§3.11）：按 earn>0、uid、UTC 源日聚合
+	//     Σcost/Σearn/row_count，与 supplier_reconciliation FULL JOIN 核缺键/
+	//     多键/数值。永久封账证据是本分区 DROP 前必须先对上的原始事实。
+	srcKeys, mismatch, openMatched, err := reconcilePartitionAggregates(ctx, tx, name)
+	if err != nil {
+		return nil, false, err
+	}
+	if mismatch > 0 {
+		// 键集合或数值不一致 ⇒ 禁止 DROP，留证（绝不静默清掉债务）。
+		return &domain.BlockedPartition{Name: name, ReconSourceKeys: srcKeys, ReconMismatch: mismatch}, false, nil
+	}
+	// 3c. 原子封账：仅 open 的匹配行置 closed；影响行数必须 == 需封账源日键数，
+	//     否则 blocked（不 DROP）。
+	if openMatched > 0 {
+		closed, cerr := closeReconciledSourceDays(ctx, tx, name, time.Now().UnixMilli())
+		if cerr != nil {
+			return nil, false, cerr
+		}
+		if closed != openMatched {
+			return &domain.BlockedPartition{Name: name, ReconSourceKeys: srcKeys, ReconOpenKeys: openMatched - closed}, false, nil
+		}
+	}
+	// 4. 锁内复检通过 ⇒ 同事务 DROP。
+	if err := tx.Exec(ctx, `DROP TABLE IF EXISTS `+name, []any{}, &res); err != nil {
+		if isMissingObject(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, err
+	}
+	return nil, true, nil
+}
+
+// pendingPartitionFacts 退休屏障在**持有 ACCESS EXCLUSIVE 锁的同一 tx** 内读取的
+// 判定事实（§3.11）：未确认正收益行数 + 其最早 created_at + 未扣费行数。
+type pendingPartitionFacts struct {
+	UncreditedEarnRows int64        // `NOT supplier_credited AND supplier_earn_millis > 0`
+	OldestUncredited   sql.NullTime // 同谓词的 MIN(created_at)
+	UnbilledRows       int64        // `NOT billed`
+}
+
+// readPendingPartitionFacts 持锁读取退休判定事实：同谓词的 COUNT 与 MIN(created_at)
+// 合并为单查询；未扣费 COUNT 独立查询（其谓词不同，合并会改变索引计划，故保留）。
+// 动态表名由受控分区名来源提供（非用户输入）。helper 与调用方复用同一 tx。
+func readPendingPartitionFacts(ctx context.Context, tx dialect.Tx, name string) (pendingPartitionFacts, error) {
+	var f pendingPartitionFacts
+	ucRows := &entsql.Rows{}
+	if err := tx.Query(ctx, `SELECT COUNT(*), MIN(created_at) FROM `+name+` WHERE NOT supplier_credited AND supplier_earn_millis > 0`, []any{}, ucRows); err != nil {
+		return f, err
+	}
+	if ucRows.Next() {
+		if err := ucRows.Scan(&f.UncreditedEarnRows, &f.OldestUncredited); err != nil {
+			ucRows.Close()
+			return f, err
+		}
+	}
+	ucRows.Close()
+	ubRows := &entsql.Rows{}
+	if err := tx.Query(ctx, `SELECT COUNT(*) FROM `+name+` WHERE NOT billed`, []any{}, ubRows); err != nil {
+		return f, err
+	}
+	if ubRows.Next() {
+		if err := ubRows.Scan(&f.UnbilledRows); err != nil {
+			ubRows.Close()
+			return f, err
+		}
+	}
+	ubRows.Close()
+	return f, nil
+}
+
+// retireReconSrc 源日封账聚合 CTE（§3.10）：谓词与记账链一致（earn>0、uid、
+// UTC 源日），与 supplier_reconciliation 的写入维度同源（credit 事务内按源行
+// created_at 的 UTC 日 upsert）。%s = 分区名（来自 pg 分区列表，非用户输入）。
+const retireReconSrc = `WITH src AS (
+ SELECT supplier_user_id AS uid,
+        (created_at AT TIME ZONE 'UTC')::date AS day,
+        SUM(cost)::bigint AS gross,
+        SUM(supplier_earn_millis)::bigint AS earned,
+        COUNT(*)::bigint AS cnt
+   FROM %s
+  WHERE supplier_earn_millis > 0 AND supplier_user_id IS NOT NULL
+  GROUP BY 1, 2
+)`
+
+// reconcilePartitionAggregates 分区源日聚合与 supplier_reconciliation 的核对
+// （§3.10/§3.11）：返回 (源聚合键数, 不一致键数, 数值一致且仍 open 的键数)。
+// 不一致 = 缺汇总行 / 多汇总行 / Σcost、Σearn、row_count 任一偏差。仅比对
+// 本分区出现过的 source_day（外层分区锁内，源日聚合与汇总不会被并发改写）。
+func reconcilePartitionAggregates(ctx context.Context, tx dialect.Tx, name string) (srcKeys, mismatch, openMatched int64, err error) {
+	q := fmt.Sprintf(retireReconSrc+`
+SELECT
+  (SELECT count(*)::bigint FROM src),
+  (SELECT count(*)::bigint
+     FROM src s
+     FULL OUTER JOIN (
+       SELECT r.supplier_user_id AS uid, r.source_day AS day, r.gross_cost AS gross,
+              r.earned AS earned, r.row_count AS cnt
+         FROM supplier_reconciliation r
+        WHERE r.source_day IN (SELECT day FROM src)
+     ) rec ON rec.uid = s.uid AND rec.day = s.day
+    WHERE s.uid IS NULL OR rec.uid IS NULL
+       OR s.gross <> rec.gross OR s.earned <> rec.earned OR s.cnt <> rec.cnt),
+  (SELECT count(*)::bigint
+     FROM src s
+     JOIN supplier_reconciliation r
+       ON r.supplier_user_id = s.uid AND r.source_day = s.day
+    WHERE r.state = 'open'
+      AND s.gross = r.gross_cost AND s.earned = r.earned AND s.cnt = r.row_count)`, name)
+	rows := &entsql.Rows{}
+	if err = tx.Query(ctx, q, []any{}, rows); err != nil {
+		return 0, 0, 0, err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		if err = rows.Scan(&srcKeys, &mismatch, &openMatched); err != nil {
+			return 0, 0, 0, err
+		}
+	}
+	return srcKeys, mismatch, openMatched, rows.Err()
+}
+
+// closeReconciledSourceDays 原子封账本分区已核对的源日（§3.10）：仅 open 的匹配
+// 行置 state='closed' + closed_revision/closed_at，返回影响行数（调用方须断言
+// == 需封账源日键数）。已 closed 且数值一致的行不动（DROP 重试幂等）。
+func closeReconciledSourceDays(ctx context.Context, tx dialect.Tx, name string, revision int64) (int64, error) {
+	q := fmt.Sprintf(retireReconSrc+`
+UPDATE supplier_reconciliation r
+   SET state = 'closed', closed_revision = $1, closed_at = clock_timestamp()
+  FROM src s
+ WHERE r.supplier_user_id = s.uid AND r.source_day = s.day
+   AND r.state = 'open'`, name)
+	var res sql.Result
+	if err := tx.Exec(ctx, q, []any{revision}, &res); err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// isLockNotAvailable 判断锁等待超时/锁不可用（55P03 lock_not_available；
+// lock_timeout 触发即此码）。
+func isLockNotAvailable(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "55P03"
 }
 
 // DropErrLogPartitionsBefore err_logs DROP 分区下界早于 cutoff 的分区（独立
@@ -632,12 +917,12 @@ func (r *PartitionRepo) DropUsageEntityStatsPartitionsBefore(ctx context.Context
 	return r.DropTablePartitionsBefore(ctx, "usage_entity_stats", cutoff)
 }
 
-// redemptionUsesDeleteBatchLimit redemption_uses 每轮批删上限（F3-2 批删有界：
+// redemptionUsesDeleteBatchLimit redemption_uses 每轮批删上限（批删有界：
 // 普通表无分区可 DROP，不能对齐分区表 O(1) DROP 形态——有界 DELETE 防长事务
 // 持锁；低频表单轮即清，超大批多轮收敛）。
 const redemptionUsesDeleteBatchLimit = 5000
 
-// DeleteRedemptionUsesBefore redemption_uses 有界批删（F3-2，retention worker
+// DeleteRedemptionUsesBefore redemption_uses 有界批删（retention worker
 // 周期任务调用；TTL 定死 90 天，cutoff = now - 90 天由调用方推导）：
 //   - 普通表无分区可 DROP → 走 DELETE 批删路径（与三张分区表 O(1) DROP 并存，
 //     均为 retention worker 周期面内的清理手段）；

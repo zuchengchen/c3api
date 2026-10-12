@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -27,6 +26,10 @@ import (
 	"github.com/is7qin/c3api/internal/repository"
 	"github.com/is7qin/c3api/internal/scheduler"
 	"github.com/is7qin/c3api/internal/service"
+	"github.com/is7qin/c3api/internal/testsupport/pgtest"
+
+	// Registers pgtest's repository-dependent hooks.
+	_ "github.com/is7qin/c3api/internal/testsupport/pgtest/pgrepo"
 )
 
 // /api/admin/overview + /api/admin/users-top 真实 PG 测试（spec 2026-08-14）：
@@ -36,31 +39,16 @@ import (
 // 基座同 handler_pricing_test：独立 schema + NewWithPG（pool 注入——聚合
 // 查询与 Upsert 均需池）+ 分区 bootstrap 后预建种子日期区间分区。
 
-// handlerOverviewPGTestSchema 本文件 PG 测试专用 schema。
-const handlerOverviewPGTestSchema = "handler_overview_test"
-
-// overviewPGTestDB 打开真实 PG（独立 schema）+ 分区基座（三表 bootstrap +
+// overviewPGTestDB 打开真实 PG（测试私有 clone）+ 分区基座（三表 bootstrap +
 // 种子区间日分区预建），返回仓库。
 func overviewPGTestDB(t *testing.T, seedFrom, seedUntil time.Time) *repository.Repository {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping real-PostgreSQL test")
-	}
-	if strings.Contains(dsn, "?") {
-		dsn += "&search_path=" + handlerOverviewPGTestSchema
-	} else {
-		dsn += "?search_path=" + handlerOverviewPGTestSchema
-	}
+	dsn := pgtest.Clone(t)
+	pool := pgtest.OpenPool(t, dsn)
 	ctx := context.Background()
-	pool, err := repository.OpenPG(ctx, dsn, 5)
-	require.NoError(t, err)
-	t.Cleanup(pool.Close)
 	db := stdlib.OpenDBFromPool(pool)
 	t.Cleanup(func() { _ = db.Close() })
-	_, err = db.ExecContext(ctx, `DROP SCHEMA IF EXISTS `+handlerOverviewPGTestSchema+` CASCADE; CREATE SCHEMA `+handlerOverviewPGTestSchema+`;`)
-	require.NoError(t, err)
-	repos, err := repository.NewWithPG(t.Context(), entsql.OpenDB(dialect.Postgres, db), true, pool)
+	repos, err := repository.NewWithPG(t.Context(), entsql.OpenDB(dialect.Postgres, db), false, pool)
 	require.NoError(t, err)
 	require.NoError(t, repos.EnsureUsageStatsPartitioned(ctx, time.Now()))
 	require.NoError(t, repos.EnsureUsageStatsPartitions(ctx, seedFrom, seedUntil))
@@ -110,13 +98,21 @@ type countingStore struct {
 	emailCalls atomic.Int64 // ListUserEmails
 }
 
-func (c *countingStore) SummarizeStats(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) (*repository.StatSummary, error) {
+func (c *countingStore) SummarizeStatsCube(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) (*repository.StatSummary, error) {
 	c.statAggs.Add(1)
-	return c.Store.SummarizeStats(ctx, from, to, groupID, zone)
+	return c.Store.SummarizeStatsCube(ctx, from, to, groupID, zone)
 }
-func (c *countingStore) ScanStatsDays(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) ([]*repository.StatDayAgg, error) {
+func (c *countingStore) SummarizeStatsRaw(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) (*repository.StatSummary, error) {
 	c.statAggs.Add(1)
-	return c.Store.ScanStatsDays(ctx, from, to, groupID, zone)
+	return c.Store.SummarizeStatsRaw(ctx, from, to, groupID, zone)
+}
+func (c *countingStore) ScanStatsDaysCube(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) ([]*repository.StatDayAgg, error) {
+	c.statAggs.Add(1)
+	return c.Store.ScanStatsDaysCube(ctx, from, to, groupID, zone)
+}
+func (c *countingStore) ScanStatsDaysRaw(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) ([]*repository.StatDayAgg, error) {
+	c.statAggs.Add(1)
+	return c.Store.ScanStatsDaysRaw(ctx, from, to, groupID, zone)
 }
 func (c *countingStore) CountOverviewResources(ctx context.Context) (*repository.OverviewResourceCounts, error) {
 	c.statAggs.Add(1)
@@ -130,7 +126,7 @@ func (c *countingStore) ListUserEmails(ctx context.Context, ids []int64) (map[in
 // overviewPGRouter 真实 PG + 契约路由（admin token 中间件；count 可为 nil）。
 func overviewPGRouter(t *testing.T, st service.Store, sched service.RuntimeProvider, opts OpsOptions) (*AdminAPI, func(method, path string) *httptest.ResponseRecorder) {
 	t.Helper()
-	svc := service.New(st, sched, service.NopInvalidator{}, nil, nil, &fakeKeys{}, nil)
+	svc := service.New(service.Deps{Store: st, Scheduler: sched, Invalidate: service.NopInvalidator{}, Publisher: nil, RuleReload: nil, Auth: &fakeKeys{}, Log: nil, EmailCodeStore: testEmailCodes})
 	h := New(svc, opts)
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler { // admin token 中间件
@@ -485,7 +481,7 @@ func TestPGUsersTopCacheHitAndEmpty(t *testing.T) {
 	require.Equal(t, int64(0), resp.OtherConcurrency)
 }
 
-// TestPGOverviewTrendUTCDayBoundary 非 UTC 会话日界回归（评审 P2-1）：trend
+// TestPGOverviewTrendUTCDayBoundary 非 UTC 会话日界回归：trend
 // 日桶必须按统计时区日界分组（未配置 = UTC；与 summary 的 Go 侧统计时区区间
 // 一致）。bug 形态：date_trunc('day', timestamptz) 按会话 TimeZone 截断——
 // America/New_York（UTC-4/5）会话下 UTC 00:30 的桶会落入前一日桶（date 标签
@@ -502,16 +498,13 @@ func TestPGOverviewTrendUTCDayBoundary(t *testing.T) {
 		overviewBucket(day0.Add(30*time.Minute), 7, 5, 1, 50, 25, 75, 0, 50_000),  // UTC 今日 00:30
 	)
 
-	dsn := os.Getenv("TEST_DATABASE_URL")
+	dsn := pgtest.Clone(t)
 	if strings.Contains(dsn, "?") {
-		dsn += "&search_path=" + handlerOverviewPGTestSchema
+		dsn += "&options=-c%20TimeZone%3DAmerica%2FNew_York"
 	} else {
-		dsn += "?search_path=" + handlerOverviewPGTestSchema
+		dsn += "?options=-c%20TimeZone%3DAmerica%2FNew_York"
 	}
-	dsn += "&options=-c%20TimeZone%3DAmerica%2FNew_York"
-	nyPool, err := repository.OpenPG(ctx, dsn, 2)
-	require.NoError(t, err)
-	t.Cleanup(nyPool.Close)
+	nyPool := pgtest.OpenPool(t, dsn)
 	conn, err := nyPool.Acquire(ctx)
 	require.NoError(t, err)
 	var tz string
@@ -523,7 +516,7 @@ func TestPGOverviewTrendUTCDayBoundary(t *testing.T) {
 	nyRepos, err := repository.NewWithPG(t.Context(), entsql.OpenDB(dialect.Postgres, nyDB), false, nyPool)
 	require.NoError(t, err)
 
-	tr, err := nyRepos.Stats.ScanStatsDays(ctx, day0.Add(-24*time.Hour), day0.Add(24*time.Hour), 0, time.UTC)
+	tr, err := nyRepos.Stats.ScanStatsDaysCube(ctx, day0.Add(-24*time.Hour), day0.Add(24*time.Hour), 0, time.UTC)
 	require.NoError(t, err)
 	// 修复前：NY 会话下 UTC 00:30 桶落前一日 → 1 桶且日期错位；修复后 2 桶按 UTC 日界
 	// （请求缺省 timezone = UTC——绑定参数支配，会话 TimeZone 不泄漏）。
@@ -543,4 +536,9 @@ func (p pgUserStatus) UserSnapshot(userID int64) (domain.UserSnapshot, bool) {
 		return domain.UserSnapshot{}, false
 	}
 	return domain.UserSnapshot{Status: u.Status, Role: u.Role}, true
+}
+
+// AuthenticateManagement 补全 auth.SnapshotProvider（users-only → mgmt 恒 false）。
+func (p pgUserStatus) AuthenticateManagement(*http.Request) (domain.ManagementKeyMeta, bool) {
+	return domain.ManagementKeyMeta{}, false
 }

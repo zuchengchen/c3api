@@ -16,11 +16,11 @@ import (
 
 // PostGroups 创建分组（平台容量池；key 为独立表，用户面 /api/user/keys 创建，
 // ServerInterface）。price_multiplier（正常值 0~10，API 边界换算万分数）：
-// 缺省/null = 不设置（×1）；显式 0 = 免费组（恒写入——T3.5 修正：API 可表达
+// 缺省/null = 不设置（×1）；显式 0 = 免费组（恒写入：API 可表达
 // 显式 0，repo 不再把 0 当未指定）。
 func (h *AdminAPI) PostGroups(w http.ResponseWriter, r *http.Request) {
 	var in GroupCreate
-	if err := decode(r, &in); err != nil {
+	if err := httpface.Decode(r, &in); err != nil {
 		httpface.WriteErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
@@ -42,7 +42,12 @@ func (h *AdminAPI) PostGroups(w http.ResponseWriter, r *http.Request) {
 			pcs = append(pcs, domain.ProtocolConvert(pc))
 		}
 	}
-	g, err := h.svc.CreateGroup(r.Context(), in.Name, visibility, mult, pcs)
+	// description 可选（自由文本）：nil/null 与显式 "" 均得 ""（空串 = 无描述）。
+	desc := ""
+	if in.Description != nil {
+		desc = *in.Description
+	}
+	g, err := h.svc.CreateGroup(r.Context(), in.Name, desc, visibility, mult, pcs)
 	if err != nil {
 		httpface.WriteServiceErr(w, err)
 		return
@@ -53,11 +58,11 @@ func (h *AdminAPI) PostGroups(w http.ResponseWriter, r *http.Request) {
 // GetGroups 分组列表（分页/筛选/排序，ServerInterface）。
 func (h *AdminAPI) GetGroups(w http.ResponseWriter, r *http.Request, params GetGroupsParams) {
 	q := repository.ListQuery{
-		Limit:  httpface.ClampLimit(int(deref(params.Limit))),
-		Offset: int(deref(params.Offset)),
-		Name:   deref(params.Name),
-		Sort:   deref(params.Sort),
-		Order:  string(deref(params.Order)),
+		Limit:  httpface.ClampLimit(int(httpface.Deref(params.Limit))),
+		Offset: int(httpface.Deref(params.Offset)),
+		Name:   httpface.Deref(params.Name),
+		Sort:   httpface.Deref(params.Sort),
+		Order:  string(httpface.Deref(params.Order)),
 	}
 	rows, total, err := h.svc.ListGroups(r.Context(), q)
 	if err != nil {
@@ -85,7 +90,7 @@ func (h *AdminAPI) GetGroupsId(w http.ResponseWriter, r *http.Request, id int64)
 // 0~10）提供（含 0 = 免费）即写入；缺省 = 保持原值。
 func (h *AdminAPI) PutGroupsId(w http.ResponseWriter, r *http.Request, id int64) {
 	var in GroupCreate
-	if err := decode(r, &in); err != nil {
+	if err := httpface.Decode(r, &in); err != nil {
 		httpface.WriteErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
@@ -95,6 +100,11 @@ func (h *AdminAPI) PutGroupsId(w http.ResponseWriter, r *http.Request, id int64)
 		return
 	}
 	g.Name = in.Name
+	// description 缺省（null/省略）= 保持原值（读改写路径携带原值自然保留）；
+	// 显式 ""（含非空）= 覆盖/清空，与 visibility/multiplier/protocol 同款语义。
+	if in.Description != nil {
+		g.Description = *in.Description
+	}
 	if in.Visibility != nil {
 		g.Visibility = domain.GroupVisibility(*in.Visibility)
 	}
@@ -124,10 +134,10 @@ func (h *AdminAPI) PutGroupsId(w http.ResponseWriter, r *http.Request, id int64)
 // PutGroupsIdAssignments 设置组的授予用户（platform_admin 专属；替换语义：
 // 未列出即撤销，空数组 = 清空；ServerInterface）。multipliers 可选：user_id →
 // 该用户在该组的专属价格倍率（正常值 0~10；null = 清除为未设置 → 回退组
-// 倍率；T3.5 修正：用户专属倍率按组挂载）。
+// 倍率； 修正：用户专属倍率按组挂载）。
 func (h *AdminAPI) PutGroupsIdAssignments(w http.ResponseWriter, r *http.Request, id int64) {
 	var in GroupAssignmentsBody
-	if err := decode(r, &in); err != nil {
+	if err := httpface.Decode(r, &in); err != nil {
 		httpface.WriteErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
@@ -179,7 +189,7 @@ func (h *AdminAPI) DeleteGroupsId(w http.ResponseWriter, r *http.Request, id int
 // service 完成，ServerInterface）。
 func (h *AdminAPI) PostGroupsBatchDelete(w http.ResponseWriter, r *http.Request) {
 	var in BatchDeleteBody
-	if err := decode(r, &in); err != nil {
+	if err := httpface.Decode(r, &in); err != nil {
 		httpface.WriteErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
@@ -198,7 +208,7 @@ func (h *AdminAPI) PostGroupsBatchDelete(w http.ResponseWriter, r *http.Request)
 // PostGroupsBatchUpdate 批量更新分组（fields 任意子集，ServerInterface）。
 func (h *AdminAPI) PostGroupsBatchUpdate(w http.ResponseWriter, r *http.Request) {
 	var in BatchUpdateGroupsBody
-	if err := decode(r, &in); err != nil {
+	if err := httpface.Decode(r, &in); err != nil {
 		httpface.WriteErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}

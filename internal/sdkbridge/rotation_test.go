@@ -22,11 +22,11 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// T5 §1：WithOnTokenRotated → account_ext 部分更新回写（RotationStore 落库面）
+// §1：WithOnTokenRotated → account_ext 部分更新回写（RotationStore 落库面）
 // ---------------------------------------------------------------------------
 
 // fakeRotationStore 轮转回写替身：记录 (accountID, at, rt, expiresAt) 调用序
-// 列；err 注入失败（D4 链接管测试）。
+// 列；err 注入失败（链接管测试）。
 type fakeRotationStore struct {
 	mu    sync.Mutex
 	calls []rotationCall
@@ -56,10 +56,11 @@ func (f *fakeRotationStore) snapshot() []rotationCall {
 // 判死 token_expired，触发 SDK 自动轮转）；其余 → 200 成功响应。与
 // TestCodex401RotationSuccess 的计数法区别：并发测试下按凭据判别确定性。
 type rotationUpstream struct {
-	mu    sync.Mutex
-	calls int
-	auths []string
-	URL   string
+	mu     sync.Mutex
+	calls  int
+	auths  []string
+	URL    string
+	onCall func() // 测试钩子：每次命中上游时（互斥区外）调用，单飞屏障用
 }
 
 func newRotationUpstream(t *testing.T, atOld string) *rotationUpstream {
@@ -70,11 +71,18 @@ func newRotationUpstream(t *testing.T, atOld string) *rotationUpstream {
 		u.mu.Lock()
 		u.calls++
 		u.auths = append(u.auths, auth)
+		hook := u.onCall
 		u.mu.Unlock()
 		if auth != "Bearer "+atOld {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(okImageResponse))
 			return
+		}
+		// onCall 仅在旧 at 首拨（401 路径）触发：重试携带新 at，若也计入会把单飞屏障
+		// 提前喂满 → 漏掉尚未拿到 401 的客户端 → 触发二次 refresh → 屏障永远等不到 N 而
+		// 死锁（CI/低并行度必现）。屏障须只对齐「N 个不同客户端的首拨 401」。
+		if hook != nil {
+			hook()
 		}
 		w.WriteHeader(401)
 		_, _ = w.Write([]byte(`{"error":{"code":"token_expired"}}`))
@@ -98,11 +106,9 @@ func TestCodexRotationWritebackPersists(t *testing.T) {
 	up := newRotationUpstream(t, "at-old")
 	refresh := newCodexMockRefresh(t, codexUpstreamStep{status: 200, body: `{"access_token":"at-new","refresh_token":"rt-new"}`})
 	store := &fakeRotationStore{}
-	a := NewCodex(nil)
-	a.SetRotationDeps(RotationDeps{Store: store})
+	a := NewCodex(nil, newOfficialRewriteTransport(t, up.URL), RotationDeps{Store: store})
 
 	cred := oauthCred(7, "at-old", "rt-1")
-	a.SetTransport(newOfficialRewriteTransport(t, up.URL))
 	expires := cred.OAuthExpiresAt
 
 	img, err := a.GenerateImage(context.Background(), cred, &domain.ImageGenParams{Model: "gpt-image-2", Prompt: "cat"})
@@ -139,11 +145,9 @@ func TestCodexRotationWritebackMissingRefreshKeepsOldRT(t *testing.T) {
 	// refresh 响应缺 refresh_token（auth_oauth.go:402-406 字段均可选）
 	newCodexMockRefresh(t, codexUpstreamStep{status: 200, body: `{"access_token":"at-new"}`})
 	store := &fakeRotationStore{}
-	a := NewCodex(nil)
-	a.SetRotationDeps(RotationDeps{Store: store})
+	a := NewCodex(nil, newOfficialRewriteTransport(t, up.URL), RotationDeps{Store: store})
 
 	cred := oauthCred(7, "at-old", "rt-1")
-	a.SetTransport(newOfficialRewriteTransport(t, up.URL))
 
 	_, err := a.GenerateImage(context.Background(), cred, &domain.ImageGenParams{Model: "gpt-image-2", Prompt: "cat"})
 	require.NoError(t, err)
@@ -154,7 +158,7 @@ func TestCodexRotationWritebackMissingRefreshKeepsOldRT(t *testing.T) {
 }
 
 // rotationUpstream401Always 恒 401 mock（新旧 at 一律 401 非判死码）——每次
-// 请求都触发 refresh（D4 重试投递测试用）。
+// 请求都触发 refresh（重试投递测试用）。
 type rotationUpstream401Always struct {
 	mu    sync.Mutex
 	calls int
@@ -186,13 +190,34 @@ func (u *rotationUpstream401Always) callsN() int {
 // 一次 SDK 单飞 refresh（同账号轮转回调串行——auth_oauth.go:217-244）→
 // RotationStore 恰一次写入。
 func TestCodexRotationWritebackSingleFlight(t *testing.T) {
+	const n = 8
 	up := newRotationUpstream(t, "at-old")
-	// refresh 慢响应（100ms）扩大单飞窗口：全部 N 请求在 leader refresh 完成
-	// 前命中 401 并加入单飞（等待者共享 leader 轮转结果）
+	// 并发屏障置于**上游**：旧 at 首拨的每次上游命中都阻塞，直到 N 路全部到齐后
+	// 一并放行 → N 路同时收到 401、同时进入单飞，由 SDK 去重成一次 refresh。
+	//
+	// 不把屏障放在 refresh 服务器上「等 N 个上游到达」：它无法观测「客户端已 join」，
+	// 在低并行度/CI 下会出现「第 N 路到达时尚未 join」的竞态 → 触发二次 refresh →
+	// 屏障凑不齐 N 而每轮各等 10s（GOMAXPROCS=1 曾 100% 复现 30s 失败）。上游同时放行
+	// 使 N 路进入单飞的时间差仅微秒级，远小于一次 refresh 往返（毫秒级），稳健。
+	var arrived atomic.Int64
+	release := make(chan struct{})
+	up.onCall = func() {
+		if arrived.Add(1) == int64(n) {
+			close(release)
+		}
+		select {
+		case <-release:
+		case <-time.After(10 * time.Second): // 超时兜底放行防死锁
+		}
+	}
 	var refreshCalls atomic.Int64
 	rsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		refreshCalls.Add(1)
-		time.Sleep(100 * time.Millisecond)
+		// 拉长单飞 leader 的 refresh，使其远大于 N 路进入单飞的微秒级时间差：
+		// 否则本地 httptest 子毫秒即返回，落后者会在 leader 完成后再起一次 refresh
+		// → 计数 >1（GOMAXPROCS 受限时必现）。真实 refresh 是毫秒级网络往返，本延迟
+		// 即对齐该量级，让 8 路都并入同一次单飞。
+		time.Sleep(50 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte(`{"access_token":"at-new","refresh_token":"rt-new"}`))
@@ -200,13 +225,10 @@ func TestCodexRotationWritebackSingleFlight(t *testing.T) {
 	t.Cleanup(rsrv.Close)
 	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", rsrv.URL)
 	store := &fakeRotationStore{}
-	a := NewCodex(nil)
-	a.SetRotationDeps(RotationDeps{Store: store})
+	a := NewCodex(nil, newOfficialRewriteTransport(t, up.URL), RotationDeps{Store: store})
 
 	cred := oauthCred(7, "at-old", "rt-1")
-	a.SetTransport(newOfficialRewriteTransport(t, up.URL))
 
-	const n = 8
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	errs := make([]error, n)
@@ -228,7 +250,7 @@ func TestCodexRotationWritebackSingleFlight(t *testing.T) {
 	require.Len(t, store.snapshot(), 1, "并发单飞不重复回写——同账号轮转回调串行")
 }
 
-// TestCodexRotationWritebackFailureD4Fatal 回写失败 → D4 链接管：回调 panic
+// TestCodexRotationWritebackFailureD4Fatal 回写失败 → 链接管：回调 panic
 // → SDK recover → pending 重试投递（同一 (at, rt) 幂等重试）→ 连续失败达阈
 // 值（默认 3）→ CallbackDeliveryError fatal → 统一回调单次上报（fail-closed：
 // 令牌无法持久化 = 账号失效信号）。
@@ -240,14 +262,12 @@ func TestCodexRotationWritebackFailureD4Fatal(t *testing.T) {
 	)
 	handler := &recordingHandler{}
 	store := &fakeRotationStore{err: errors.New("db down")}
-	a := NewCodex(handler.add)
-	a.SetRotationDeps(RotationDeps{Store: store})
+	a := NewCodex(handler.add, newOfficialRewriteTransport(t, up.URL), RotationDeps{Store: store})
 
 	cred := oauthCred(7, "at-old", "rt-1")
-	a.SetTransport(newOfficialRewriteTransport(t, up.URL))
 
-	// R1：refresh run1 回调失败（fail#1，pending，本次 at 放行）→ 401 重试
-	// 防重试风暴不再 refresh → HTTPError 401（回写失败不阻塞请求——D4 语义）
+	// R1：refresh run1 回调失败（fail，pending，本次 at 放行）→ 401 重试
+	// 防重试风暴不再 refresh → HTTPError 401（回写失败不阻塞请求——语义）
 	_, err := a.GenerateImage(context.Background(), cred, &domain.ImageGenParams{Model: "gpt-image-2", Prompt: "cat"})
 	require.Error(t, err)
 	var he *codexsdk.HTTPError
@@ -255,7 +275,7 @@ func TestCodexRotationWritebackFailureD4Fatal(t *testing.T) {
 	require.Len(t, store.snapshot(), 1, "R1 回调失败一次（pending 未交付）")
 	require.Empty(t, handler.snapshot(), "R1 不触发 fatal 上报")
 
-	// R2：refresh run2 先 deliverPendingRotate（fail#2）→ 新回调失败（fail#3
+	// R2：refresh run2 先 deliverPendingRotate（fail）→ 新回调失败（fail
 	// ≥ 阈值）→ CallbackDeliveryError fatal → 统一回调单次上报
 	_, err = a.GenerateImage(context.Background(), cred, &domain.ImageGenParams{Model: "gpt-image-2", Prompt: "cat"})
 	require.Error(t, err)
@@ -264,22 +284,21 @@ func TestCodexRotationWritebackFailureD4Fatal(t *testing.T) {
 	require.Equal(t, 3, cd.Attempts)
 
 	calls := handler.snapshot()
-	require.Len(t, calls, 1, "D4 fatal 统一上报恰一次（双源去重——OnAuthFatal 与 errors.As 同 fatal）")
+	require.Len(t, calls, 1, " fatal 统一上报恰一次（双源去重——OnAuthFatal 与 errors.As 同 fatal）")
 	var cd2 *codexsdk.CallbackDeliveryError
 	require.True(t, errors.As(calls[0].fatal, &cd2))
 	require.Equal(t, int64(7), calls[0].accountID)
 	require.Len(t, store.snapshot(), 3, "回调三次失败（run1 新回调 + run2 pending 重试 + run2 新回调）——同一 (at, rt) 幂等重试")
 }
 
-// TestCodexRotationWritebackUnwired 回写面未装配（SetRotationDeps 未调用——
+// TestCodexRotationWritebackUnwired 回写面未装配（RotationDeps 零值——
 // 测试/旧装配形态）：轮转正常进行，回写 no-op 不 panic。
 func TestCodexRotationWritebackUnwired(t *testing.T) {
 	up := newRotationUpstream(t, "at-old")
 	newCodexMockRefresh(t, codexUpstreamStep{status: 200, body: `{"access_token":"at-new","refresh_token":"rt-new"}`})
-	a := NewCodex(nil) // 未装配 rotate
+	a := NewCodex(nil, newOfficialRewriteTransport(t, up.URL), RotationDeps{}) // 未装配 rotate
 
 	cred := oauthCred(7, "at-old", "rt-1")
-	a.SetTransport(newOfficialRewriteTransport(t, up.URL))
 	_, err := a.GenerateImage(context.Background(), cred, &domain.ImageGenParams{Model: "gpt-image-2", Prompt: "cat"})
 	require.NoError(t, err, "未装配回写面不阻断轮转")
 	require.Equal(t, "Bearer at-new", up.auth(1))
@@ -291,11 +310,9 @@ func TestRotationCallExpiryNilPreserved(t *testing.T) {
 	up := newRotationUpstream(t, "at-old")
 	newCodexMockRefresh(t, codexUpstreamStep{status: 200, body: `{"access_token":"at-new","refresh_token":"rt-new"}`})
 	store := &fakeRotationStore{}
-	a := NewCodex(nil)
-	a.SetRotationDeps(RotationDeps{Store: store})
+	a := NewCodex(nil, newOfficialRewriteTransport(t, up.URL), RotationDeps{Store: store})
 
 	cred := &domain.AccountCredential{AccountID: 7, OAuthToken: "at-old", OAuthRefreshToken: "rt-1"}
-	a.SetTransport(newOfficialRewriteTransport(t, up.URL))
 	_, err := a.GenerateImage(context.Background(), cred, &domain.ImageGenParams{Model: "gpt-image-2", Prompt: "cat"})
 	require.NoError(t, err)
 	calls := store.snapshot()
@@ -304,7 +321,7 @@ func TestRotationCallExpiryNilPreserved(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T5 §3：FatalAuth（WS 业务判死帧——毒化 + 单次上报 + 双源去重）
+// §3：FatalAuth（WS 业务判死帧——毒化 + 单次上报 + 双源去重）
 // ---------------------------------------------------------------------------
 
 // TestCodexFatalAuthPoisonAndDedup 帧判死接线：FatalAuth → Auth 毒化（后续
@@ -315,10 +332,9 @@ func TestCodexFatalAuthPoisonAndDedup(t *testing.T) {
 	up, _ := newCodexUpstream(t, codexUpstreamStep{status: 200, body: okImageResponse})
 	defer up.Close()
 	handler := &recordingHandler{}
-	a := NewCodex(handler.add)
+	a := NewCodex(handler.add, newOfficialRewriteTransport(t, up.URL), RotationDeps{})
 
 	cred := oauthCred(7, "at-1", "rt-1")
-	a.SetTransport(newOfficialRewriteTransport(t, up.URL))
 	_, err := a.GenerateImage(context.Background(), cred, &domain.ImageGenParams{Model: "gpt-image-2", Prompt: "cat"})
 	require.NoError(t, err)
 
@@ -345,7 +361,7 @@ func TestCodexFatalAuthPoisonAndDedup(t *testing.T) {
 // no-op 不 panic（条目不存在 = 并发 fatal 已上报剔除，上报已由胜者完成）。
 func TestCodexFatalAuthNilAndMissing(t *testing.T) {
 	handler := &recordingHandler{}
-	a := NewCodex(handler.add)
+	a := NewCodex(handler.add, nil, RotationDeps{})
 	require.NotPanics(t, func() {
 		a.FatalAuth(7, nil)
 		a.FatalAuth(999, &codexsdk.AuthPermanentlyRevokedError{Code: "token_revoked"})

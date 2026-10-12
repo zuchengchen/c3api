@@ -7,6 +7,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import { Boxes, Pencil, Plus, Settings2, Trash2, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import type { TFunction } from 'i18next'
 import { api } from '@/App'
 import { ApiError, ApiUnauthorized } from '@/lib/api/client'
 import type { components } from '@/lib/api/schema'
@@ -40,7 +41,7 @@ type Template = components['schemas']['Template']
 type TemplateCreate = components['schemas']['TemplateCreate']
 type TemplatePatch = components['schemas']['TemplatePatch']
 type TemplateExt = components['schemas']['TemplateExt']
-// 模板格式联合 = API SupportedFormats 元素类型（W1 扩展后为 4 值含 openai-responses-ws；
+// 模板格式联合 = API SupportedFormats 元素类型（扩展后为 4 值含 openai-responses-ws；
 // 不用 RequestFormat 别名——usage 侧枚举保持 3 值，模板格式与其已分化）。
 type TemplateFormat = components['schemas']['Template']['SupportedFormats'][number]
 type TemplateCredentialType = NonNullable<Template['CredentialType']>
@@ -160,7 +161,7 @@ function mappingOf(rows: MappingRow[]): Record<string, ModelMappingEntry> {
   return out
 }
 
-function validateMappingRows(rows: MappingRow[], tr: (k: string, o?: Record<string, unknown>) => string): string | null {
+function validateMappingRows(rows: MappingRow[], tr: TFunction): string | null {
   const seen = new Set<string>()
   for (const r of rows) {
     const aliasTrim = r.alias.trim()
@@ -232,7 +233,7 @@ function FormFields({
   form: FormState
   setForm: (updater: (f: FormState) => FormState) => void
   error?: string | null
-  batch?: boolean // 批量更新隐藏凭据类型（TemplatePatch 不支持类型变更，评审 M-2）
+  batch?: boolean // 批量更新隐藏凭据类型（TemplatePatch 不支持类型变更）
   batchCodex?: boolean
   batchMappingMode?: BatchMappingMode
   setBatchMappingMode?: (v: BatchMappingMode) => void
@@ -804,7 +805,7 @@ export default function Templates() {
         </motion.div>
       ) : (
         <>
-          <ScrollArea data-od-id="table-scroll-templates" className="rounded-[14px] border border-transparent bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] after:pointer-events-none after:absolute after:inset-0 after:z-20 after:rounded-[14px] after:border after:border-[rgba(19,45,83,0.26)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:after:border-[rgba(148,180,220,0.32)]" showHorizontal>
+          <ScrollArea data-od-id="table-scroll-templates" className="rounded-[14px] border border-[rgba(19,45,83,0.26)] bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:border-[rgba(148,180,220,0.32)]" showHorizontal>
             <Table className="min-w-[1500px]" containerClassName="overflow-x-visible border-0 shadow-none rounded-none bg-transparent backdrop-blur-none">
               <TableHeader>
                 <TableRow>
@@ -969,7 +970,7 @@ export default function Templates() {
       <Dialog open={!!extTarget} onOpenChange={o => { if (!o && !extSave.isPending) setExtTarget(null) }}>
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
-            <DialogTitle>{tr('templates.ext.title', { id: extTarget?.ID })}</DialogTitle>
+            <DialogTitle>{tr('templates.ext.title', { id: extTarget?.ID ?? 0 })}</DialogTitle>
             <DialogDescription>{tr('templates.ext.desc')}</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
@@ -1011,7 +1012,7 @@ export default function Templates() {
           <DialogHeader>
             <DialogTitle>{tr('templates.deleteTitle')}</DialogTitle>
             <DialogDescription>
-              {tr('templates.deleteDesc', { name: deleting?.Name })}
+              {tr('templates.deleteDesc', { name: deleting?.Name ?? '' })}
             </DialogDescription>
           </DialogHeader>
           {remove.isError && errMsg(remove.error) && (

@@ -315,7 +315,7 @@ export default function RedemptionCodes() {
         </motion.div>
       ) : (
         <>
-          <ScrollArea data-od-id="table-scroll-redemption-codes" className="rounded-[14px] border border-transparent bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] after:pointer-events-none after:absolute after:inset-0 after:z-20 after:rounded-[14px] after:border after:border-[rgba(19,45,83,0.26)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:after:border-[rgba(148,180,220,0.32)]" showHorizontal>
+          <ScrollArea data-od-id="table-scroll-redemption-codes" className="rounded-[14px] border border-[rgba(19,45,83,0.26)] bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:border-[rgba(148,180,220,0.32)]" showHorizontal>
             <Table className="min-w-[1200px]" containerClassName="overflow-x-visible border-0 shadow-none rounded-none bg-transparent backdrop-blur-none">
               <TableHeader>
                 <TableRow>
@@ -334,6 +334,7 @@ export default function RedemptionCodes() {
                   <SortableHeader field="status" label={t('redemptions.table.status')} active={activeSort === 'status'} order={order} onToggle={onColumnToggle} />
                   <TableHead>{t('redemptions.table.expiresAt')}</TableHead>
                   <TableHead>{t('redemptions.table.remark')}</TableHead>
+                  <SortableHeader field="created_by" label={t('redemptions.table.createdBy')} active={activeSort === 'created_by'} order={order} onToggle={onColumnToggle} />
                   <TableHead className="text-right">{t('redemptions.table.actions')}</TableHead>
                 </TableRow>
               </TableHeader>
@@ -357,7 +358,7 @@ export default function RedemptionCodes() {
                     <TableCell className="tabular-nums">{c.UsedCount} / {c.MaxUses}</TableCell>
                     <TableCell><CodeStatusBadge status={c.Status} /></TableCell>
                     <TableCell>
-                      <div className="text-sm">{formatDateTime(c.ExpiresAt)}</div>
+                      <div className="text-sm">{formatDateTime(c.ExpiresAt ?? undefined)}</div>
                       {c.ResourceExpiresAt && (
                         <div className="text-xs text-muted-foreground">
                           {t('redemptions.table.resourceExpiresAt')}: {formatDateTime(c.ResourceExpiresAt)}
@@ -365,6 +366,7 @@ export default function RedemptionCodes() {
                       )}
                     </TableCell>
                     <TableCell className="max-w-40 truncate" title={c.Remark ?? undefined}>{c.Remark || '—'}</TableCell>
+                    <TableCell className="tabular-nums">{`#${c.CreatedBy}`}</TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-1">
                         <Button variant="ghost" size="icon-sm" title={t('redemptions.uses')} data-od-id="redemption-uses" onClick={() => setUsesFor(c)}>
@@ -424,7 +426,7 @@ export default function RedemptionCodes() {
           ) : (
             <>
               <div className="space-y-3">
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div className="space-y-1.5">
                     <Label>{t('redemptions.typeLabel')}</Label>
                     <Select
@@ -450,7 +452,7 @@ export default function RedemptionCodes() {
                   <Label htmlFor="rc-remark">{t('redemptions.remarkLabel')}</Label>
                   <Input id="rc-remark" value={genForm.remark} placeholder={t('redemptions.remarkPlaceholder')} onChange={e => updateGenForm({ remark: e.target.value })} />
                 </div>
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div className="space-y-1.5">
                     <Label htmlFor="rc-expires">{t('redemptions.expiresAtLabel')}</Label>
                     <DateTimePicker id="rc-expires" value={genForm.expires_at} onChange={v => updateGenForm({ expires_at: v })} />
@@ -467,7 +469,7 @@ export default function RedemptionCodes() {
                     )}
                   </div>
                 </div>
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div className="space-y-1.5">
                     <Label htmlFor="rc-max">{t('redemptions.maxUsesLabel')}</Label>
                     <Input id="rc-max" type="number" min={1} value={genForm.max_uses} onChange={e => updateGenForm({ max_uses: e.target.value })} />
@@ -500,7 +502,7 @@ export default function RedemptionCodes() {
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
             <DialogTitle>{t('redemptions.deactivateTitle')}</DialogTitle>
-            <DialogDescription>{t('redemptions.deactivateDesc', { code: deactivating?.Code })}</DialogDescription>
+            <DialogDescription>{t('redemptions.deactivateDesc', { code: deactivating?.Code ?? '' })}</DialogDescription>
           </DialogHeader>
           {deactivate.isError && errMsg(deactivate.error) && (
             <p className="text-sm text-destructive">{errMsg(deactivate.error)}</p>
@@ -518,7 +520,7 @@ export default function RedemptionCodes() {
       <Dialog open={!!usesFor} onOpenChange={o => { if (!o) setUsesFor(null) }}>
         <DialogContent className="sm:max-w-lg overflow-hidden">
           <DialogHeader>
-            <DialogTitle>{t('redemptions.usesTitle', { code: usesFor?.Code })}</DialogTitle>
+            <DialogTitle>{t('redemptions.usesTitle', { code: usesFor?.Code ?? '' })}</DialogTitle>
             <DialogDescription>{t('redemptions.usesDesc')}</DialogDescription>
           </DialogHeader>
           {usesQ.isError ? (

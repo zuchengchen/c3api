@@ -8,8 +8,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +22,7 @@ import (
 	"github.com/is7qin/c3api/internal/repository"
 	"github.com/is7qin/c3api/internal/rule"
 	"github.com/is7qin/c3api/internal/scheduler"
+	"github.com/is7qin/c3api/internal/testsupport/pgtest"
 	"github.com/is7qin/c3api/internal/usage"
 	"github.com/is7qin/c3api/pkg/aiclient"
 )
@@ -33,38 +32,24 @@ import (
 //	TEST_DATABASE_URL=postgres://postgres:c3api@127.0.0.1:15432/c3api_test \
 //	  go test ./internal/proxy/ -run TestPGResponsesSpecialCredential -v
 //
-// 未设置 TEST_DATABASE_URL → t.Skip。独立 schema（proxy_rsp_special_test）：
-// 与同包 pg_responses_ws_test 的 proxy_ws_test、repository 包的 public schema
-// 测试并行跑均不互踩。
-
-const rspSpecialPGTestSchema = "proxy_rsp_special_test"
+// 未设置 TEST_DATABASE_URL → t.Skip。每测试克隆一个私有数据库（pgtest.Clone，
+// 隔离粒度 = database）：与同包 pg_responses_ws_test、repository 包的 PG 测试
+// 并行跑均不互踩。
 
 // TestPGResponsesSpecialCredential responses-special 模板（主列
 // credential_type）+ 账号 upstream_key → 真实 PG 快照 → Selection →
-// credentialFor 取 key 成功（P4 502 消灭断言：修复前 TypeResponsesSpecial 未
+// credentialFor 取 key 成功（502 消灭断言：修复前 TypeResponsesSpecial 未
 // 注册 → For 兜底（现 unsupportedProvider，旧 apiKeyProvider）→ Credential
 // 类型不匹配 ErrUnsupported → 真实流量 502 unsupported credential type；本断
 // 言确定性红）。HTTP 补充：完整 resp-ws 会话正常闭环（上游校验 Authorization:
 // Bearer <账号 key>）。
 func TestPGResponsesSpecialCredential(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping real-PostgreSQL test")
-	}
-	if strings.Contains(dsn, "?") {
-		dsn += "&search_path=" + rspSpecialPGTestSchema
-	} else {
-		dsn += "?search_path=" + rspSpecialPGTestSchema
-	}
+	dsn := pgtest.Clone(t)
 	ctx := context.Background()
-	pool, err := repository.OpenPG(ctx, dsn, 5)
-	require.NoError(t, err)
-	t.Cleanup(pool.Close)
+	pool := pgtest.OpenPool(t, dsn)
 	db := stdlib.OpenDBFromPool(pool)
 	t.Cleanup(func() { _ = db.Close() })
-	_, err = db.ExecContext(ctx, `DROP SCHEMA IF EXISTS `+rspSpecialPGTestSchema+` CASCADE; CREATE SCHEMA `+rspSpecialPGTestSchema+`;`)
-	require.NoError(t, err)
-	repos, err := repository.New(entsql.OpenDB(dialect.Postgres, db), true)
+	repos, err := repository.New(entsql.OpenDB(dialect.Postgres, db), false)
 	require.NoError(t, err)
 
 	up := fakeResponsesWS(t, &fakeWSHooks{frameLimit: 1})
@@ -81,27 +66,28 @@ func TestPGResponsesSpecialCredential(t *testing.T) {
 	require.NoError(t, err)
 	acc, err := repos.Accounts.CreateAccount(ctx, &domain.Account{
 		Name: "a-rsp", TemplateID: tpl.ID, UpstreamKey: "sk-upstream",
-		Weight: 1, MaxConcurrency: 8,
+		MaxConcurrency: 8, Enabled: true,
 	})
 	require.NoError(t, err)
 	require.NoError(t, repos.Accounts.SetAccountGroups(ctx, acc.ID, []int64{g.ID}))
 
-	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil)
+	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil, nil, nil)
 	require.NoError(t, re.Reload(context.Background())) // 空表写种子（同 newTestProxyTplTimeoutRec）
 	sched := scheduler.New(scheduler.Config{
-		DefaultMaxConcurrency: 4, SyncInterval: time.Hour,
-	}, repos.Groups, re, nil)
+		SyncInterval: time.Hour,
+	}, repos.Groups, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
+	publishTestRoutes(t, sched)
 
 	sel, err := sched.Select(g.ID, domain.FormatOpenAIResponsesWS, "gpt-4o")
 	require.NoError(t, err, "responses-special 模板选号")
 	require.Equal(t, credential.TypeResponsesSpecial, sel.CredentialType, "模板主列 credential_type 随快照下发")
 	require.Equal(t, "sk-upstream", sel.UpstreamKey, "账号 upstream_key 随 Selection 携带")
-	defer sched.Release(sel.AccountID)
+	defer sel.Release()
 
 	p := newPGTestProxy(t, sched, g.ID)
 
-	// P4 502 消灭断言（确定性）：credentialFor 必须取到账号 key。
+	// 502 消灭断言（确定性）：credentialFor 必须取到账号 key。
 	cred, err := p.credentialFor(ctx, sel)
 	require.NoError(t, err, "responses-special 凭据取用必须成功（修复前：未注册 → 502 unsupported credential type）")
 	require.Equal(t, "sk-upstream", cred)
@@ -137,7 +123,7 @@ func newPGTestProxy(t *testing.T, sched *scheduler.Scheduler, groupID int64) *Pr
 	}, noopLogStore{}, nil)
 	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{
 		"ck-1": activeKey(1, 1, groupID),
-	}}, noopUserLoader{}, nil, true)
+	}}, noopUserLoader{}, nil, nil, true)
 	require.NoError(t, auth.Reload(context.Background())) // 构造不再自载——测试显式首刷
 	hc := &http.Client{Transport: http.DefaultTransport}
 	clients := aiclient.NewFactory(hc, aiclient.Config{
@@ -145,5 +131,5 @@ func newPGTestProxy(t *testing.T, sched *scheduler.Scheduler, groupID int64) *Pr
 		UpstreamStreamTimeout: 30 * time.Second,
 	})
 	errlogW := usage.NewErrLogWorker(usage.ErrLogConfig{QueueSize: 4096, FlushInterval: time.Hour}, noopErrLogStore{}, nil)
-	return New(cfg, sched, credential.New(), rec, clients, auth, nil, nil, errlogW)
+	return New(cfg, sched, credential.New(), rec, clients, auth, nil, nil, errlogW, Deps{})
 }

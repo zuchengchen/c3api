@@ -19,7 +19,7 @@ func (User) Fields() []ent.Field {
 		field.Int64("id"),
 		field.String("email").Unique(),
 		field.String("password_hash"),
-		field.Enum("role").Values("platform_admin", "user").Default("user"),
+		field.Enum("role").Values("platform_admin", "user", "supplier").Default("user"),
 		field.Enum("status").Values("active", "disabled").Default("active"),
 		field.Int("max_concurrency").Default(0),             // 0 = 不限
 		field.Int64("balance").Default(0),                   // 最小单位；Phase 5 扣费
@@ -38,6 +38,7 @@ func (User) Fields() []ent.Field {
 func (User) Edges() []ent.Edge {
 	return []ent.Edge{
 		edge.To("keys", Key.Type),
+		edge.To("management_keys", ManagementKey.Type),
 		edge.To("temp_balances", TempBalance.Type),
 		edge.To("group_assignments", GroupAssignment.Type),
 	}

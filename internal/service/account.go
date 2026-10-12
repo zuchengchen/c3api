@@ -6,49 +6,109 @@ package service
 
 import (
 	"context"
-	"time"
 
-	"github.com/is7qin/c3api/internal/credential"
 	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/notify"
 	"github.com/is7qin/c3api/internal/repository"
 	"github.com/is7qin/c3api/pkg/logx"
 )
 
-func (s *Service) CreateAccount(ctx context.Context, a *domain.Account) (*domain.Account, error) {
-	if err := validateAccount(a); err != nil {
+// CreateAccount 账号创建：与 PATCH 共用同一三态字段模型（repository.AccountPatch），
+// 创建侧额外要求 Name 与 TemplateID 必须显式提供。写时默认：Enabled=true、
+// UpstreamCostMultiplierBp=10000（×1）、CacheDomain/BaseURL=nil、无分组、
+// MaxConcurrency=注入的默认并发、LifecycleRevision=IdentityRevision=1。
+// 未提供的字段落默认；base_url/cache_domain 的 &"" 即 NULL（与默认一致）；
+// 显式 enabled:false 生效。
+func (s *Service) CreateAccount(ctx context.Context, p repository.AccountPatch) (*domain.Account, error) {
+	if p.Name == nil || *p.Name == "" {
+		return nil, ErrInvalidInput
+	}
+	if p.TemplateID == nil || *p.TemplateID <= 0 {
+		return nil, ErrInvalidInput
+	}
+	if err := validateAccountPatch(p); err != nil {
 		return nil, err
 	}
-	tpl, err := s.store.GetTemplate(ctx, a.TemplateID)
+	tpl, err := s.store.GetTemplate(ctx, *p.TemplateID)
 	if err != nil {
 		return nil, mapRepoErr(err) // 模板缺 id → 404
 	}
 	// upstream_key 必填性按模板类型：codex-oauth/codex-pat 凭据走 account_ext
 	// （创建后经 /accounts/{id}/ext 配置），可空；其余类型静态透传必填。
-	if a.UpstreamKey == "" && tpl.CredentialType != credential.TypeCodexOAuth && tpl.CredentialType != credential.TypeCodexPAT {
+	key := ""
+	if p.UpstreamKey != nil {
+		key = *p.UpstreamKey
+	}
+	if key == "" && !tpl.CredentialType.IsCodex() {
 		return nil, ErrInvalidInput
 	}
-	if isCodexCredentialType(tpl.CredentialType) && a.BaseURL != nil && *a.BaseURL != "" {
+	if tpl.CredentialType.IsCodex() && p.BaseURL != nil && *p.BaseURL != "" {
 		return nil, ErrInvalidInput
 	}
-	if a.GroupIDs != nil {
-		if err := s.checkGroupsExist(ctx, *a.GroupIDs); err != nil {
+	if p.GroupIDs != nil {
+		if err := s.checkGroupsExist(ctx, *p.GroupIDs); err != nil {
 			return nil, err // 组缺 id → 404
 		}
+	}
+	// 倍率：补丁未提供 → 显式落创建默认 ×1（10000）；提供 → 精确落值（含 0 = 免费）。
+	multBp := 10000
+	if p.UpstreamCostMultiplierBp != nil {
+		multBp = *p.UpstreamCostMultiplierBp
+	}
+	a := &domain.Account{
+		Name:                     *p.Name,
+		TemplateID:               *p.TemplateID,
+		UpstreamKey:              key,
+		MaxConcurrency:           s.defaultMaxConcurrency,
+		Enabled:                  true,
+		UpstreamCostMultiplierBp: &multBp,
+		LifecycleRevision:        1,
+		IdentityRevision:         1,
+	}
+	if p.BaseURL != nil && *p.BaseURL != "" {
+		v := *p.BaseURL
+		a.BaseURL = &v
+	}
+	if p.CacheDomain != nil && *p.CacheDomain != "" {
+		v := *p.CacheDomain
+		a.CacheDomain = &v
+	}
+	if p.MaxConcurrency != nil {
+		a.MaxConcurrency = *p.MaxConcurrency
+	}
+	if p.Enabled != nil {
+		a.Enabled = *p.Enabled
+	}
+	// 归属（§2.5 行层作用域的锚点）：
+	//   - 供应商面：服务端**钉死** JWT 本人（请求体出现该字段已由 handler 判 400，
+	//     故这里的 patch 值不可能来自供应商面请求体）。
+	//   - 管理面：投影**已验证的 patch owner**（`supplier_user_id` 是管理面把账号
+	//     分配给供应商的入口；前端创建表单就在发该字段）。值域校验（供应商面可达
+	//     + active）由仓储在**同一写事务内**锁 users 行后执行（ownership.go），
+	//     与禁用路径串行化——管理面单建因此与批量转属同纪律。
+	if sc := domain.AccountScopeFrom(ctx); sc.Set {
+		a.SupplierUserID = sc.OwnerUID
+	} else if p.SupplierUserID != nil && *p.SupplierUserID > 0 {
+		a.SupplierUserID = *p.SupplierUserID
 	}
 	created, err := s.store.CreateAccount(ctx, a)
 	if err != nil {
 		return nil, mapRepoErr(err)
 	}
-	if a.GroupIDs != nil {
+	if p.GroupIDs != nil {
 		// 创建才有 id；替换语义（含空数组 = 清空，对新建账号即无分组）。
-		if err := mapRepoErr(s.store.SetAccountGroups(ctx, created.ID, *a.GroupIDs)); err != nil {
+		if err := mapRepoErr(s.store.SetAccountGroups(ctx, created.ID, *p.GroupIDs)); err != nil {
 			return nil, err
 		}
 	}
-	// O2 组级定向：新账号进其分组快照（无分组账号不入任何快照 → 空集 no-op）。
-	s.inv.Accounts(groupsOf(a), false)
-	s.publish(ctx, notify.Change{Groups: groupsOf(a)})
+	// 组级定向：新账号进其分组快照（无分组账号不入任何快照 → 空集 no-op）。
+	s.inv.Accounts(groupsOfPatch(p), false)
+	s.publish(ctx, notify.Change{Groups: groupsOfPatch(p)})
+	// 新账号带供应商归属 ⇒ 财务视图换代（§4.6.3）：否则调度快照已含它、财务
+	// 视图未含，供给准入门会一直拒绝该账号入选（可用性缺口）。
+	if created.SupplierUserID > 0 {
+		s.reloadSupplierView(ctx)
+	}
 	return created, nil
 }
 
@@ -67,78 +127,86 @@ func (s *Service) ListAccounts(ctx context.Context, q repository.ListQuery) ([]*
 	return s.store.ListAccounts(ctx, q)
 }
 
-func (s *Service) UpdateAccount(ctx context.Context, a *domain.Account) (*domain.Account, error) {
-	if err := validateAccount(a); err != nil {
+// PatchAccount 账号配置的**唯一写点**：三态补丁一次落库，无条件推进配置代际 C
+// （客户端 CAS 令牌）。身份字段（模板/base_url/upstream_key）按值变更时另推进
+// 身份代际 K（由 repository 层判定并落库）。事务提交后统一失效：组级定向重载
+// + clients 失效（身份字段变更）+ NOTIFY——失效只在提交后执行，回滚路径不留
+// 半套失效。
+//
+// 三态语义由 repository.AccountPatch 承载：nil = 不变；base_url/cache_domain
+// 空串 = 清空（落 NULL）；有值 = 落值；group_ids nil = 不变、非 nil（含空数组）
+// = 替换。
+//
+// ifMatch 非 nil 时为前置条件（对当前 lifecycle_revision）：陈旧 →
+// ErrPreconditionFailed（412）；nil = 不做前置条件检查。
+//
+// 失效字段（failed_at/last_error/failure_source）不在写面内：失效恢复的唯一入口
+// 是 RecoverAccount。
+func (s *Service) PatchAccount(ctx context.Context, id int64, p repository.AccountPatch, ifMatch *int64) (*domain.Account, error) {
+	if err := validateAccountPatch(p); err != nil {
 		return nil, err
 	}
-	tpl, err := s.store.GetTemplate(ctx, a.TemplateID)
+	cur, err := s.store.GetAccount(ctx, id)
+	if err != nil {
+		return nil, mapRepoErr(err) // 缺 id → 404
+	}
+	if ifMatch != nil && *ifMatch != cur.LifecycleRevision {
+		return nil, ErrPreconditionFailed
+	}
+	// upstream_key 必填性按**合并后**的模板类型判定（模板可随本补丁一起改）。
+	tplID := cur.TemplateID
+	if p.TemplateID != nil {
+		tplID = *p.TemplateID
+	}
+	tpl, err := s.store.GetTemplate(ctx, tplID)
 	if err != nil {
 		return nil, mapRepoErr(err)
 	}
-	if a.UpstreamKey == "" && !isCodexCredentialType(tpl.CredentialType) {
+	key := cur.UpstreamKey
+	if p.UpstreamKey != nil {
+		key = *p.UpstreamKey
+	}
+	if key == "" && !tpl.CredentialType.IsCodex() {
 		return nil, ErrInvalidInput
 	}
-	if isCodexCredentialType(tpl.CredentialType) && a.BaseURL != nil && *a.BaseURL != "" {
-		return nil, ErrInvalidInput
-	}
-	if a.GroupIDs != nil {
-		if err := s.checkGroupsExist(ctx, *a.GroupIDs); err != nil {
+	if p.GroupIDs != nil {
+		if err := s.checkGroupsExist(ctx, *p.GroupIDs); err != nil {
 			return nil, err // 组缺 id → 404
 		}
 	}
-	// O2 组级定向：变更前取旧组（账号移组 A→B 时 A、B 两组快照都要重载——
-	// 旧组移除账号、新组加入账号）+ 旧 upstream_key/base_url 比较（变更 →
-	// clients 失效）。查询失败 → 空集 + Warn（调度器 ≤30s 同步兜底）。
-	oldGroups, gErr := s.store.GetAccountGroups(ctx, a.ID)
-	keyChanged := false
-	recovered := false // T5 失效恢复审计：此前已失效（failed_at 置位）→ status→active 恢复
-	if cur, err := s.store.GetAccount(ctx, a.ID); err == nil {
-		keyChanged = cur.UpstreamKey != a.UpstreamKey
-		// baseURLChanged 并入 keyChanged（C2——BaseURL 构建时固化在 client 缓存
-		// 键内，非流式路径新值不生效直到失效）：按值判定（M4——nil↔"" 同值，
-		// DB 经 create 归一/批量空串落 NULL 无 "" 形态，误报仅多余失效无害；
-		// 不引入 helper）。复用既有 Accounts(gids, keyChanged) 参数面，
-		// 零新增失效类型/调用点。
-		curB, newB := "", ""
-		if cur.BaseURL != nil {
-			curB = *cur.BaseURL
-		}
-		if a.BaseURL != nil {
-			newB = *a.BaseURL
-		}
-		keyChanged = keyChanged || curB != newB
-		recovered = cur.FailedAt != nil && a.Status == domain.StatusActive
-	}
-	var cooldownUntil *time.Time
-	if a.Status == domain.StatusActive {
-		now := time.Now()
-		cooldownUntil = &now
-	}
-	updated, err := s.store.UpdateAccount(ctx, a, cooldownUntil)
+	// 失效判据来自 repository 回显的**真实变更集**（身份类字段按值变更），
+	// 不在本层重写字段清单。
+	oldGroups, gErr := s.store.GetAccountGroups(ctx, id)
+	results, err := s.store.UpdateAccountsBatch(ctx, []int64{id}, p)
 	if err != nil {
 		return nil, mapRepoErr(err)
 	}
-	if recovered && s.log != nil {
-		// T5 §4 恢复操作审计（日志面）：status→active 隐含清 failed_at +
-		// last_error（repo 层执行），此处留痕恢复动作。
-		s.log.Info("account failure cleared (status->active)", logx.Int64("account_id", a.ID))
-	}
-	if a.GroupIDs != nil {
-		// nil = 不变；非 nil = 替换（含空数组 = 清空）。
-		if err := mapRepoErr(s.store.SetAccountGroups(ctx, a.ID, *a.GroupIDs)); err != nil {
-			return nil, err
-		}
-	}
 	gids := oldGroups
-	if a.GroupIDs != nil {
-		gids = append(gids, (*a.GroupIDs)...)
+	if p.GroupIDs != nil {
+		gids = append(gids, (*p.GroupIDs)...)
 	}
 	if gErr != nil && s.log != nil {
-		s.log.Warn("account groups query failed", logx.Int64("account_id", a.ID), logx.Error(gErr))
+		s.log.Warn("account groups query failed", logx.Int64("account_id", id), logx.Error(gErr))
 	}
-	s.inv.Accounts(gids, keyChanged)
-	s.publish(ctx, notify.Change{Groups: gids, Clients: keyChanged}) // upstream_key/base_url 变更 → clients 失效
-	return updated, nil
+	identityChanged := identityChangedIn(results)
+	s.inv.Accounts(gids, identityChanged)
+	s.publish(ctx, notify.Change{Groups: gids, Clients: identityChanged})
+	// 归属/启用变更 ⇒ 财务视图换代（§4.6.3 发布屏障）。
+	if p.SupplierUserID != nil || p.Enabled != nil {
+		s.reloadSupplierView(ctx)
+	}
+	return s.accountOrErr(ctx, id)
+}
+
+// identityChangedIn 汇总一次写入中是否有账号真的换了路由目标身份（身份类字段
+// 按值变更）。判据只来自 repository 回显的变更集，本层不重写字段清单。
+func identityChangedIn(results []repository.AccountWriteResult) bool {
+	for _, res := range results {
+		if res.ChangedFields.IdentityChanged() {
+			return true
+		}
+	}
+	return false
 }
 
 // GetAccountGroups 账号的分组 id 列表（编辑回显）。账号缺 id → 404。
@@ -160,7 +228,7 @@ func (s *Service) checkGroupsExist(ctx context.Context, ids []int64) error {
 }
 
 func (s *Service) DeleteAccount(ctx context.Context, id int64) error {
-	// O2：删除前查旧组（删除后快照须移除该账号）。
+	// 删除前查旧组（删除后快照须移除该账号）。
 	gids, err := s.store.GetAccountGroups(ctx, id)
 	if err != nil && s.log != nil {
 		s.log.Warn("account groups query failed", logx.Int64("account_id", id), logx.Error(err))
@@ -177,7 +245,7 @@ func (s *Service) DeleteAccountsBatch(ctx context.Context, ids []int64) error {
 	if err := validateIDs(ids); err != nil {
 		return err
 	}
-	// O2：删除前逐个查旧组（组级定向并集）。
+	// 删除前逐个查旧组（组级定向并集）。
 	var gids []int64
 	for _, id := range ids {
 		gs, err := s.store.GetAccountGroups(ctx, id)
@@ -197,14 +265,16 @@ func (s *Service) DeleteAccountsBatch(ctx context.Context, ids []int64) error {
 	return nil
 }
 
-func (s *Service) UpdateAccountsBatch(ctx context.Context, ids []int64, p repository.AccountPatch) error {
+// UpdateAccountsBatch 批量账号配置写入：单事务全成或全败，返回每账号的新配置
+// 代际（客户端下一次读-改-写令牌）与真实变更集。
+func (s *Service) UpdateAccountsBatch(ctx context.Context, ids []int64, p repository.AccountPatch) ([]repository.AccountWriteResult, error) {
 	if err := validateIDs(ids); err != nil {
-		return err
+		return nil, err
 	}
 	if err := validateAccountPatch(p); err != nil {
-		return err
+		return nil, err
 	}
-	// O2：变更前逐个查旧组 + 替换目标组并集（upstream_key 批量变更 →
+	// 变更前逐个查旧组 + 替换目标组并集（upstream_key 批量变更 →
 	// clients 失效）。
 	var gids []int64
 	for _, id := range ids {
@@ -220,85 +290,38 @@ func (s *Service) UpdateAccountsBatch(ctx context.Context, ids []int64, p reposi
 	if p.GroupIDs != nil {
 		gids = append(gids, (*p.GroupIDs)...)
 	}
-	if p.Status != nil && *p.Status == domain.StatusActive {
-		now := time.Now()
-		p.CooldownUntil = &now
+	results, err := s.store.UpdateAccountsBatch(ctx, ids, p)
+	if err != nil {
+		return nil, mapRepoErr(err)
 	}
-	if err := mapRepoErr(s.store.UpdateAccountsBatch(ctx, ids, p)); err != nil {
-		return err
+	// clients 失效判据来自 repository 回显的**真实变更集**：只有身份类字段真的
+	// 变了才失效（幂等重写不再白白断连）。
+	identityChanged := identityChangedIn(results)
+	s.inv.Accounts(gids, identityChanged)
+	s.publish(ctx, notify.Change{Groups: gids, Clients: identityChanged})
+	// 归属/启用变更 ⇒ 财务视图换代（§4.6.3 发布屏障）。
+	if p.SupplierUserID != nil || p.Enabled != nil {
+		s.reloadSupplierView(ctx)
 	}
-	if p.Status != nil && *p.Status == domain.StatusActive && s.log != nil {
-		// T5 §4 恢复操作审计（批量）：status→active 隐含清 failed_at +
-		// last_error（repo 层执行——批量路径不做逐账号旧值比较，操作级留痕）。
-		s.log.Info("account failure cleared (batch status->active)", logx.Int("count", len(ids)))
-	}
-	// 评审 I-3：nil = 未提供；空串 = 清除 upstream_key（同为变更语义）。
-	// 批量路径不做逐账号旧值比较（需 N 次 GetAccount），只要提供了
-	// UpstreamKey 就保守标记 clients 失效——clients 失效成本远低于旧 key
-	// 滞留风险（宁可多失效一次）。BaseURL 同此保守失效（C2——含 "" 清空态，
-	// 复用既有 Accounts(gids, keyChanged) 调用面）。
-	s.inv.Accounts(gids, p.UpstreamKey != nil || p.BaseURL != nil)
-	s.publish(ctx, notify.Change{Groups: gids, Clients: p.UpstreamKey != nil || p.BaseURL != nil})
-	return nil
+	return results, nil
 }
 
-// ResetAccountsCooldownBatch 批量重置账号冷却：validateIDs → 预取目标
-// 存在性 + 旧组并集 → 合成 patch {Status:active, CooldownUntil:now}
-// 复用 UpdateAccountsBatch（触发既有 failed_at/last_error 清理 + 新冷却写入）
-// → 恢复审计 → 组级失效 + NOTIFY。
-func (s *Service) ResetAccountsCooldownBatch(ctx context.Context, ids []int64) (int, error) {
-	if err := validateIDs(ids); err != nil {
-		return 0, err
-	}
-	var gids []int64
-	for _, id := range ids {
-		if _, err := s.store.GetAccount(ctx, id); err != nil {
-			return 0, mapRepoErr(err)
-		}
-		gs, err := s.store.GetAccountGroups(ctx, id)
-		if err != nil {
-			if s.log != nil {
-				s.log.Warn("account groups query failed", logx.Int64("account_id", id), logx.Error(err))
-			}
-			continue
-		}
-		gids = append(gids, gs...)
-	}
-	now := time.Now()
-	st := domain.StatusActive
-	patch := repository.AccountPatch{Status: &st, CooldownUntil: &now}
-	if err := mapRepoErr(s.store.UpdateAccountsBatch(ctx, ids, patch)); err != nil {
-		return 0, err
-	}
-	if s.log != nil {
-		s.log.Info("account failure cleared (batch status->active)", logx.Int("count", len(ids)))
-	}
-	s.inv.Accounts(gids, false)
-	s.publish(ctx, notify.Change{Groups: gids})
-	return len(ids), nil
-}
-
-// groupsOf 账号分组 id 列表（nil = 无分组）。
-func groupsOf(a *domain.Account) []int64 {
-	if a.GroupIDs == nil {
+// groupsOfPatch 补丁携带的分组 id 列表（nil = 未提供 → 空集）。
+func groupsOfPatch(p repository.AccountPatch) []int64 {
+	if p.GroupIDs == nil {
 		return nil
 	}
-	return *a.GroupIDs
+	return *p.GroupIDs
 }
 
-// AccountView 是账号的管理端视图（含调度器运行时信息）。Status/CooldownUntil
-// 覆盖嵌入 Account 的同名字段（Go 字段提升规则：同名顶层字段遮蔽嵌入字段）：
-// 合并后列表显示 = 调度器内存权威（A-4，2026-08-19）——回写丢失/失败时内存与
-// DB 不一致，管理端显示与 Select 请求行为同源（overview 聚合早已用内存状态，
-// A-4 后列表口径与其统一）；DB 列仍是持久化镜像。JSON 键名与嵌入字段默认
-// 一致（"Status"/"CooldownUntil"，形状不变）。
+// AccountView 是账号的管理端视图（含调度器运行时信息）。运行时并发/EWMA
+// 指标与请求路径同源（快照原子读）；账号生命周期（enabled/failed_at）与失效
+// 恢复走 fenced 端点，不在视图内重复。
 type AccountView struct {
 	*domain.Account
-	Status        domain.AccountStatus `json:"Status"`
-	CooldownUntil *time.Time           `json:"CooldownUntil"`
-	Concurrency   int64                `json:"concurrency"`
-	ErrRate       float64              `json:"err_rate"`
-	ErrCount      int                  `json:"err_count"`
+	Concurrency int64   `json:"concurrency"`
+	ErrRate     float64 `json:"err_rate"`
+	ErrCount    int     `json:"err_count"`
 }
 
 // ListAccountViews 账号管理端视图（含调度器运行时信息）。handler 列表入口，
@@ -313,15 +336,10 @@ func (s *Service) ListAccountViews(ctx context.Context, q repository.ListQuery) 
 	}
 	out := make([]*AccountView, 0, len(accs))
 	for _, a := range accs {
-		// 顶层覆盖字段初始化为 DB 值（sched 未装配/快照外时回退 DB 镜像——
-		// 与嵌入字段默认序列化形状一致）
-		v := &AccountView{Account: a, Status: a.Status, CooldownUntil: a.CooldownUntil}
+		v := &AccountView{Account: a}
 		if s.sched != nil {
 			if ri, ok := s.sched.Runtime(a.ID); ok {
 				v.Concurrency, v.ErrRate, v.ErrCount = ri.Concurrency, ri.ErrRate, ri.ErrCount
-				// A-4：Status/CooldownUntil 合并调度器内存值（快照内账号必有
-				// Runtime；快照未加载时保持 DB 值——与请求路径不可达一致）
-				v.Status, v.CooldownUntil = ri.Status, ri.CooldownUntil
 			}
 		}
 		out = append(out, v)

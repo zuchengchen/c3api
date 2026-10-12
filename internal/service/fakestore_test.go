@@ -37,6 +37,7 @@ type fakeStore struct {
 	groups      map[int64]*domain.Group
 	accGroups   map[int64][]int64 // accountID → groupIDs（账号侧绑定，Set/GetAccountGroups）
 	keys        map[int64]*domain.Key
+	mgmtKeys    map[int64]*domain.ManagementKey // 管理 API key（mk-，spec 2026-10-09）
 	users       map[int64]*domain.User
 	settings    map[string]*domain.Setting
 	rules       map[int64]domain.Rule
@@ -44,13 +45,13 @@ type fakeStore struct {
 	stats       []*domain.StatBucket
 	entityStats []*domain.EntityStatBucket
 	assign      map[int64][]int64 // groupID → 授予 user_id 列表（group_assignments 模拟）
-	assignMult  map[[2]int64]*int // (groupID, userID) → 专属价格倍率（nil = 未设置；T3.5 按组）
+	assignMult  map[[2]int64]*int // (groupID, userID) → 专属价格倍率（nil = 未设置；按组）
 	codes       map[int64]*domain.RedemptionCode
 	uses        map[int64]*domain.RedemptionUse
 	temps       []*fakeTempRow
 	// pricings 模型价格（key = model，一行 = 最终生效价，镜像仓库 unique(model)
 	// 约束；manual > litellm 优先级语义与真实仓库一致）。
-	// imagePrices 图片生成价格（Task A 数据面；同 pricings 的 manual > litellm
+	// imagePrices 图片生成价格（数据面；同 pricings 的 manual > litellm
 	// 优先级语义）。
 	imagePrices map[string]*domain.PriceEntry
 	// functionPrices 按单元计费功能类价格（价格表三件套；同 pricings 优先级语义）。
@@ -63,43 +64,75 @@ type fakeStore struct {
 	// emailTemplates/emailCodes 邮件模板与验证码 fake（task email）。
 	emailTemplates map[string]*domain.EmailTemplate
 	emailCodes     map[string]*domain.EmailCode
-	// accExtErr 注入 GetAccountExt 非 ErrNotFound 故障（per-account；T2-2
+	// accExtErr 注入 GetAccountExt 非 ErrNotFound 故障（per-account；
 	// store 故障隔离测试——不误标上游问题）。
 	accExtErr map[int64]error
+	// supplier* 供应商业务面 fake（spec 2026-10-09 §6.1/§6.2）：概览缺省零值、
+	// 结算单按序追加、ApplySettlement 可注入错误。
+	supplierOverviews   map[int64]*domain.SupplierOverview
+	supplierSettlements []*domain.SupplierSettlement
+	supplierApplyErr    error
+	// lastSupplierApplyActor 记录 ApplySettlement 收到的具名操作者（I5 透传断言）。
+	lastSupplierApplyActor domain.FundsActor
+	// supplierBalances 管理面余额替身（§6.3 PATCH/列表）。
+	supplierBalances map[int64]*domain.SupplierBalance
 	// pricingListErr 注入 ListPricing 失败（快照 fail-safe 测试）。
 	pricingListErr error
-	// lastTrendZone/lastEntityTrendZone/lastSummaryZone/lastDaysZone 记录统计
-	// 读族最近一次收到的请求时区（request-tz 透传断言面——fake 分组模拟恒
-	// UTC，cube/raw 路由真实性由 repository PG 测试钉）。
-	lastTrendZone       *time.Location
-	lastEntityTrendZone *time.Location
-	lastSummaryZone     *time.Location
-	lastDaysZone        *time.Location
+	// lastTrendExec/lastEntityTrendExec/lastSummaryExec/lastDaysExec 记录统计读族
+	// 最近一次收到的可执行计划（**Cube/Raw 方法对**的上游选择 + 生效窗口 + 时区
+	// 透传断言面；真实 cube/raw 语义由 repository PG 测试钉）。
+	lastTrendExec       domain.Exec
+	lastEntityTrendExec domain.Exec
+	lastSummaryExec     domain.Exec
+	lastDaysExec        domain.Exec
 	// imageListErr 注入 ListImagePrice 失败（image 快照 fail-safe 测试）。
 	imageListErr error
 	// functionListErr 注入 ListFunctionPrice 失败（function 快照 fail-safe 测试）。
 	functionListErr  error
 	pricingUpsertErr error
 	nextID           int64
-	// lastPatch 记录最近一次 UpdateAccountsBatch 收到的 patch（评审 M3：
+	// lastPatch 记录最近一次 UpdateAccountsBatch 收到的 patch（
 	// 断言 handler 的 group_ids nil/[] 映射是否真正传到了 repo 层）。
 	lastPatch repository.AccountPatch
+	// updateKeyCalls 记录 UpdateKey 被调用次数（无变更短路"零写库"断言的
+	// 事实来源——短路路径不得触达 repo UpdateKey）。
+	updateKeyCalls int
 	// tempBalances 临时额度行（注册赠品断言用）。
 	tempBalances []fakeTempBalance
-	// tempBalanceErr 注入 CreateTempBalance 失败（评审 M-2：注册不阻断）。
+	// tempBalanceErr 注入 CreateTempBalance 失败（注册不阻断）。
 	tempBalanceErr error
 	// codesConflictAlways 模拟 code 唯一冲突恒失败（GenerateCodes 重试 N=5
 	// 终止路径的测试注入）。
 	codesConflictAlways bool
 	// countUsersErr 注入 CountUsers 失败（注册 bootstrap 错误传播测试）。
 	countUsersErr error
-	// revokeGroupErr 注入 RevokeGroup 失败（S3-F2 替换中途失败 → 整体回滚测试）。
+	// balanceLogs 余额变动记录行（注册默认/管理面建用户/管理面改余额/兑换写入断言用）。
+	balanceLogs []*domain.BalanceLog
+	// createBalanceLogErr 注入事务内 CreateBalanceLog 失败（原子回滚断言，spec §4/A6）。
+	createBalanceLogErr error
+	// createUserUnique 事务内 CreateUser 强制 email 唯一（并发重复邮箱竞态测试）。
+	createUserUnique bool
+	// updateUserTxErr 注入事务内 UpdateUser 失败（重试超限/回滚测试）。
+	updateUserTxErr error
+	// revokeGroupErr 注入 RevokeGroup 失败（替换中途失败 → 整体回滚测试）。
 	revokeGroupErr error
-	// txUpsertExtErr 注入事务内 UpsertAccountExt 失败（Task B 导入单行事务
+	// txUpsertExtErr 注入事务内 UpsertAccountExt 失败（导入单行事务
 	// 回滚测试——ext 写入失败 → 无 account 行无 ext 行）。
 	txUpsertExtErr error
-	// emailTemplateDeleteErr 注入 DeleteEmailTemplate 非 NotFound 故障（评审 FIX-3a）。
+	// emailTemplateDeleteErr 注入 DeleteEmailTemplate 非 NotFound 故障。
 	emailTemplateDeleteErr error
+	// routing 事实读 fake：固定返回行 + 记录最近一次调用参数。
+	routingQualityRows  []repository.RoutingQualityStat
+	routingFlowRows     []repository.RoutingFlowStat
+	routingObservedRows []domain.RouteClassIDVal
+	routingFactErr      error
+	routingFactCall     struct {
+		routeClass domain.RouteClassIDVal
+		from, to   time.Time
+	}
+	// routingObservedCalls 记录 QueryObservedRouteClasses 被调用次数（计划为空时
+	// 的短路测试断言其为 0）。
+	routingObservedCalls int
 }
 
 // fakeTempRow 临时额度行模拟（domain 无 TempBalance 类型，CreateTempBalance
@@ -115,7 +148,7 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{
 		tpls: make(map[int64]*domain.Template), accs: make(map[int64]*domain.Account),
 		groups: make(map[int64]*domain.Group), accGroups: make(map[int64][]int64),
-		keys: make(map[int64]*domain.Key), users: make(map[int64]*domain.User),
+		keys: make(map[int64]*domain.Key), mgmtKeys: make(map[int64]*domain.ManagementKey), users: make(map[int64]*domain.User),
 		settings: make(map[string]*domain.Setting), rules: make(map[int64]domain.Rule),
 		assign: make(map[int64][]int64), assignMult: make(map[[2]int64]*int),
 		codes:         make(map[int64]*domain.RedemptionCode),
@@ -128,6 +161,28 @@ func newFakeStore() *fakeStore {
 		accExtErr:      make(map[int64]error),
 		nextID:         1,
 	}
+}
+
+// testEmailCodes 无行为 EmailCodeStore（New 必选依赖的测试占位：被测路径
+// 不触验证码面；验证码行为由 mailer 测试经 fake 真实现覆盖）。
+var testEmailCodes EmailCodeStore = testEmailCodeStore{}
+
+type testEmailCodeStore struct{}
+
+func (testEmailCodeStore) GetEmailCode(ctx context.Context, email, purpose string) (*domain.EmailCode, error) {
+	return nil, ErrNotFound
+}
+
+func (testEmailCodeStore) UpsertEmailCode(ctx context.Context, email, purpose, sha256 string, expiresAt time.Time) (*domain.EmailCode, error) {
+	return &domain.EmailCode{Email: email}, nil
+}
+
+func (testEmailCodeStore) IncrementEmailCodeAttempts(ctx context.Context, email, purpose string) (int, error) {
+	return 0, nil
+}
+
+func (testEmailCodeStore) DeleteEmailCode(ctx context.Context, email, purpose string) error {
+	return nil
 }
 
 // DeleteKeysByGroup 满足 KeyStore（组删除前置清理；返回被删明文列表）。
@@ -209,7 +264,7 @@ func (f *fakeStore) UpdateTemplate(ctx context.Context, t *domain.Template) (*do
 	if _, ok := f.tpls[t.ID]; !ok {
 		return nil, missingErr(t.ID)
 	}
-	if isCodexCredentialType(t.CredentialType) {
+	if t.CredentialType.IsCodex() {
 		if t.BaseURL != "" {
 			return nil, repository.ErrInvalidInput
 		}
@@ -263,21 +318,56 @@ func (f *fakeStore) ListAccounts(ctx context.Context, q repository.ListQuery) ([
 	defer f.mu.Unlock()
 	out := make([]*domain.Account, 0, len(f.accs))
 	for _, a := range f.accs {
+		// enabled 三态过滤（镜像真实 repo 谓词：nil = 不过滤）。
+		if q.Enabled != nil && a.Enabled != *q.Enabled {
+			continue
+		}
 		c := *a
 		out = append(out, &c)
 	}
-	return out, int64(len(f.accs)), nil
+	return out, int64(len(out)), nil
 }
 
-func (f *fakeStore) UpdateAccount(ctx context.Context, a *domain.Account, cooldownUntil *time.Time) (*domain.Account, error) {
+func (f *fakeStore) FailAccountCAS(ctx context.Context, id int64, expectedRevision int64, source string, failedAt time.Time, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	c := *a
-	if cooldownUntil != nil {
-		c.CooldownUntil = cooldownUntil
+	cur, ok := f.accs[id]
+	if !ok {
+		return missingErr(id)
 	}
-	f.accs[a.ID] = &c
-	return &c, nil
+	// 与生产同语义：guard 身份代际 K，被推进的是配置代际 C（相对自增）。
+	// 以 C 为 guard、把 expected 绝对写回 C 会让夹具在 C != K 时掩盖真实缺陷。
+	if cur.IdentityRevision != expectedRevision {
+		return fmt.Errorf("%w: id=%d expected identity revision %d stale", repository.ErrStaleIdentityRevision, id, expectedRevision)
+	}
+	// 与生产同语义：已失效 → 幂等 no-op（不推 C、不二次改写失败字段）。
+	if cur.FailedAt != nil {
+		return nil
+	}
+	cur.FailedAt = &failedAt
+	cur.FailureSource = &source
+	if reason != "" {
+		cur.LastError = &reason
+	}
+	cur.LifecycleRevision++
+	return nil
+}
+
+func (f *fakeStore) RecoverAccountCAS(ctx context.Context, id int64, expectedRevision int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cur, ok := f.accs[id]
+	if !ok {
+		return missingErr(id)
+	}
+	if cur.LifecycleRevision != expectedRevision {
+		return fmt.Errorf("%w: id=%d expected revision %d stale", repository.ErrConflict, id, expectedRevision)
+	}
+	cur.FailedAt = nil
+	cur.LastError = nil
+	cur.FailureSource = nil
+	cur.LifecycleRevision = expectedRevision + 1
+	return nil
 }
 
 func (f *fakeStore) DeleteAccount(ctx context.Context, id int64) error {
@@ -366,7 +456,7 @@ func (f *fakeStore) GetAccountGroups(ctx context.Context, accountID int64) ([]in
 	return slices.Clone(f.accGroups[accountID]), nil
 }
 
-// LoadGroupAccounts 单组账号（F1 删组校验用；镜像真实 repo：已删账号过滤）。
+// LoadGroupAccounts 单组账号（删组校验用；镜像真实 repo：已删账号过滤）。
 func (f *fakeStore) LoadGroupAccounts(ctx context.Context, groupID int64) ([]*domain.Account, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -409,7 +499,7 @@ func (f *fakeStore) UpdateTemplatesBatch(ctx context.Context, ids []int64, p rep
 		if !ok {
 			return fmt.Errorf("%w: id=%d missing", repository.ErrNotFound, id)
 		}
-		if p.BaseURL != nil && *p.BaseURL != "" && isCodexCredentialType(t.CredentialType) {
+		if p.BaseURL != nil && *p.BaseURL != "" && t.CredentialType.IsCodex() {
 			return repository.ErrInvalidInput
 		}
 	}
@@ -451,21 +541,21 @@ func (f *fakeStore) DeleteAccountsBatch(ctx context.Context, ids []int64) error 
 	return nil
 }
 
-func (f *fakeStore) UpdateAccountsBatch(ctx context.Context, ids []int64, p repository.AccountPatch) error {
+func (f *fakeStore) UpdateAccountsBatch(ctx context.Context, ids []int64, p repository.AccountPatch) ([]repository.AccountWriteResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// 组存在性（与真实 repo 的 checkGroupExist 同级语义：非空 group_ids 全查）
 	if p.GroupIDs != nil {
 		for _, gid := range *p.GroupIDs {
 			if _, ok := f.groups[gid]; !ok {
-				return fmt.Errorf("%w: id=%d missing", repository.ErrNotFound, gid)
+				return nil, fmt.Errorf("%w: id=%d missing", repository.ErrNotFound, gid)
 			}
 		}
 	}
 	for _, id := range ids {
 		account, ok := f.accs[id]
 		if !ok {
-			return fmt.Errorf("%w: id=%d missing", repository.ErrNotFound, id)
+			return nil, fmt.Errorf("%w: id=%d missing", repository.ErrNotFound, id)
 		}
 		templateID := account.TemplateID
 		if p.TemplateID != nil {
@@ -473,22 +563,26 @@ func (f *fakeStore) UpdateAccountsBatch(ctx context.Context, ids []int64, p repo
 		}
 		tpl, ok := f.tpls[templateID]
 		if !ok {
-			return fmt.Errorf("%w: id=%d missing", repository.ErrNotFound, templateID)
+			return nil, fmt.Errorf("%w: id=%d missing", repository.ErrNotFound, templateID)
 		}
 		baseURL := account.BaseURL
 		if p.BaseURL != nil {
 			baseURL = p.BaseURL
 		}
-		if isCodexCredentialType(tpl.CredentialType) && baseURL != nil && *baseURL != "" {
-			return repository.ErrInvalidInput
+		if tpl.CredentialType.IsCodex() && baseURL != nil && *baseURL != "" {
+			return nil, repository.ErrInvalidInput
 		}
 	}
 	f.lastPatch = p
+	revs := make([]repository.AccountWriteResult, 0, len(ids))
 	for _, id := range ids {
 		a, ok := f.accs[id]
 		if !ok {
-			return fmt.Errorf("%w: id=%d missing", repository.ErrNotFound, id)
+			return nil, fmt.Errorf("%w: id=%d missing", repository.ErrNotFound, id)
 		}
+		// 变更集与真实 repo 同源：调用同一比较实现，字段类别由 domain 声明表
+		// 决定——替身不得自行重写一份字段清单。
+		changed := repository.ChangedFields(p, accountFieldValues(a))
 		if p.Name != nil {
 			a.Name = *p.Name
 		}
@@ -499,7 +593,7 @@ func (f *fakeStore) UpdateAccountsBatch(ctx context.Context, ids []int64, p repo
 			a.UpstreamKey = *p.UpstreamKey
 		}
 		if p.BaseURL != nil {
-			// 批量三态（C1，对齐真实 repo）："" = 清空（NULL = 继承模板）；非空 = 落值
+			// 批量三态（对齐真实 repo）："" = 清空（NULL = 继承模板）；非空 = 落值
 			if *p.BaseURL == "" {
 				a.BaseURL = nil
 			} else {
@@ -507,23 +601,60 @@ func (f *fakeStore) UpdateAccountsBatch(ctx context.Context, ids []int64, p repo
 				a.BaseURL = &b
 			}
 		}
-		if p.Status != nil {
-			a.Status = *p.Status
-		}
-		if p.Weight != nil {
-			a.Weight = *p.Weight
-		}
 		if p.MaxConcurrency != nil {
 			a.MaxConcurrency = *p.MaxConcurrency
 		}
 		if p.GroupIDs != nil {
 			f.accGroups[id] = slices.Clone(*p.GroupIDs)
 		}
-		if p.CooldownUntil != nil {
-			a.CooldownUntil = p.CooldownUntil
+		if p.Enabled != nil {
+			a.Enabled = *p.Enabled
 		}
+		if p.UpstreamCostMultiplierBp != nil {
+			v := *p.UpstreamCostMultiplierBp
+			a.UpstreamCostMultiplierBp = &v
+		}
+		if p.CacheDomain != nil {
+			if *p.CacheDomain == "" {
+				a.CacheDomain = nil
+			} else {
+				v := *p.CacheDomain
+				a.CacheDomain = &v
+			}
+		}
+		if p.SupplierUserID != nil {
+			a.SupplierUserID = *p.SupplierUserID
+		}
+		// 配置写入**无条件**推进 C（镜像真实 repo）；身份类字段真的变了才推进 K
+		//（判据来自 ChangedFields，与真实 repo 同一实现）。
+		a.LifecycleRevision++
+		if changed.IdentityChanged() {
+			a.IdentityRevision++
+		}
+		revs = append(revs, repository.AccountWriteResult{
+			AccountID:         id,
+			LifecycleRevision: a.LifecycleRevision,
+			ChangedFields:     changed,
+		})
 	}
-	return nil
+	return revs, nil
+}
+
+// accountFieldValues 把存量账号行投影成按值比较所需的旧值快照（与真实 repo 从
+// 锁定行构造的同形）。
+func accountFieldValues(a *domain.Account) repository.AccountFieldValues {
+	return repository.AccountFieldValues{
+		ID:                       a.ID,
+		Name:                     a.Name,
+		TemplateID:               a.TemplateID,
+		BaseURL:                  a.BaseURL,
+		UpstreamKey:              a.UpstreamKey,
+		MaxConcurrency:           a.MaxConcurrency,
+		Enabled:                  a.Enabled,
+		CacheDomain:              a.CacheDomain,
+		UpstreamCostMultiplierBp: domain.MultBp(a.UpstreamCostMultiplierBp),
+		SupplierUserID:           a.SupplierUserID,
+	}
 }
 
 func (f *fakeStore) DeleteGroupsBatch(ctx context.Context, ids []int64) error {
@@ -613,10 +744,24 @@ func (f *fakeStore) queryLogs(userID int64) []*domain.UsageLog {
 	return out
 }
 
-func (f *fakeStore) StatsTrend(ctx context.Context, from, to time.Time, unit string, groupID int64, model string, zone *time.Location) ([]*domain.StatBucket, error) {
+// StatsTrendCube / StatsTrendRaw 趋势读族（Cube/Raw 同形 SQL 的 fake 模拟：分组
+// 结果相同——两者都只按传入的生效窗口/粒度聚合，差异只在记录的上游选择）。
+func (f *fakeStore) StatsTrendCube(ctx context.Context, from, to time.Time, unit string, groupID int64, model string, zone *time.Location) ([]*domain.StatBucket, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.lastTrendZone = zone // 透传断言面（分组模拟恒 UTC——cube 语义）
+	f.lastTrendExec = domain.Exec{Storage: domain.StatsStorageCube, From: from, To: to, Zone: zone}
+	return f.trendLocked(from, to, unit, groupID, model), nil
+}
+
+func (f *fakeStore) StatsTrendRaw(ctx context.Context, from, to time.Time, unit string, groupID int64, model string, zone *time.Location) ([]*domain.StatBucket, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastTrendExec = domain.Exec{Storage: domain.StatsStorageRaw, From: from, To: to, Zone: zone}
+	return f.trendLocked(from, to, unit, groupID, model), nil
+}
+
+// trendLocked 趋势聚合体（调用方持 f.mu）。
+func (f *fakeStore) trendLocked(from, to time.Time, unit string, groupID int64, model string) []*domain.StatBucket {
 	m := map[time.Time]*domain.StatBucket{}
 	for _, b := range f.stats {
 		if b.BucketTime.Before(from) || !b.BucketTime.Before(to) {
@@ -661,7 +806,7 @@ func (f *fakeStore) StatsTrend(ctx context.Context, from, to time.Time, unit str
 		out = append(out, &c)
 	}
 	slices.SortFunc(out, func(a, b *domain.StatBucket) int { return a.BucketTime.Compare(b.BucketTime) })
-	return out, nil
+	return out
 }
 
 func (f *fakeStore) StatsTop(ctx context.Context, from, to time.Time, entityType string, by string, limit int) ([]*domain.EntityStatBucket, error) {
@@ -724,10 +869,23 @@ func (f *fakeStore) StatsTop(ctx context.Context, from, to time.Time, entityType
 	return out, nil
 }
 
-func (f *fakeStore) StatsEntityTrend(ctx context.Context, from, to time.Time, unit string, entityType string, entityID int64, model string, zone *time.Location) ([]*domain.EntityStatBucket, error) {
+// StatsEntityTrendCube / StatsEntityTrendRaw 实体趋势读族（同形 SQL 的 fake 模拟）。
+func (f *fakeStore) StatsEntityTrendCube(ctx context.Context, from, to time.Time, unit string, entityType string, entityID int64, model string, zone *time.Location) ([]*domain.EntityStatBucket, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.lastEntityTrendZone = zone // 透传断言面（分组模拟恒 UTC）
+	f.lastEntityTrendExec = domain.Exec{Storage: domain.StatsStorageCube, From: from, To: to, Zone: zone}
+	return f.entityTrendLocked(from, to, unit, entityType, entityID, model), nil
+}
+
+func (f *fakeStore) StatsEntityTrendRaw(ctx context.Context, from, to time.Time, unit string, entityType string, entityID int64, model string, zone *time.Location) ([]*domain.EntityStatBucket, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastEntityTrendExec = domain.Exec{Storage: domain.StatsStorageRaw, From: from, To: to, Zone: zone}
+	return f.entityTrendLocked(from, to, unit, entityType, entityID, model), nil
+}
+
+// entityTrendLocked 实体趋势聚合体（调用方持 f.mu）。
+func (f *fakeStore) entityTrendLocked(from, to time.Time, unit string, entityType string, entityID int64, model string) []*domain.EntityStatBucket {
 	m := map[time.Time]*domain.EntityStatBucket{}
 	for _, b := range f.entityStats {
 		if b.BucketTime.Before(from) || !b.BucketTime.Before(to) {
@@ -772,7 +930,7 @@ func (f *fakeStore) StatsEntityTrend(ctx context.Context, from, to time.Time, un
 		out = append(out, &c)
 	}
 	slices.SortFunc(out, func(a, b *domain.EntityStatBucket) int { return a.BucketTime.Compare(b.BucketTime) })
-	return out, nil
+	return out
 }
 
 func (f *fakeStore) StatsTTFTSketch(ctx context.Context, from, to time.Time, model string) (*domain.TTFTSummary, error) {
@@ -828,10 +986,24 @@ func (f *fakeStore) StatsTTFTExact(ctx context.Context, from, to time.Time, enti
 
 // --- /api/admin/overview 聚合面（与真实 StatRepo 同语义：区间 + 组过滤；毫分原样） ---
 
-func (f *fakeStore) SummarizeStats(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) (*repository.StatSummary, error) {
+// SummarizeStatsCube / SummarizeStatsRaw summary 读族（绝对区间 sum——时区不参与
+// 数值，两个变体同形）。
+func (f *fakeStore) SummarizeStatsCube(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) (*repository.StatSummary, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.lastSummaryZone = zone // 透传断言面（区间 sum 与时区无关）
+	f.lastSummaryExec = domain.Exec{Storage: domain.StatsStorageCube, From: from, To: to, Zone: zone}
+	return f.summaryLocked(from, to, groupID), nil
+}
+
+func (f *fakeStore) SummarizeStatsRaw(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) (*repository.StatSummary, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastSummaryExec = domain.Exec{Storage: domain.StatsStorageRaw, From: from, To: to, Zone: zone}
+	return f.summaryLocked(from, to, groupID), nil
+}
+
+// summaryLocked 区间聚合体（调用方持 f.mu）。
+func (f *fakeStore) summaryLocked(from, to time.Time, groupID int64) *repository.StatSummary {
 	s := &repository.StatSummary{}
 	for _, b := range f.stats {
 		if b.BucketTime.Before(from) || !b.BucketTime.Before(to) {
@@ -848,13 +1020,27 @@ func (f *fakeStore) SummarizeStats(ctx context.Context, from, to time.Time, grou
 		s.CacheReadTokens += b.CacheReadTokens
 		s.Cost += b.Cost
 	}
-	return s, nil
+	return s
 }
 
-func (f *fakeStore) ScanStatsDays(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) ([]*repository.StatDayAgg, error) {
+// ScanStatsDaysCube / ScanStatsDaysRaw 日桶读族（日分组模拟恒 UTC——真实时区分组
+// 由 repository PG 测试钉死）。
+func (f *fakeStore) ScanStatsDaysCube(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) ([]*repository.StatDayAgg, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.lastDaysZone = zone // 透传断言面（日分组模拟恒 UTC——真实时区分组由 repository PG 测试钉死）
+	f.lastDaysExec = domain.Exec{Storage: domain.StatsStorageCube, From: from, To: to, Zone: zone}
+	return f.daysLocked(from, to, groupID), nil
+}
+
+func (f *fakeStore) ScanStatsDaysRaw(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) ([]*repository.StatDayAgg, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastDaysExec = domain.Exec{Storage: domain.StatsStorageRaw, From: from, To: to, Zone: zone}
+	return f.daysLocked(from, to, groupID), nil
+}
+
+// daysLocked 日桶聚合体（调用方持 f.mu）。
+func (f *fakeStore) daysLocked(from, to time.Time, groupID int64) []*repository.StatDayAgg {
 	day := map[string]*repository.StatDayAgg{}
 	var order []string
 	for _, b := range f.stats {
@@ -880,7 +1066,7 @@ func (f *fakeStore) ScanStatsDays(ctx context.Context, from, to time.Time, group
 	for _, k := range order {
 		out = append(out, day[k])
 	}
-	return out, nil
+	return out
 }
 
 func (f *fakeStore) CountOverviewResources(ctx context.Context) (*repository.OverviewResourceCounts, error) {
@@ -1008,7 +1194,7 @@ func (f *fakeStore) groupNameConflictLocked(excludeID int64, name string) error 
 	return nil
 }
 
-// --- Phase 3a：UserStore / SettingStore 假实现 ---
+// --- UserStore / SettingStore 假实现 ---
 
 func (f *fakeStore) CreateUser(ctx context.Context, u *domain.User) (*domain.User, error) {
 	f.mu.Lock()
@@ -1093,6 +1279,14 @@ func (f *fakeStore) UpdateUser(ctx context.Context, p *repository.UserPatch) (*d
 	}
 	if p.Status != nil {
 		cur.Status = *p.Status
+		// 供应商生命周期（§2.7-1，镜像真实 repo）：禁用 ⇒ 连带禁用其名下账号。
+		if *p.Status != domain.UserStatusActive {
+			for _, a := range f.accs {
+				if a.SupplierUserID == p.ID {
+					a.Enabled = false
+				}
+			}
+		}
 	}
 	c := *cur
 	return &c, nil
@@ -1113,7 +1307,7 @@ func (f *fakeStore) UpdateUserPassword(ctx context.Context, id int64, passwordHa
 }
 
 // CreateTempBalance 临时额度行（注册赠品）；tempBalanceErr 非 nil 时注入失败
-// （评审 M-2 测试）。
+// （测试）。
 func (f *fakeStore) CreateTempBalance(ctx context.Context, userID int64, amount int64, expiresAt *time.Time, note *string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1160,6 +1354,22 @@ func (f *fakeStore) ListTempBalances(ctx context.Context, q repository.ListQuery
 	return out, int64(len(out)), nil
 }
 
+// ListUserBalanceLogs 某用户的余额变动记录（编译兜底：按 user_id 过滤；fake 不做
+// 排序/分页语义——行内容/顺序断言直接读 f.balanceLogs）。
+func (f *fakeStore) ListUserBalanceLogs(ctx context.Context, userID int64, q repository.ListQuery) ([]*domain.BalanceLog, int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*domain.BalanceLog
+	for _, l := range f.balanceLogs {
+		if l.UserID != userID {
+			continue
+		}
+		c := *l
+		out = append(out, &c)
+	}
+	return out, int64(len(out)), nil
+}
+
 func (f *fakeStore) GetSetting(ctx context.Context, key string) (*domain.Setting, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1194,7 +1404,7 @@ func (f *fakeStore) SetSetting(ctx context.Context, key string, typ domain.Setti
 	return &domain.Setting{Key: key, Type: typ, Value: value}, nil
 }
 
-// --- Phase 3a Task 4：KeyStore / GroupAssignmentStore 假实现 ---
+// --- KeyStore / GroupAssignmentStore test implementations ---
 
 func (f *fakeStore) CreateKey(ctx context.Context, k *domain.Key) (*domain.Key, error) {
 	f.mu.Lock()
@@ -1275,10 +1485,11 @@ func (f *fakeStore) ListKeys(ctx context.Context, q repository.ListQuery) ([]*do
 	return out, int64(total), nil
 }
 
-// UpdateKey patch 语义（S3-F1，镜像真实 repo）：仅应用非 nil 字段，nil = 不动。
+// UpdateKey patch 语义（镜像真实 repo）：仅应用非 nil 字段，nil = 不动。
 func (f *fakeStore) UpdateKey(ctx context.Context, p *repository.KeyPatch) (*domain.Key, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.updateKeyCalls++
 	cur, ok := f.keys[p.ID]
 	if !ok {
 		return nil, missingErr(p.ID)
@@ -1294,6 +1505,12 @@ func (f *fakeStore) UpdateKey(ctx context.Context, p *repository.KeyPatch) (*dom
 	}
 	if p.Quota != nil {
 		cur.Quota = *p.Quota
+		if *p.Quota == 0 {
+			cur.QuotaUsed = 0 // 镜像真实 repo：额度显式设为 0（不限）→ 同步清零累计消耗
+		}
+	}
+	if p.GroupID != nil {
+		cur.GroupID = *p.GroupID // 镜像真实 repo：SetGroupID
 	}
 	c := *cur
 	return &c, nil
@@ -1327,6 +1544,62 @@ func (f *fakeStore) DeleteKey(ctx context.Context, id int64) error {
 	return nil
 }
 
+// --- 管理 API key（mk-，spec 2026-10-09）---
+
+func (f *fakeStore) CreateManagementKey(ctx context.Context, k *domain.ManagementKey) (*domain.ManagementKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k.ID = f.nextID
+	f.nextID++
+	c := *k
+	f.mgmtKeys[k.ID] = &c
+	out := c
+	return &out, nil
+}
+
+func (f *fakeStore) ListManagementKeysByUser(ctx context.Context, userID int64) ([]*domain.ManagementKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*domain.ManagementKey
+	for _, k := range f.mgmtKeys {
+		if k.DeletedAt != nil || k.UserID != userID {
+			continue
+		}
+		c := *k
+		out = append(out, &c)
+	}
+	return out, nil
+}
+
+func (f *fakeStore) UpdateManagementKey(ctx context.Context, p *repository.ManagementKeyPatch) (*domain.ManagementKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k, ok := f.mgmtKeys[p.ID]
+	if !ok || k.UserID != p.UserID || k.DeletedAt != nil {
+		return nil, missingErr(p.ID)
+	}
+	if p.Name != nil {
+		k.Name = *p.Name
+	}
+	if p.Status != nil {
+		k.Status = *p.Status
+	}
+	c := *k
+	return &c, nil
+}
+
+func (f *fakeStore) DeleteManagementKey(ctx context.Context, userID, id int64) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k, ok := f.mgmtKeys[id]
+	if !ok || k.UserID != userID || k.DeletedAt != nil {
+		return "", missingErr(id)
+	}
+	now := time.Now()
+	k.DeletedAt = &now
+	return k.KeyRaw, nil
+}
+
 func (f *fakeStore) GrantGroup(ctx context.Context, groupID, userID int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1344,8 +1617,8 @@ func (f *fakeStore) RevokeGroup(ctx context.Context, groupID, userID int64) erro
 	return nil
 }
 
-// SetAssignmentMultiplier 设置/清除该用户在该组的专属价格倍率（T3.5 修正：
-// 按组——用户在不同组可有不同倍率；nil = 清除为未设置 → 回退组倍率）。
+// SetAssignmentMultiplier 设置/清除该用户在该组的专属价格倍率：
+// 按组——用户在不同组可有不同倍率；nil = 清除为未设置 → 回退组倍率。
 func (f *fakeStore) SetAssignmentMultiplier(ctx context.Context, groupID, userID int64, m *int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1410,7 +1683,7 @@ func (f *fakeStore) ListGroupsForUser(ctx context.Context, userID int64) ([]*dom
 	return out, nil
 }
 
-// --- 原子资源更新（UserStore 扩展，评审 I-1；tx 版见 fakeTx） ---
+// --- 原子资源更新（UserStore 扩展；tx 版见 fakeTx） ---
 
 func (f *fakeStore) UpdateUserBalance(ctx context.Context, userID, delta int64) error {
 	f.mu.Lock()
@@ -1451,9 +1724,9 @@ func (f *fakeStore) UpdateUserBalanceWarningThreshold(ctx context.Context, userI
 	return &c, previousThreshold, nil
 }
 
-// --- 兑换码（RedemptionStore，Phase 5 计费前基础设施） ---
+// --- 兑换码（RedemptionStore 计费前基础设施） ---
 
-// WithTx 事务语义模拟（评审 I-1）：fn 内变更先入暂存（fakeTx 持有主视图的
+// WithTx 事务语义模拟：fn 内变更先入暂存（fakeTx 持有主视图的
 // 深拷贝），fn 返回 nil → 提交（整体替换主视图），返回错误 → 丢弃（主视图
 // 不变）——回滚断言（use 冲突/用尽 → 余额/并发不变）的前提。持锁贯穿整个
 // 事务，模拟串行执行。
@@ -1466,11 +1739,18 @@ func (f *fakeStore) WithTx(ctx context.Context, fn func(repository.TxStore) erro
 		users:  cloneUserMap(f.users),
 		temps:  slices.Clone(f.temps),
 		nextID: f.nextID,
-		// 授予面（S3-F2：assignment 替换循环入事务；error 注入透传）
+		// mgmtKeys 管理 key 暂存（同 WithTx 提交/回滚）。
+		mgmtKeys: cloneMgmtKeyMap(f.mgmtKeys),
+		// 余额变动记录（注册/建用户/改余额/兑换写行；注入透传）
+		balanceLogs:      slices.Clone(f.balanceLogs),
+		balanceLogErr:    f.createBalanceLogErr,
+		createUserUnique: f.createUserUnique,
+		updateUserErr:    f.updateUserTxErr,
+		// 授予面（assignment 替换循环入事务；error 注入透传）
 		assign:     cloneAssignMap(f.assign),
 		assignMult: maps.Clone(f.assignMult),
 		revokeErr:  f.revokeGroupErr,
-		// 账号/扩展/归组面（Task B codex 导入 imported 行单行事务；注入透传）
+		// 账号/扩展/归组面（codex 导入 imported 行单行事务；注入透传）
 		accs:          cloneAccMap(f.accs),
 		accExts:       cloneAccExtMap(f.accExts),
 		accGroups:     cloneAccGroupsMap(f.accGroups),
@@ -1483,10 +1763,67 @@ func (f *fakeStore) WithTx(ctx context.Context, fn func(repository.TxStore) erro
 		return err // 回滚：暂存丢弃
 	}
 	f.codes, f.uses, f.users, f.temps, f.nextID = tx.codes, tx.uses, tx.users, tx.temps, tx.nextID
+	f.balanceLogs = tx.balanceLogs
 	f.assign, f.assignMult = tx.assign, tx.assignMult
 	f.accs, f.accExts, f.accGroups = tx.accs, tx.accExts, tx.accGroups
 	f.priceEntries, f.priceVariants = tx.priceEntries, tx.priceVariants
+	f.mgmtKeys = tx.mgmtKeys
 	return nil
+}
+
+func cloneMgmtKeyMap(m map[int64]*domain.ManagementKey) map[int64]*domain.ManagementKey {
+	out := make(map[int64]*domain.ManagementKey, len(m))
+	for k, v := range m {
+		c := *v
+		out[k] = &c
+	}
+	return out
+}
+
+func (f *fakeTx) CreateManagementKey(ctx context.Context, k *domain.ManagementKey) (*domain.ManagementKey, error) {
+	k.ID = f.nextID
+	f.nextID++
+	c := *k
+	f.mgmtKeys[k.ID] = &c
+	out := c
+	return &out, nil
+}
+
+func (f *fakeTx) ListManagementKeysByUser(ctx context.Context, userID int64) ([]*domain.ManagementKey, error) {
+	var out []*domain.ManagementKey
+	for _, k := range f.mgmtKeys {
+		if k.DeletedAt != nil || k.UserID != userID {
+			continue
+		}
+		c := *k
+		out = append(out, &c)
+	}
+	return out, nil
+}
+
+func (f *fakeTx) UpdateManagementKey(ctx context.Context, p *repository.ManagementKeyPatch) (*domain.ManagementKey, error) {
+	k, ok := f.mgmtKeys[p.ID]
+	if !ok || k.UserID != p.UserID || k.DeletedAt != nil {
+		return nil, missingErr(p.ID)
+	}
+	if p.Name != nil {
+		k.Name = *p.Name
+	}
+	if p.Status != nil {
+		k.Status = *p.Status
+	}
+	c := *k
+	return &c, nil
+}
+
+func (f *fakeTx) DeleteManagementKey(ctx context.Context, userID, id int64) (string, error) {
+	k, ok := f.mgmtKeys[id]
+	if !ok || k.UserID != userID || k.DeletedAt != nil {
+		return "", missingErr(id)
+	}
+	now := time.Now()
+	k.DeletedAt = &now
+	return k.KeyRaw, nil
 }
 
 func cloneAssignMap(m map[int64][]int64) map[int64][]int64 {
@@ -1584,12 +1921,21 @@ type fakeTx struct {
 	users  map[int64]*domain.User
 	temps  []*fakeTempRow
 	nextID int64
-	// 授予面（S3-F2）：assign/assignMult 同 fakeStore 语义；revokeErr 注入
+	// mgmtKeys 管理 API key 暂存（创建随外层事务提交/回滚，spec 2026-10-09）。
+	mgmtKeys map[int64]*domain.ManagementKey
+	// 余额变动记录（暂存；balanceLogErr 注入 CreateBalanceLog 失败 → 回滚断言）
+	balanceLogs   []*domain.BalanceLog
+	balanceLogErr error
+	// createUserUnique 事务内 CreateUser 强制 email 唯一（并发重复邮箱竞态）。
+	createUserUnique bool
+	// updateUserErr 注入事务内 UpdateUser 失败（重试超限/回滚测试）。
+	updateUserErr error
+	// 授予面：assign/assignMult 同 fakeStore 语义；revokeErr 注入
 	// 替换中途失败（回滚断言用）。
 	assign     map[int64][]int64
 	assignMult map[[2]int64]*int
 	revokeErr  error
-	// 账号/扩展/归组面（Task B codex 导入 imported 行单行事务）：accs/accExts/
+	// 账号/扩展/归组面（codex 导入 imported 行单行事务）：accs/accExts/
 	// accGroups/groups 同 fakeStore 语义；upsertErr 注入 ext 写入失败（回滚
 	// 断言用——无孤儿）。
 	accs      map[int64]*domain.Account
@@ -1597,7 +1943,7 @@ type fakeTx struct {
 	accGroups map[int64][]int64
 	groups    map[int64]*domain.Group
 	upsertErr error
-	// 价格条目/变体（D-C4：级联删除事务面；语义镜像真实 repo + fakeStore
+	// 价格条目/变体（级联删除事务面；语义镜像真实 repo + fakeStore
 	// DeletePriceEntryManual 已有级联行为）。
 	priceEntries  map[string]*domain.PriceEntry
 	priceVariants map[string][]*domain.PriceVariant
@@ -1662,6 +2008,75 @@ func (t *fakeTx) UpdateUserMaxConcurrency(ctx context.Context, userID int64, val
 	return nil
 }
 
+// CreateUser 事务内建用户（注册/管理面建用户；镜像 fakeStore.CreateUser 语义）。
+func (t *fakeTx) CreateUser(ctx context.Context, u *domain.User) (*domain.User, error) {
+	if t.createUserUnique {
+		for _, existing := range t.users {
+			if existing.Email == u.Email {
+				return nil, fmt.Errorf("%w: email=%q", repository.ErrConflict, u.Email)
+			}
+		}
+	}
+	u.ID = t.nextID
+	t.nextID++
+	c := *u
+	t.users[u.ID] = &c
+	return &c, nil
+}
+
+// GetUser 事务内读用户（兑换读回余额；缺失 → ErrNotFound 包装）。
+func (t *fakeTx) GetUser(ctx context.Context, id int64) (*domain.User, error) {
+	u, ok := t.users[id]
+	if !ok {
+		return nil, missingErr(id)
+	}
+	c := *u
+	return &c, nil
+}
+
+// UpdateUser 事务内条件更新（镜像 fakeStore.UpdateUser 语义：旧值不满足 → ErrConflict）。
+func (t *fakeTx) UpdateUser(ctx context.Context, p *repository.UserPatch) (*domain.User, error) {
+	if t.updateUserErr != nil {
+		return nil, t.updateUserErr
+	}
+	cur, ok := t.users[p.ID]
+	if !ok {
+		return nil, missingErr(p.ID)
+	}
+	if p.MaxConcurrency != nil {
+		if p.OldMaxConcurrency == nil || cur.MaxConcurrency != *p.OldMaxConcurrency {
+			return nil, fmt.Errorf("%w: id=%d max_concurrency changed", repository.ErrConflict, p.ID)
+		}
+		cur.MaxConcurrency = *p.MaxConcurrency
+	}
+	if p.Balance != nil {
+		if p.OldBalance == nil || cur.Balance != *p.OldBalance {
+			return nil, fmt.Errorf("%w: id=%d balance changed", repository.ErrConflict, p.ID)
+		}
+		cur.Balance = *p.Balance
+	}
+	if p.Role != nil {
+		cur.Role = *p.Role
+	}
+	if p.Status != nil {
+		cur.Status = *p.Status
+	}
+	c := *cur
+	return &c, nil
+}
+
+// CreateBalanceLog 事务内写入余额变动记录（暂存；balanceLogErr 注入失败 → 回滚）。
+func (t *fakeTx) CreateBalanceLog(ctx context.Context, l *domain.BalanceLog) error {
+	if t.balanceLogErr != nil {
+		return t.balanceLogErr
+	}
+	c := *l
+	c.ID = t.nextID
+	t.nextID++
+	t.balanceLogs = append(t.balanceLogs, &c)
+	return nil
+}
+
 func (t *fakeTx) CreateTempBalance(ctx context.Context, userID int64, amount int64, expiresAt *time.Time, note *string) error {
 	t.temps = append(t.temps, &fakeTempRow{UserID: userID, Amount: amount, ExpiresAt: expiresAt, Note: note})
 	return nil
@@ -1686,13 +2101,13 @@ func (t *fakeTx) IncrementUsed(ctx context.Context, codeID int64) (bool, error) 
 		return false, nil // 0 行受影响（真实：WHERE id 不命中）
 	}
 	if c.UsedCount >= c.MaxUses {
-		return false, nil // 已用尽（评审 I-2）
+		return false, nil // 已用尽
 	}
 	c.UsedCount++
 	return true, nil
 }
 
-// --- 组授予（S3-F2：tx 面扩展，语义镜像 fakeStore 对应方法） ---
+// --- 组授予（tx 面扩展，语义镜像 fakeStore 对应方法） ---
 
 func (t *fakeTx) GrantGroup(ctx context.Context, groupID, userID int64) error {
 	if !slices.Contains(t.assign[groupID], userID) {
@@ -1710,8 +2125,8 @@ func (t *fakeTx) RevokeGroup(ctx context.Context, groupID, userID int64) error {
 	return nil
 }
 
-// SetAssignmentMultiplier 设置/清除该用户在该组的专属价格倍率（T3.5 修正：
-// 按组——用户在不同组可有不同倍率；nil = 清除为未设置 → 回退组倍率）。
+// SetAssignmentMultiplier 设置/清除该用户在该组的专属价格倍率：
+// 按组——用户在不同组可有不同倍率；nil = 清除为未设置 → 回退组倍率。
 func (t *fakeTx) SetAssignmentMultiplier(ctx context.Context, groupID, userID int64, m *int) error {
 	if !slices.Contains(t.assign[groupID], userID) {
 		return missingErr(userID) // 授予行必须已存在（service 先 Grant 再 Set）
@@ -1746,7 +2161,7 @@ func (t *fakeTx) ListAssignmentsByUser(ctx context.Context, userID int64) ([]*do
 	return out, nil
 }
 
-// --- 账号/扩展/归组（Task B codex 导入 imported 行单行事务面；语义镜像
+// --- 账号/扩展/归组（codex 导入 imported 行单行事务面；语义镜像
 // fakeStore 对应方法——变更只落暂存） ---
 
 func (t *fakeTx) CreateAccount(ctx context.Context, a *domain.Account) (*domain.Account, error) {
@@ -1858,7 +2273,7 @@ func (f *fakeStore) GetAccountExt(ctx context.Context, accountID int64) (*domain
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err, ok := f.accExtErr[accountID]; ok {
-		return nil, err // 注入非 ErrNotFound 故障（T2-2 store 故障隔离测试）
+		return nil, err // 注入非 ErrNotFound 故障（store 故障隔离测试）
 	}
 	e, ok := f.accExts[accountID]
 	if !ok {
@@ -1868,7 +2283,48 @@ func (f *fakeStore) GetAccountExt(ctx context.Context, accountID int64) (*domain
 	return &c, nil
 }
 
-// FindAccountExtByCodexKey 组合幂等键查重（Task B 批量导入；镜像真实 repo
+// GetOwnedAccountExt 作用域内 ext 单读镜像：管理面（无作用域）⇒ 同 GetAccountExt；
+// 供应商面（scope.Set）⇒ 归属不符一律 ErrNotFound（与真实 repo 的 owner 谓词同语义
+// ——谓词读 ctx，fake 同源读 ctx）。
+func (f *fakeStore) GetOwnedAccountExt(ctx context.Context, accountID int64) (*domain.AccountExt, error) {
+	f.mu.Lock()
+	scope := domain.AccountScopeFrom(ctx)
+	defer f.mu.Unlock()
+	if scope.Set {
+		a, ok := f.accs[accountID]
+		if !ok || a.DeletedAt != nil || !scope.MatchesOwner(a.SupplierUserID) {
+			return nil, fmt.Errorf("%w: account_id=%d missing", repository.ErrNotFound, accountID)
+		}
+	}
+	if err, ok := f.accExtErr[accountID]; ok {
+		return nil, err // 注入非 ErrNotFound 故障（store 故障隔离测试）
+	}
+	e, ok := f.accExts[accountID]
+	if !ok {
+		return nil, fmt.Errorf("%w: account_id=%d missing", repository.ErrNotFound, accountID)
+	}
+	c := *e
+	return &c, nil
+}
+
+// FindMissingOwnedAccountID ids 中第一个越出当前作用域的 id 镜像（作用域未设 ⇒ 恒 false）。
+func (f *fakeStore) FindMissingOwnedAccountID(ctx context.Context, ids []int64) (int64, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	scope := domain.AccountScopeFrom(ctx)
+	if !scope.Set {
+		return 0, false, nil
+	}
+	for _, id := range ids {
+		a, ok := f.accs[id]
+		if !ok || a.DeletedAt != nil || !scope.MatchesOwner(a.SupplierUserID) {
+			return id, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+// FindAccountExtByCodexKey 组合幂等键查重（批量导入；镜像真实 repo
 // 双条件 AND——缺行 → ErrNotFound）。
 func (f *fakeStore) FindAccountExtByCodexKey(ctx context.Context, codexEmail, codexAccountID string) (*domain.AccountExt, error) {
 	f.mu.Lock()
@@ -1898,17 +2354,62 @@ func (f *fakeStore) WriteOAuthRotation(ctx context.Context, accountID int64, at,
 	return nil
 }
 
-// WritePATKey pat 凭据列部分更新（WriteOAuthRotation 的 pat 对称形态）；
-// 行缺失 → ErrNotFound。
-func (f *fakeStore) WritePATKey(ctx context.Context, accountID int64, patKey string) error {
+// AdminWriteOAuthRotationCAS 管理员 OAuth 轮转镜像（fenced + ext 行缺失 → ErrNotFound）。
+func (f *fakeStore) AdminWriteOAuthRotationCAS(ctx context.Context, accountID int64, expectedRevision int64, at, rt string, expiresAt *time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	acc, ok := f.accs[accountID]
+	if !ok {
+		return missingErr(accountID)
+	}
+	if acc.LifecycleRevision != expectedRevision {
+		return fmt.Errorf("%w: account_id=%d expected revision %d stale", repository.ErrConflict, accountID, expectedRevision)
+	}
+	e, ok := f.accExts[accountID]
+	if !ok {
+		return fmt.Errorf("%w: account_id=%d ext row missing", repository.ErrNotFound, accountID)
+	}
+	e.CodexOAuthToken = &at
+	e.CodexOAuthRefreshToken = &rt
+	e.CodexOAuthExpiresAt = expiresAt
+	acc.LifecycleRevision = expectedRevision + 1
+	return nil
+}
+
+func (f *fakeStore) AdminWritePATKeyCAS(ctx context.Context, accountID int64, expectedRevision int64, patKey string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	acc, ok := f.accs[accountID]
+	if !ok {
+		return missingErr(accountID)
+	}
+	if acc.LifecycleRevision != expectedRevision {
+		return fmt.Errorf("%w: account_id=%d expected revision %d stale", repository.ErrConflict, accountID, expectedRevision)
+	}
 	e, ok := f.accExts[accountID]
 	if !ok {
 		return fmt.Errorf("%w: account_id=%d ext row missing", repository.ErrNotFound, accountID)
 	}
 	e.CodexPATKey = &patKey
+	acc.LifecycleRevision = expectedRevision + 1
 	return nil
+}
+
+func (f *fakeStore) AdminUpsertAccountExtCAS(ctx context.Context, e *domain.AccountExt, expectedRevision int64) (*domain.AccountExt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	acc, ok := f.accs[e.AccountID]
+	if !ok {
+		return nil, missingErr(e.AccountID)
+	}
+	if acc.LifecycleRevision != expectedRevision {
+		return nil, fmt.Errorf("%w: account_id=%d expected revision %d stale", repository.ErrConflict, e.AccountID, expectedRevision)
+	}
+	c := *e
+	f.accExts[e.AccountID] = &c
+	acc.LifecycleRevision = expectedRevision + 1
+	cc := c
+	return &cc, nil
 }
 
 // --- 兑换码非事务面（管理端 CRUD 用；错误格式镜像真实 repo） ---
@@ -2069,7 +2570,7 @@ func (f *fakeStore) IncrementUsed(ctx context.Context, codeID int64) (bool, erro
 }
 
 // DeactivateCodes 批量失效（单事务模拟）：已 disabled no-op；缺失 id 由
-// service 层先查（fake 同真实 repo：不报错，评审 M-2）。返回新失效数。
+// service 层先查（fake 同真实 repo：不报错）。返回新失效数。
 func (f *fakeStore) DeactivateCodes(ctx context.Context, ids []int64) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -2196,4 +2697,183 @@ func (f *fakeStore) DeleteEmailCode(ctx context.Context, email, purpose string) 
 	}
 	delete(f.emailCodes, key)
 	return nil
+}
+
+// --- SupplierStore fake（spec 2026-10-09 §6.1/§6.2）---
+
+func (f *fakeStore) SupplierOverview(_ context.Context, uid int64) (*domain.SupplierOverview, error) {
+	if f.supplierOverviews != nil {
+		if o, ok := f.supplierOverviews[uid]; ok {
+			return o, nil
+		}
+	}
+	return &domain.SupplierOverview{}, nil
+}
+
+func (f *fakeStore) SupplierChunks(_ context.Context, _ int64, _, _ int) ([]domain.SupplierChunk, int64, error) {
+	return nil, 0, nil
+}
+
+func (f *fakeStore) SupplierEarnings(_ context.Context, _ int64, _, _ int) ([]domain.SupplierEarning, int64, error) {
+	return nil, 0, nil
+}
+
+func (f *fakeStore) ListSupplierSettlements(_ context.Context, uid int64, _, _ int) ([]*domain.SupplierSettlement, int64, error) {
+	out := make([]*domain.SupplierSettlement, 0)
+	for _, s := range f.supplierSettlements {
+		if s.SupplierUserID == uid {
+			out = append(out, s)
+		}
+	}
+	return out, int64(len(out)), nil
+}
+
+func (f *fakeStore) ApplySettlement(_ context.Context, req domain.ApplySettlementRequest, actor domain.FundsActor) (*domain.SupplierSettlement, error) {
+	f.lastSupplierApplyActor = actor
+	if f.supplierApplyErr != nil {
+		return nil, f.supplierApplyErr
+	}
+	s := &domain.SupplierSettlement{
+		ID: int64(len(f.supplierSettlements) + 1), SupplierUserID: req.SupplierUID,
+		Kind: req.Kind, AmountMillis: req.AmountMillis, Status: domain.SettlementPending,
+		Revision: 1, RequestKey: req.RequestKey, RequestedOperator: req.OperatorUID, Note: req.Note,
+	}
+	f.supplierSettlements = append(f.supplierSettlements, s)
+	return s, nil
+}
+
+// --- SupplierAdminStore 替身（spec 2026-10-09 §6.3/§6.5）---
+
+func (f *fakeStore) ListSupplierSettlementsAdmin(_ context.Context, filter domain.SupplierSettlementFilter, _, _ int) ([]*domain.SupplierSettlement, int64, error) {
+	out := make([]*domain.SupplierSettlement, 0, len(f.supplierSettlements))
+	for _, s := range f.supplierSettlements {
+		if filter.Status != nil && s.Status != *filter.Status {
+			continue
+		}
+		if filter.Kind != nil && s.Kind != *filter.Kind {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out, int64(len(out)), nil
+}
+
+func (f *fakeStore) ListSupplierBalances(_ context.Context, _, _ int) ([]domain.SupplierBalance, int64, error) {
+	out := make([]domain.SupplierBalance, 0, len(f.supplierBalances))
+	for _, b := range f.supplierBalances {
+		out = append(out, *b)
+	}
+	return out, int64(len(out)), nil
+}
+
+func (f *fakeStore) PatchSupplierBalance(_ context.Context, uid int64, p domain.SupplierBalancePatch) (*domain.SupplierBalance, error) {
+	b, ok := f.supplierBalances[uid]
+	if !ok {
+		return nil, repository.ErrNotFound
+	}
+	if p.ShareBp != nil {
+		v := *p.ShareBp
+		b.ShareBp = &v
+	} else if p.ClearShareBp {
+		b.ShareBp = nil
+	}
+	if p.FreezeHours != nil {
+		v := *p.FreezeHours
+		b.FreezeHours = &v
+	} else if p.ClearFreezeHours {
+		b.FreezeHours = nil
+	}
+	cp := *b
+	return &cp, nil
+}
+
+// fakeSettlementMutation 定位结算单并复核 revision；不存在 ⇒ ErrNotFound，
+// 陈旧 ⇒ ErrStaleRevision。fn 原地改状态。
+func (f *fakeStore) fakeSettlementMutation(id, expectedRevision int64, fn func(s *domain.SupplierSettlement) error) (*domain.SupplierSettlement, error) {
+	for _, s := range f.supplierSettlements {
+		if s.ID != id {
+			continue
+		}
+		if s.Revision != expectedRevision {
+			return nil, repository.ErrStaleRevision
+		}
+		if err := fn(s); err != nil {
+			return nil, err
+		}
+		s.Revision++
+		return s, nil
+	}
+	return nil, repository.ErrNotFound
+}
+
+func (f *fakeStore) ApproveSettlement(_ context.Context, id, expectedRevision int64, _ domain.FundsActor) (*domain.SupplierSettlement, error) {
+	return f.fakeSettlementMutation(id, expectedRevision, func(s *domain.SupplierSettlement) error {
+		if s.Status != domain.SettlementPending {
+			return repository.ErrStaleRevision
+		}
+		s.Status = domain.SettlementApproved
+		return nil
+	})
+}
+
+func (f *fakeStore) RejectSettlement(_ context.Context, id, expectedRevision int64, reason *string, _ domain.FundsActor) (*domain.SupplierSettlement, error) {
+	return f.fakeSettlementMutation(id, expectedRevision, func(s *domain.SupplierSettlement) error {
+		if s.Status != domain.SettlementPending && s.Status != domain.SettlementApproved {
+			return repository.ErrStaleRevision
+		}
+		s.Status = domain.SettlementRejected
+		s.RejectReason = reason
+		if b, ok := f.supplierBalances[s.SupplierUserID]; ok {
+			b.Available += s.AmountMillis
+		}
+		return nil
+	})
+}
+
+func (f *fakeStore) ClaimSettlement(_ context.Context, id, expectedRevision, amountMillis int64, payee domain.SupplierPayeeSnapshot, risk domain.SupplierRiskEvidence, _ domain.FundsActor) (*domain.SupplierSettlement, error) {
+	if amountMillis <= 0 || payee.PayeeName == "" || payee.Account == "" || payee.Unit == "" || risk.Reference == "" || risk.Summary == "" {
+		return nil, repository.ErrInvalidInput
+	}
+	return f.fakeSettlementMutation(id, expectedRevision, func(s *domain.SupplierSettlement) error {
+		if s.Status != domain.SettlementApproved {
+			return repository.ErrStaleRevision
+		}
+		if amountMillis != s.AmountMillis {
+			return repository.ErrInvalidInput
+		}
+		s.Status = domain.SettlementPaying
+		return nil
+	})
+}
+
+func (f *fakeStore) ConfirmFailedSettlement(_ context.Context, id, expectedRevision int64, in domain.SupplierPayoutFailureConfirmation, _ domain.FundsActor) (*domain.SupplierSettlement, error) {
+	return f.fakeSettlementMutation(id, expectedRevision, func(s *domain.SupplierSettlement) error {
+		if s.Status != domain.SettlementPaying {
+			return repository.ErrStaleRevision
+		}
+		s.Status = domain.SettlementApproved
+		s.PayoutFailureReason = &in.Reason
+		return nil
+	})
+}
+
+func (f *fakeStore) PaidSettlement(_ context.Context, id, expectedRevision int64, externalRef string, _ domain.FundsActor) (*domain.SupplierSettlement, error) {
+	return f.fakeSettlementMutation(id, expectedRevision, func(s *domain.SupplierSettlement) error {
+		if s.Status != domain.SettlementPaying {
+			return repository.ErrStaleRevision
+		}
+		s.Status = domain.SettlementPaid
+		s.ExternalRef = &externalRef
+		if b, ok := f.supplierBalances[s.SupplierUserID]; ok {
+			b.LifetimePaid += s.AmountMillis
+		}
+		return nil
+	})
+}
+
+func (f *fakeStore) AdminApplySettlement(ctx context.Context, req domain.ApplySettlementRequest, actor domain.FundsActor) (*domain.SupplierSettlement, error) {
+	if _, ok := f.supplierBalances[req.SupplierUID]; !ok {
+		return nil, repository.ErrNotFound
+	}
+	return f.ApplySettlement(ctx, req, actor)
 }

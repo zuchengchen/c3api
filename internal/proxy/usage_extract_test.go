@@ -20,21 +20,21 @@ import (
 	"github.com/is7qin/c3api/internal/domain"
 )
 
-// 提取单测用真实上游 JSON 构造（评审 I-1：不得用结构体 marshal 自证——
+// 提取单测用真实上游 JSON 构造（不得用结构体 marshal 自证——
 // RawJSON 路径必须经过 SDK UnmarshalJSON 才能得到原始字节）。
 
-// —— chat 流式 usage 帧（顶层 usage.*；cached_tokens 嵌套于
-// prompt_tokens_details，与 SDK CompletionUsage 结构体一致——评审 I-1） ——
+// —— chat 流式 usage 帧（顶层 usage.*；cached_tokens / cache_write_tokens
+// 嵌套于 prompt_tokens_details） ——
 
 func TestChatStreamUsage(t *testing.T) {
-	frame := []byte(`{"id":"x","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":5},"cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":2}}}`)
+	frame := []byte(`{"id":"x","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":5,"cache_write_tokens":3}}}`)
 	u, ok := chatStreamUsage(frame)
 	require.True(t, ok, "usage 存在 → ok")
-	require.Equal(t, int64(5), u.it, "可计费输入 = prompt − cached（spec 2026-08-25 缓存归一）")
+	require.Equal(t, int64(2), u.it, "可计费输入 = prompt − cached − cache_write（P0-2）")
 	require.Equal(t, int64(20), u.ot)
 	require.Equal(t, int64(30), u.tt, "tt 线上原值——归一不改 total（数值不变量）")
 	require.Equal(t, int64(5), u.cr, "prompt_tokens_details.cached_tokens 直读")
-	require.Equal(t, int64(6), u.cc, "ephemeral 5m+1h 聚合")
+	require.Equal(t, int64(3), u.cc, "prompt_tokens_details.cache_write_tokens")
 
 	// 空对象 usage 仍存在（字段缺失 → 0，不阻塞采集）
 	u, ok = chatStreamUsage([]byte(`{"usage":{}}`))
@@ -63,16 +63,16 @@ func TestChatStreamUsage(t *testing.T) {
 // —— chat 非流式（SDK UnmarshalJSON → PromptTokensDetails 直读 + RawJSON gjson） ——
 
 func TestChatUsageFromResponse(t *testing.T) {
-	raw := `{"id":"x","object":"chat.completion","model":"m","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":5},"cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":2}}}`
+	raw := `{"id":"x","object":"chat.completion","model":"m","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":5,"cache_write_tokens":3}}}`
 	var resp openai.ChatCompletion
 	require.NoError(t, json.Unmarshal([]byte(raw), &resp))
 	require.True(t, resp.JSON.Usage.Valid())
 	pt, ct, tt, cr, cc := chatUsageFromResponse(resp.Usage)
-	require.Equal(t, int64(5), pt, "可计费输入 = prompt − cached（spec 2026-08-25）")
+	require.Equal(t, int64(2), pt, "可计费输入 = prompt − cached − cache_write（P0-2）")
 	require.Equal(t, int64(20), ct)
 	require.Equal(t, int64(30), tt, "tt 信任上游 TotalTokens 原值")
 	require.Equal(t, int64(5), cr, "SDK PromptTokensDetails.CachedTokens 直读")
-	require.Equal(t, int64(6), cc, "RawJSON 保留上游原始字节 → ephemeral 聚合")
+	require.Equal(t, int64(3), cc, "RawJSON → prompt_tokens_details.cache_write_tokens")
 
 	// 无 cache 字段 → 0
 	plain := `{"id":"x","object":"chat.completion","model":"m","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`
@@ -134,7 +134,7 @@ func TestResponsesStreamUsage(t *testing.T) {
 	require.Equal(t, int64(20), u.ot)
 	require.Equal(t, int64(30), u.tt, "tt 线上原值——归一不改 total")
 	require.Equal(t, int64(5), u.cr, "response.usage.input_tokens_details.cached_tokens")
-	require.Zero(t, u.cc, "Responses 无 cache_creation 对象，恒 0 预期（M4）")
+	require.Zero(t, u.cc, "无 cache_write_tokens → 0")
 
 	// 无 response / 无 usage / 显式 null → ok=false
 	_, ok = responsesCompletedUsage([]byte(`{"type":"response.completed"}`))
@@ -145,75 +145,68 @@ func TestResponsesStreamUsage(t *testing.T) {
 	require.False(t, ok, "显式 null → 不存在")
 }
 
-// —— codex resp 顶层 usage（P1-1——T6：SDK 路径 usage 形状为顶层；fixture 对齐
-// codex-sdk responses_test.go respUsage 形状 + cache 明细） ——
+// —— codex 合成体顶层 usage（SDK 把 response.usage 提升到合成体） ——
 
-func TestResponsesTopLevelUsage(t *testing.T) {
-	// 流式 completed 帧形态（顶层 usage——response 对象内无 usage）
-	completed := []byte(`{"type":"response.completed","response":{"id":"r","object":"response","status":"completed"},"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":2},"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":3}}}`)
-	u, ok := responsesTopLevelUsage(completed)
+func TestResponsesBodyUsage(t *testing.T) {
+	composite := []byte(`{"id":"resp_001","object":"response","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":4}}}`)
+	u, ok := responsesBodyUsage(composite)
 	require.True(t, ok)
-	require.Equal(t, int64(8), u.it, "可计费输入 = input − cached（spec 2026-08-25）")
+	require.Equal(t, int64(4), u.it, "可计费输入 = input 10 − cached 2 − cache_write 4（P0-2）")
 	require.Equal(t, int64(20), u.ot)
 	require.Equal(t, int64(30), u.tt, "tt 线上原值——归一不改 total")
-	require.Equal(t, int64(2), u.cr, "顶层 usage.input_tokens_details.cached_tokens")
-	require.Equal(t, int64(4), u.cc, "顶层 cache_creation ephemeral 5m+1h 聚合")
-
-	// 合成体形态（无 type 字段——usage 同样顶层）
-	composite := []byte(`{"id":"resp_001","object":"response","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":2}}}`)
-	u, ok = responsesTopLevelUsage(composite)
-	require.True(t, ok)
-	require.Equal(t, int64(8), u.it)
-	require.Equal(t, int64(20), u.ot)
-	require.Equal(t, int64(30), u.tt)
-	require.Equal(t, int64(2), u.cr)
-	require.Zero(t, u.cc, "无 cache_creation → 0")
+	require.Equal(t, int64(2), u.cr, "usage.input_tokens_details.cached_tokens")
+	require.Equal(t, int64(4), u.cc, "input_tokens_details.cache_write_tokens")
 
 	// 缺失 → ok=false；空对象仍存在；显式 null 字段 → 0（不阻塞采集）
-	_, ok = responsesTopLevelUsage([]byte(`{"id":"x"}`))
+	_, ok = responsesBodyUsage([]byte(`{"id":"x"}`))
 	require.False(t, ok, "usage 缺失 → ok=false")
-	u, ok = responsesTopLevelUsage([]byte(`{"usage":{}}`))
+	u, ok = responsesBodyUsage([]byte(`{"usage":{}}`))
 	require.True(t, ok)
 	require.Zero(t, u.cr)
 	require.Zero(t, u.cc)
-	u, ok = responsesTopLevelUsage([]byte(`{"usage":{"input_tokens_details":{"cached_tokens":null}}}`))
+	u, ok = responsesBodyUsage([]byte(`{"usage":{"input_tokens_details":{"cached_tokens":null}}}`))
 	require.True(t, ok)
 	require.Zero(t, u.cr, "显式 null 与缺失等价")
 }
 
-func TestSniffResponsesCompletedTop(t *testing.T) {
-	completed := []byte(`{"type":"response.completed","response":{"id":"r","object":"response","status":"completed"},"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":2},"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":3}}}`)
-	u, ok := sniffResponsesCompletedTop(completed)
+func TestSniffResponsesCompletedUsage(t *testing.T) {
+	completed := []byte(`{"type":"response.completed","response":{"id":"r","object":"response","status":"completed","usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":4}}}}`)
+	u, ok := sniffResponsesCompletedUsage(completed)
 	require.True(t, ok, "completed 帧命中")
-	require.Equal(t, int64(8), u.it, "可计费输入 = input − cached（spec 2026-08-25）")
+	require.Equal(t, int64(4), u.it, "可计费输入 = input 10 − cached 2 − cache_write 4（P0-2）")
 	require.Equal(t, int64(20), u.ot)
 	require.Equal(t, int64(30), u.tt)
 	require.Equal(t, int64(2), u.cr)
 	require.Equal(t, int64(4), u.cc)
 
 	// 精确判定：正文含 "type":"response.completed" 子串的**非 completed 帧**
-	//（消息文本）不命中——WS 路径 bytes.Contains 预筛会误命中（P1-1 冻结防线）
+	//（消息文本）不命中——WS 路径 bytes.Contains 预筛会误命中（冻结防线）
 	messageFrame := []byte(`{"type":"message","content":[{"type":"output_text","text":"say {\"type\":\"response.completed\"} please"}]}`)
-	_, ok = sniffResponsesCompletedTop(messageFrame)
+	_, ok = sniffResponsesCompletedUsage(messageFrame)
 	require.False(t, ok, "正文含子串的非 completed 帧不得命中（type 精确判定）")
 
 	// 非 JSON 行 / 未知类型 → 不命中
-	_, ok = sniffResponsesCompletedTop([]byte(`this is not json`))
+	_, ok = sniffResponsesCompletedUsage([]byte(`this is not json`))
 	require.False(t, ok)
-	_, ok = sniffResponsesCompletedTop([]byte(`{"type":"output_item.done","item":{"id":"m"}}`))
+	_, ok = sniffResponsesCompletedUsage([]byte(`{"type":"response.output_item.done","item":{"id":"m"}}`))
 	require.False(t, ok)
 
-	// completed 但 usage 缺失 → 命中 + 全 0（缺失 = 0，不阻塞采集）
-	u, ok = sniffResponsesCompletedTop([]byte(`{"type":"response.completed","response":{"id":"r"}}`))
-	require.True(t, ok)
-	require.Zero(t, u.it)
-	require.Zero(t, u.cc)
+	// completed 但 usage 缺失 → ok=false（不阻塞采集；调用方保留此前值）
+	_, ok = sniffResponsesCompletedUsage([]byte(`{"type":"response.completed","response":{"id":"r"}}`))
+	require.False(t, ok, "type 命中但 usage 缺失 → ok=false（统一 missing 语义）")
+
+	// 用量只在 response.usage。顶层 usage 不是当前事件契约（response.usage 缺失 → ok=false）。
+	u, ok = sniffResponsesCompletedUsage([]byte(`{"type":"response.completed","response":{"id":"r"},"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}}`))
+	require.False(t, ok)
+	require.Zero(t, u.it, "不读顶层 usage")
+	require.Zero(t, u.ot)
+	require.Zero(t, u.tt)
 }
 
-// —— A-1 双实现对照（改造前 gjson 版本保留为测试内对照——评审 I-1 语义等价
+// —— 双实现对照（改造前 gjson 版本保留为测试内对照——语义等价
 // 验证） ——
 
-// 对照实现 = 改造前生产代码原样（gjson 多遍扫描）+ deductCacheRead 归一镜像
+// 对照实现 = 改造前生产代码原样（gjson 多遍扫描）+ deductCacheTokens 归一镜像
 // （spec 2026-08-25：生产出口已施加归一，对照必须同语义——否则等价性断言失去
 // 意义）；ok = usage 存在性判定（与原调用方 Type == gjson.JSON 前置检查同构：
 // 缺失/显式 null → Type Null → false）。对照仅存在于测试（生产热路径已全量
@@ -225,10 +218,9 @@ func chatStreamUsageRef(data []byte) (usageTuple, bool) {
 		ot: gjson.GetBytes(data, "usage.completion_tokens").Int(),
 		tt: gjson.GetBytes(data, "usage.total_tokens").Int(),
 		cr: gjson.GetBytes(data, "usage.prompt_tokens_details.cached_tokens").Int(),
-		cc: gjson.GetBytes(data, "usage.cache_creation.ephemeral_5m_input_tokens").Int() +
-			gjson.GetBytes(data, "usage.cache_creation.ephemeral_1h_input_tokens").Int(),
+		cc: gjson.GetBytes(data, "usage.prompt_tokens_details.cache_write_tokens").Int(),
 	}
-	t.it = deductCacheRead(t.it, t.cr)
+	t.it = deductCacheTokens(t.it, t.cr, t.cc)
 	return t, gjson.GetBytes(data, "usage").Type == gjson.JSON
 }
 
@@ -251,43 +243,42 @@ func responsesCompletedUsageRef(data []byte) (usageTuple, bool) {
 		ot: gjson.GetBytes(data, "response.usage.output_tokens").Int(),
 		tt: gjson.GetBytes(data, "response.usage.total_tokens").Int(),
 		cr: gjson.GetBytes(data, "response.usage.input_tokens_details.cached_tokens").Int(),
-		cc: gjson.GetBytes(data, "response.usage.cache_creation.ephemeral_5m_input_tokens").Int() +
-			gjson.GetBytes(data, "response.usage.cache_creation.ephemeral_1h_input_tokens").Int(),
+		cc: gjson.GetBytes(data, "response.usage.input_tokens_details.cache_write_tokens").Int(),
 	}
-	t.it = deductCacheRead(t.it, t.cr)
+	t.it = deductCacheTokens(t.it, t.cr, t.cc)
 	return t, gjson.GetBytes(data, "response.usage").Type == gjson.JSON
 }
 
-func responsesTopLevelUsageRef(data []byte) (usageTuple, bool) {
+func responsesBodyUsageRef(data []byte) (usageTuple, bool) {
 	t := usageTuple{
 		it: gjson.GetBytes(data, "usage.input_tokens").Int(),
 		ot: gjson.GetBytes(data, "usage.output_tokens").Int(),
 		tt: gjson.GetBytes(data, "usage.total_tokens").Int(),
 		cr: gjson.GetBytes(data, "usage.input_tokens_details.cached_tokens").Int(),
-		cc: gjson.GetBytes(data, "usage.cache_creation.ephemeral_5m_input_tokens").Int() +
-			gjson.GetBytes(data, "usage.cache_creation.ephemeral_1h_input_tokens").Int(),
+		cc: gjson.GetBytes(data, "usage.input_tokens_details.cache_write_tokens").Int(),
 	}
-	t.it = deductCacheRead(t.it, t.cr)
+	t.it = deductCacheTokens(t.it, t.cr, t.cc)
 	return t, gjson.GetBytes(data, "usage").Type == gjson.JSON
 }
 
-func sniffResponsesCompletedTopRef(data []byte) (usageTuple, bool) {
+func sniffResponsesCompletedUsageRef(data []byte) (usageTuple, bool) {
 	if gjson.GetBytes(data, "type").String() != "response.completed" {
 		return usageTuple{}, false
 	}
-	t, _ := responsesTopLevelUsageRef(data)
-	return t, true
+	// type 命中后沿用 usage 存在性判定：缺失/显式 null → ok=false（统一 missing
+	// 语义，与生产实现一致）。
+	return responsesCompletedUsageRef(data)
 }
 
-// TestUsageExtractEquivalence A-1 语义等价双实现对照：真实上游形态用例 + 病态
+// TestUsageExtractEquivalence 语义等价双实现对照：真实上游形态用例 + 病态
 // 用例（显式 null / 缺失字段 / 字符串数字 / 嵌套同名键 / 键名前缀干扰 /
-// cache_creation 单桶缺失）全跑新实现与 gjson 对照（真实 JSON 构造，非结构体
-// marshal 自证——评审 I-1），输出元组与 ok 全等。已知差异方向（float / 指数 /
+// cache_write_tokens 单字段）全跑新实现与 gjson 对照（真实 JSON 构造，非结构体
+// marshal 自证），输出元组与 ok 全等。已知差异方向（float / 指数 /
 // 超 int64 / 字符串 \uXXXX 数字 / bool 字面——"保守 0"）不入本表，单独断言
 // （TestScanIntValuePathologicalDivergence）。
 func TestUsageExtractEquivalence(t *testing.T) {
 	chatFrames := []string{
-		`{"id":"x","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":5},"cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":2}}}`,
+		`{"id":"x","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":5,"cache_write_tokens":4}}}`,
 		`{"id":"x","choices":[],"usage":{}}`,   // 空对象仍存在
 		`{"id":"x","choices":[]}`,              // usage 缺失
 		`{"id":"x","choices":[],"usage":null}`, // 显式 null
@@ -298,15 +289,15 @@ func TestUsageExtractEquivalence(t *testing.T) {
 		`{"id":"x","choices":[],"usage":{"prompt_tokens":9223372036854775807,"completion_tokens":1,"total_tokens":9223372036854775807}}`,                            // int64 边界
 		`{"id":"x","choices":[],"usage":{"prompt_tokens_extra":5,"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}`,                                        // 键名前缀干扰
 		`{"id":"x","choices":[],"usage":{"prompt_tokens":7,"prompt_tokens_details":{"prompt_tokens":99,"cached_tokens":5},"completion_tokens":2,"total_tokens":9}}`, // 嵌套同名键（子区间内不误定位）
-		`{"id":"x","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"cache_creation":{"ephemeral_1h_input_tokens":2}}}`,               // cache_creation 单桶缺失
-		`{"id":"x","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"cache_creation":{}}}`,                                            // cache_creation 空对象
+		`{"id":"x","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"prompt_tokens_details":{"cache_write_tokens":2}}}`,               // prompt_tokens_details 仅 cache_write_tokens
+		`{"id":"x","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"prompt_tokens_details":{}}}`,                                     // prompt_tokens_details 空对象
 	}
 	for _, f := range chatFrames {
 		got, ok := chatStreamUsage([]byte(f))
 		want, wantOK := chatStreamUsageRef([]byte(f))
 		require.Equalf(t, want, got, "chat 帧: %s", f)
 		require.Equalf(t, wantOK, ok, "chat ok 帧: %s", f)
-		// 预筛超集属性（E3 核心论证钉住）：ok=true 帧必含 "usage" 子串——
+		// 预筛超集属性（核心论证钉住）：ok=true 帧必含 "usage" 子串——
 		// bytes.Contains 预筛永不漏真命中帧（scanKeyValue 先剥引号取键再
 		// 比较裸键，故键存在时原始字节必含引号形态 needle）
 		if wantOK {
@@ -344,7 +335,7 @@ func TestUsageExtractEquivalence(t *testing.T) {
 		`{"type":"response.completed","response":{"id":"r"}}`, // error 终态形状（无 usage）
 		`{"type":"response.completed","response":{"id":"r","usage":null}}`,
 		`{"type":"response.completed"}`,
-		`{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":5},"cache_creation":{"ephemeral_5m_input_tokens":1}}}}`,
+		`{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":5,"cache_write_tokens":1}}}}`,
 	}
 	for _, f := range responsesFrames {
 		got, ok := responsesCompletedUsage([]byte(f))
@@ -353,30 +344,35 @@ func TestUsageExtractEquivalence(t *testing.T) {
 		require.Equalf(t, wantOK, ok, "responses completed ok 帧: %s", f)
 	}
 
-	topFrames := []string{
-		`{"type":"response.completed","response":{"id":"r","object":"response","status":"completed"},"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":2},"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":3}}}`,
-		`{"id":"resp_001","object":"response","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":2}}}`,
-		`{"type":"response.completed","response":{"id":"r"}}`,
-		`{"type":"response.completed","response":{"id":"r"},"usage":null}`,
+	bodyFrames := []string{
+		`{"id":"resp_001","object":"response","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":4}}}`,
 		`{"id":"x"}`,
-		`{"type":"message","content":[{"type":"output_text","text":"say {\"type\":\"response.completed\"} please"}],"usage":{"input_tokens":10}}`, // 正文含 type 子串的非 completed 帧（sniff 不误命中 → ok=false）
+		`{"id":"x","usage":null}`,
+		`{"usage":{}}`,
+	}
+	for _, f := range bodyFrames {
+		got, ok := responsesBodyUsage([]byte(f))
+		want, wantOK := responsesBodyUsageRef([]byte(f))
+		require.Equalf(t, want, got, "合成体 usage 帧: %s", f)
+		require.Equalf(t, wantOK, ok, "合成体 usage ok 帧: %s", f)
+	}
+
+	sniffFrames := []string{
+		`{"type":"response.completed","response":{"id":"r","object":"response","status":"completed","usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":4}}}}`,
+		`{"type":"response.completed","response":{"id":"r"}}`,
+		`{"type":"response.completed","response":{"id":"r","usage":null}}`,
+		`{"type":"message","content":[{"type":"output_text","text":"say {\"type\":\"response.completed\"} please"}]}`,
 		`this is not json`,
 	}
-	for _, f := range topFrames {
-		got, ok := responsesTopLevelUsage([]byte(f))
-		want, wantOK := responsesTopLevelUsageRef([]byte(f))
-		require.Equalf(t, want, got, "顶层 usage 帧: %s", f)
-		require.Equalf(t, wantOK, ok, "顶层 usage ok 帧: %s", f)
-
-		// sniff 同帧对照（type 精确判定 + 顶层 usage——内联扫描与二次扫描全等）
-		sgot, sok := sniffResponsesCompletedTop([]byte(f))
-		swant, swantOK := sniffResponsesCompletedTopRef([]byte(f))
+	for _, f := range sniffFrames {
+		sgot, sok := sniffResponsesCompletedUsage([]byte(f))
+		swant, swantOK := sniffResponsesCompletedUsageRef([]byte(f))
 		require.Equalf(t, swant, sgot, "sniff 帧: %s", f)
 		require.Equalf(t, swantOK, sok, "sniff ok 帧: %s", f)
 	}
 }
 
-// TestScanIntValuePathologicalDivergence A-1 病态输入差异（差异方向已注释标注
+// TestScanIntValuePathologicalDivergence 病态输入差异（差异方向已注释标注
 // 于 scanIntValue——本实现一律"保守 0"，不做双实现相等断言）：
 //   - float 字面：gjson safeInt 截断取整（12.5 → 12）
 //   - 指数 1e3：gjson parseInt 取前导数字（1）
@@ -400,26 +396,26 @@ func TestScanIntValuePathologicalDivergence(t *testing.T) {
 	require.Equal(t, int64(-5), scanIntValue([]byte(`-5`)), "负数")
 }
 
-// TestUsageExtractZeroAlloc A-1 零分配断言（对齐 respImageCount 先例——gjson
+// TestUsageExtractZeroAlloc 零分配断言（对齐 respImageCount 先例——gjson
 // GetBytes 物化 Raw 字符串分配；scanKeyValue 族纯切片零分配）：A 项全部函数
 // 命中/未命中路径均钉 AllocsPerRun == 0。
 func TestUsageExtractZeroAlloc(t *testing.T) {
-	chat := []byte(`{"id":"x","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":5},"cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":2}}}`)
+	chat := []byte(`{"id":"x","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":5,"cache_write_tokens":4}}}`)
 	anthropic := []byte(`{"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}}}`)
 	delta := []byte(`{"type":"message_delta","usage":{"output_tokens":20}}`)
 	completed := []byte(`{"type":"response.completed","response":{"id":"r","model":"m","usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":5}},"output":[]}}`)
-	top := []byte(`{"type":"response.completed","response":{"id":"r"},"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":2},"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":3}}}`)
+	body := []byte(`{"id":"resp_001","object":"response","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":4}}}`)
 	miss := []byte(`{"id":"x"}`)
 
 	require.Zero(t, testing.AllocsPerRun(100, func() { chatStreamUsage(chat) }))
 	require.Zero(t, testing.AllocsPerRun(100, func() { chatStreamUsage(miss) }), "usage 缺失路径同样零分配")
-	require.Zero(t, testing.AllocsPerRun(100, func() { bytes.Contains(miss, []byte(`"usage"`)) }), "E3 预筛 needle 零分配（inline 字面量编译器静态化）")
+	require.Zero(t, testing.AllocsPerRun(100, func() { bytes.Contains(miss, []byte(`"usage"`)) }), " 预筛 needle 零分配（inline 字面量编译器静态化）")
 	require.Zero(t, testing.AllocsPerRun(100, func() { anthropicStartUsage(anthropic) }))
 	require.Zero(t, testing.AllocsPerRun(100, func() { anthropicDeltaOutput(delta) }))
 	require.Zero(t, testing.AllocsPerRun(100, func() { responsesCompletedUsage(completed) }))
-	require.Zero(t, testing.AllocsPerRun(100, func() { responsesTopLevelUsage(top) }))
-	require.Zero(t, testing.AllocsPerRun(100, func() { sniffResponsesCompletedTop(top) }))
-	require.Zero(t, testing.AllocsPerRun(100, func() { sniffResponsesCompletedTop([]byte(`{"type":"message"}`)) }), "type 未命中路径同样零分配")
+	require.Zero(t, testing.AllocsPerRun(100, func() { responsesBodyUsage(body) }))
+	require.Zero(t, testing.AllocsPerRun(100, func() { sniffResponsesCompletedUsage(completed) }))
+	require.Zero(t, testing.AllocsPerRun(100, func() { sniffResponsesCompletedUsage([]byte(`{"type":"message"}`)) }), "type 未命中路径同样零分配")
 	// scanIntValue 双分支（数字字面 / 字符串数字——string([]byte) 走编译器
 	// 免分配优化路径，实测 0）
 	require.Zero(t, testing.AllocsPerRun(100, func() { scanIntValue([]byte(`12345`)) }))
@@ -429,31 +425,36 @@ func TestUsageExtractZeroAlloc(t *testing.T) {
 // —— Responses 非流式（直读 + RawJSON） ——
 
 func TestResponsesUsageFromResponse(t *testing.T) {
-	raw := `{"id":"r","object":"response","model":"m","status":"completed","usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":5}},"output":[]}`
+	raw := `{"id":"r","object":"response","model":"m","status":"completed","usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":5,"cache_write_tokens":3}},"output":[]}`
 	var resp responses.Response
 	require.NoError(t, json.Unmarshal([]byte(raw), &resp))
 	require.True(t, resp.JSON.Usage.Valid())
 	pt, ct, tt, cr, cc := responsesUsageFromResponse(resp.Usage)
-	require.Equal(t, int64(5), pt, "可计费输入 = input − cached（spec 2026-08-25）")
+	require.Equal(t, int64(2), pt, "可计费输入 = input − cached − cache_write（P0-2）")
 	require.Equal(t, int64(20), ct)
 	require.Equal(t, int64(30), tt, "tt 先按原始 in+out 定值再归一——数值不变量")
 	require.Equal(t, int64(5), cr, "SDK InputTokensDetails.CachedTokens 直读")
-	require.Zero(t, cc, "恒 0 预期（M4）")
+	require.Equal(t, int64(3), cc, "RawJSON → input_tokens_details.cache_write_tokens")
 }
 
-// —— deductCacheRead 归一边界（spec 2026-08-25 验收 #2） ——
+// —— deductCacheTokens 归一边界（spec 2026-08-25 + P0-2 验收） ——
 
-func TestDeductCacheReadBoundaries(t *testing.T) {
-	require.Equal(t, int64(0), deductCacheRead(700, 700), "cr == it → 可计费输入 0（全量缓存命中）")
-	require.Equal(t, int64(0), deductCacheRead(500, 700), "cr > it（病态上游）→ 钳 0 防负车道")
-	require.Equal(t, int64(1000), deductCacheRead(1000, 0), "cr == 0 → 恒等")
-	require.Equal(t, int64(1000), deductCacheRead(1000, -5), "负 cr 视同缺失 → 恒等（钳底由 clamp 兜底）")
-	require.Equal(t, int64(300), deductCacheRead(1000, 700), "常规路径 it − cr")
+func TestDeductCacheTokensBoundaries(t *testing.T) {
+	require.Equal(t, int64(0), deductCacheTokens(700, 700, 0), "cr == it → 可计费输入 0（全量缓存命中）")
+	require.Equal(t, int64(0), deductCacheTokens(500, 700, 0), "cr > it（病态上游）→ 钳 0 防负车道")
+	require.Equal(t, int64(1000), deductCacheTokens(1000, 0, 0), "cr == 0 → 恒等")
+	require.Equal(t, int64(1000), deductCacheTokens(1000, -5, 0), "负 cr 视同缺失 → 恒等（钳底由 clamp 兜底）")
+	require.Equal(t, int64(300), deductCacheTokens(1000, 700, 0), "常规路径 it − cr")
+	// P0-2：cache_write ⊆ input，同样扣除——避免 input 价与 cache-write 价双重计费。
+	require.Equal(t, int64(500), deductCacheTokens(1000, 300, 200), "it − cr − cc")
+	require.Equal(t, int64(0), deductCacheTokens(1000, 400, 600), "cr + cc == it → 0")
+	require.Equal(t, int64(0), deductCacheTokens(1000, 700, 800), "cr + cc > it（病态上游）→ 钳 0")
+	require.Equal(t, int64(1000), deductCacheTokens(1000, 0, -3), "负 cc 视同缺失 → 恒等")
+	require.Equal(t, int64(700), deductCacheTokens(1000, -5, 300), "负 cr 归 0，仅扣 cc")
 
-	// 流式出口级数值不变量：归一前后 TotalTokens 相等（验收 #3）
-	// fixture 为顶层 usage 形态 → 走 responsesTopLevelUsage 出口
+	// 流式出口级数值不变量：归一前后 TotalTokens 相等
 	frame := []byte(`{"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":5}}}`)
-	u, ok := responsesTopLevelUsage(frame)
+	u, ok := responsesBodyUsage(frame)
 	require.True(t, ok)
 	require.Equal(t, int64(30), u.tt, "tt 不因归一变化")
 	require.Equal(t, int64(5), u.it)
@@ -461,7 +462,7 @@ func TestDeductCacheReadBoundaries(t *testing.T) {
 	require.Equal(t, int64(10), u.it+u.cr, "it' + cr == 线上 input_tokens")
 }
 
-// —— buildLog 接线（评审 I-2）：cr/cc → UsageLog.CacheRead/CreationTokens ——
+// —— buildLog 接线：cr/cc → UsageLog.CacheRead/CreationTokens ——
 
 func TestBuildLogWiresCacheTokens(t *testing.T) {
 	l := (&Proxy{}).buildLog("req1", 1, 2, "m", "", domain.FormatOpenAIChat, 200, domain.ErrNone,
@@ -474,7 +475,7 @@ func TestBuildLogWiresCacheTokens(t *testing.T) {
 	require.Zero(t, nilU.CacheCreationTokens)
 }
 
-// —— mappedFor 判定（评审 I-1）：映射/无映射/used 空 ——
+// —— mappedFor 判定：映射/无映射/used 空 ——
 
 func TestMappedFor(t *testing.T) {
 	require.Equal(t, "gpt-4o-upstream", mappedFor("gpt-4o", "gpt-4o-upstream"), "有映射 → 映射后模型")
@@ -483,7 +484,7 @@ func TestMappedFor(t *testing.T) {
 	require.Equal(t, "", mappedFor("", ""), "请求模型缺失（401）→ 空")
 }
 
-// —— buildLog 模型语义（Todo 3 mapping-mode）：Model=客户端请求模型、
+// —— buildLog 模型语义（mapping-mode）：Model=客户端请求模型、
 // MappedModel=调用方直填用量身份（不再 mappedFor 推断）—— ——
 
 func TestBuildLogModelSemantics(t *testing.T) {

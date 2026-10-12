@@ -35,7 +35,8 @@ c3api is in **beta**: feature-complete, but breaking changes are free to happen.
 | **Template & account management** | Model templates, upstream accounts, groups, credentials, and per-template format/model allowlists |
 | **Admin console** | React web UI embedded in the binary (`/app`), plus a full OpenAPI-defined admin API (`/api/admin`) |
 | **Billing & usage** | Per-user balance with pre-check deductions, FEFO temporary quotas, per-model pricing synced from litellm, daily-partitioned usage logs and statistics — billing is enabled by default (`config.example.toml` billing.enabled=true) |
-| **Rules engine** | Customizable routing, rate limiting, and 429/error backoff rules with a built-in scheduler |
+| **Intelligent routing** | A background compiler turns durable per-attempt quality statistics (Wilson-bounded success + log-TTFT), procurement cost multipliers, cache domains, and runtime health into immutable routing plans (Primary / Explore / Degraded lanes); a small steady-state exploration share (1–5%) keeps sampling non-primary candidates; selection is plan-only (no off-plan fallback; AI traffic answers 503 until the first compiled plan publishes), executing the precompiled plan with distinct replay-safe failover (1–8 attempts); requests carrying `prompt_cache_key` / `conversation_id` / `session_id` get soft cache-domain affinity. No manual weights |
+| **Rules engine** | Typed `throttle` (transient runtime health) and `fail_account` (terminal) actions with count/ratio windows, plus response shaping — replaces the old hardcoded backoff; customizable via `/api/admin/rules` |
 | **Multi-instance ready** | PostgreSQL-based state, `NOTIFY`-based cross-instance invalidation, Redis-heartbeat instance discovery (cluster size auto-detected) — zero-config horizontal scaling |
 | **Single binary** | Go binary with embedded frontend, non-root Docker image, drop-in deployment |
 
@@ -58,7 +59,7 @@ c3api is in **beta**: feature-complete, but breaking changes are free to happen.
 **Run the prebuilt image (pull)** — for production, remove the `build:` block in `compose.yml` so `up` runs the pulled image instead of building:
 
 ```bash
-cp .env.example .env        # fill in AUTH_JWT_SECRET (ADMIN_TOKEN optional — see below)
+cp .env.example .env        # fill in AUTH_JWT_SECRET
 docker compose pull
 docker compose up -d
 ```
@@ -66,7 +67,7 @@ docker compose up -d
 **Self-build** — compose builds the image locally (`image` and `build` coexist, `build` wins):
 
 ```bash
-cp .env.example .env        # fill in AUTH_JWT_SECRET (ADMIN_TOKEN optional — see below)
+cp .env.example .env        # fill in AUTH_JWT_SECRET
 docker compose up -d --build
 ```
 
@@ -81,7 +82,6 @@ Prebuilt images are published to GHCR (`ghcr.io/is7qin/c3api`): `:beta` tracks t
 ```bash
 # 0. Inject local dev secrets once (config.toml keeps empty values; placeholder
 #    values like change-me are rejected by config.Load)
-export C3API_ADMIN_TOKEN=local-admin-token
 export C3API_AUTH_JWT_SECRET=$(openssl rand -hex 16)
 
 # 1. Start the gateway (default :18080)
@@ -111,12 +111,13 @@ Point any OpenAI/Anthropic-compatible SDK at the gateway URL — the request for
                     │  │ proxy: auth → gate →     │  │
                     │  │         route → forward  │  │
                     │  └──────────┬──────────────┘  │
-                    │   workers: billing / usage /  │
-                    │   errlog / scheduler / notify │
-                    │   retention / stats-agg /     │
-                    │   pricing-sync / rule-engine  │
-                    │   auth-sync / invalidate /    │
-                    │   discovery                   │
+                     │   workers: billing / usage /  │
+                     │   errlog / scheduler / notify │
+                     │   retention / stats-agg /     │
+                     │   pricing-sync / rule-engine  │
+                     │   quality-sync                │
+                     │   auth-sync / invalidate /    │
+                     │   discovery                   │
                     └───────┼───────────────┼──────┘
                             ▼               ▼
               PostgreSQL 18 (state + NOTIFY) │
@@ -127,7 +128,7 @@ Point any OpenAI/Anthropic-compatible SDK at the gateway URL — the request for
 
 - **Single binary**: the frontend is built and embedded via `go:embed`, so the runtime is one `server` process plus a mounted config file.
 - **Stateless gateway, stateful DB**: all shared state lives in PostgreSQL; instances coordinate through `NOTIFY` on the `c3api_invalidate` channel. The cluster instance count for multi-instance budget sharing is auto-discovered via Redis heartbeats — scale horizontally by just adding instances (no manual setting).
-- **Persistent workers**: billing deduction, usage/statistics flushing, error-log auditing, partition retention, offline stats aggregation, price sync, and the rule scheduler run as long-lived workers with graceful shutdown draining.
+- **Persistent workers**: billing deduction, usage/statistics flushing, error-log auditing, partition retention, offline stats aggregation, price sync, realtime quality sync (`quality-sync`), and the rule scheduler run as long-lived workers with graceful shutdown draining. The routing plan compiler is not a separate worker: it runs as a serial compile lane inside the scheduler, with freshness surfaced through the scheduler's ops stats.
 
 ## Performance
 
@@ -149,7 +150,6 @@ The gateway loads `config.toml` (see `config.example.toml`), overlaid by `C3API_
 
 | Variable | Description |
 |---|---|
-| `C3API_ADMIN_TOKEN` | Admin API token (optional; leave empty to disable static-token auth — `/api/admin` then accepts `platform_admin` JWTs only) |
 | `C3API_AUTH_JWT_SECRET` | JWT signing secret for user auth (required; stable across restarts and instances) |
 | `C3API_DB_DSN` | PostgreSQL DSN |
 | `C3API_REDIS_ADDR` | Redis address (required; e.g. `127.0.0.1:6379` — instance discovery, short-lived verification codes and other ephemeral state) |
@@ -160,7 +160,8 @@ See `config.example.toml` for the full schema (server, log, admin, auth, db, red
 - **Fresh setup only (no migration path)** — schemas and configuration are not backward-compatible between versions: an upgrade means a brand-new database and a re-checked configuration (see [Status: Beta](#status-beta)).
 - **Env-only deployments** (e.g. K8s): pass `-config ""` to skip the config file entirely — the flag defaults to `config.toml`, and a missing file is a startup error.
 - **Config is read once at startup** — changes require a rolling restart (no hot reload).
-- **Invalid config fails fast at startup** with the offending key: non-positive durations/intervals, unknown keys (typos, removed legacy keys), missing required secrets, and placeholder values (`change-me`, `dev-admin-token`, …) are all rejected.
+- **Invalid config fails fast at startup** with the offending key: non-positive durations/intervals, unknown keys (typos, removed keys), missing required secrets, and placeholder values (`change-me`, `dev-jwt-secret-for-local`, …) are all rejected.
+- **`proxy.behind_cdn` defaults to `true`**: the `client_ip` column (usage and error logs) trusts `CF-Connecting-IP` → `True-Client-IP` → `X-Real-IP` (first non-empty) and falls back to `RemoteAddr`. This assumes the origin receives traffic only through a CDN or reverse proxy; if the gateway is exposed directly to the internet, set it to `false`, because those headers are then client-forgeable (the column is a best-effort troubleshooting identifier, not a security boundary).
 
 ## Deployment
 

@@ -5,26 +5,42 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/handler/httpface"
+	"github.com/is7qin/c3api/internal/sdkbridge"
+	"github.com/is7qin/c3api/pkg/logx"
 )
+
+// CodexUsageProber codex 额度快照数据源（*sdkbridge.Codex 满足——组合根经
+// OpsOptions.UsageSnap 构造注入；接口化供测试注入）。
+type CodexUsageProber interface {
+	GetUsageSnapshot(ctx context.Context, cred *domain.AccountCredential) (*domain.CodexUsageSnapshot, error)
+}
 
 // GetAccountsUsage 账号用量聚合（/api/admin/accounts/usage——统一 usage API 查询
 // 面 spec 2026-08-18，ServerInterface）。参数解析与校验在 handler 层：
-// account_ids 逗号分隔必填（非数字/空/去重后 >100 → 400）；from/to RFC3339
-// 可选——缺省 = 当天（from=请求浏览器时区当日零点（`timezone` 参数，缺省
-// UTC）、to=now，"当天"语义单点，经 h.now 可注入时钟）；显式 from/to 为绝对
-// 时刻直透，不做任何时区改写；from > to → 400。响应 items 恒 = account_ids
+// account_ids 逗号分隔必填（非数字/空/去重后 >100 → 400）；窗口**两形态恰择一**
+// （P3，spec §7.3）：from+to 绝对窗口，或 window 时长串相对窗口（服务端自持
+// `h.now`：to = 整点向上取整、from = to − window）。两态都给 / 只给一端 / 都不给
+// → 400 `window_ambiguous`；`window` 不是时长串（如 `7d`）→ 400 `window_invalid`。
+// **本端点不再有"缺省 = 当天"**（那正是"两态都不给"的第三种形态，双路径按裁决
+// 删除而非兼容；调用方必须显式说出它要哪一段）。响应 items 恒 = account_ids
 // 去重后全量（无记录账号 gateway 全 0——前端免补零），顺序 = 去重后顺序。
-// 底层读 usage_logs 原始行绝对区间——本端点时区只影响缺省日界，不影响数值。
+//
+// **窗口上限与覆盖率在 service 层判定**（domain.Admit，KindUsageAgg：raw cost
+// 90d + usage_logs 覆盖率）——本 handler 只把线上形态解码成一对绝对时刻，
+// 倒序（from 不早于 to）也由 Admit step 1 报 400（window_invalid），不再有第二
+// 份形状校验（spec §4.5：全区间 GROUP BY 无 LIMIT 的真实成本洞在 service 补掉）。
 func (h *AdminAPI) GetAccountsUsage(w http.ResponseWriter, r *http.Request, params GetAccountsUsageParams) {
-	zone, err := resolveStatsZone(params.Timezone)
-	if err != nil {
+	if _, err := resolveStatsZone(params.Timezone); err != nil {
 		httpface.WriteServiceErr(w, err)
 		return
 	}
@@ -33,29 +49,95 @@ func (h *AdminAPI) GetAccountsUsage(w http.ResponseWriter, r *http.Request, para
 		httpface.WriteErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	now := h.now()
-	from := dayStart(now, zone) // 请求时区当日零点（"当天"缺省单点）
-	to := now
-	if params.From != nil {
-		from = *params.From
-	}
-	if params.To != nil {
-		to = *params.To
-	}
-	if !from.Before(to) {
-		httpface.WriteErr(w, http.StatusBadRequest, "from must be before to")
-		return
-	}
-	items, err := h.svc.AccountsUsage(r.Context(), ids, from, to)
+	from, to, err := httpface.ResolveStatsWindow(params.From, params.To, params.Window, h.now())
 	if err != nil {
 		httpface.WriteServiceErr(w, err)
 		return
 	}
+	items, err := h.svc.AccountsGatewayUsage(r.Context(), ids, from, to)
+	if err != nil {
+		httpface.WriteServiceErr(w, err)
+		return
+	}
+	h.assembleUpstream(r.Context(), items)
 	out := make([]AccountUsageItem, 0, len(items))
 	for _, it := range items {
 		out = append(out, toAPIAccountUsageItem(it))
 	}
 	httpface.WriteJSON(w, http.StatusOK, AccountsUsageResponse{Items: out})
+}
+
+// assembleUpstream upstream 栏装配（原 service.AccountsUsage 后半段
+// 整体搬迁——行为逐分支一致）：逐账号凭据组装（svc.AccountUsageCredential：
+// api-key/非 codex → nil cred → null 快照/null 标记；store 故障 → 已在
+// service 侧 Warn + null/null）→ **冻结短路**（codex 账号 failed_at 置位 →
+// 不打上游，按失效来源标 upstream_error：sdk → auth_expired；rule/空 → 不标；
+// 见 svc.AccountUsageFrozen）→ codex 账号调
+// prober（nil prober = 未装配 → null 快照，与旧 service nil-setter 降级一致）
+// → sdkbridge 哨兵映射 upstream_error（ErrAuthExpired → auth_expired，
+// ErrUpstream → upstream_unavailable；未知错误 → Warn + null/null，不误标）。
+//
+// 失败语义：单账号快照失败不整批失败（其余账号照常）；批内 errgroup 有界
+// 并发（8——与适配层 usage 并发上限 8 对齐（sdkbridge.usageFetchConcurrency）：
+// 上游并发仍由适配层恒保 ≤8，此处仅并行化编排的 DB 往返/调用分发）；结果按 ids
+// 顺序（goroutine 按 index 写 items，保序）。
+func (h *AdminAPI) assembleUpstream(ctx context.Context, items []domain.AccountUsage) {
+	var g errgroup.Group
+	g.SetLimit(8) // 批内并行度（与适配层 usage 并发上限 8 / sdkbridge.usageFetchConcurrency 语义对齐）
+	for i := range items {
+		i := i
+		g.Go(func() error {
+			cred, err := h.svc.AccountUsageCredential(ctx, items[i].AccountID)
+			if err != nil {
+				return nil // store 故障（service 侧已 Warn）→ null/null，不误标
+			}
+			if cred == nil {
+				return nil // 非 codex（api-key 无凭据）→ null 快照/null 标记
+			}
+			if h.usageSnap == nil {
+				return nil // 未装配 → null 快照（旧 nil-setter 降级语义）
+			}
+			// 冻结：运行时失效（failed_at）账号不打上游额度端点。失效即从调度
+			// 摘除，额度查询无意义；且拨号会反复触发 SDK 凭据刷新判死上报
+			// （token revoked 循环 → C 无限增长）。upstream_error 按失效来源映射
+			// （Q2）：SDK 判死 = 凭据失效（auth_expired，token 吊销场景展示不变）；
+			// 规则引擎判死（凭据未必失效）→ 不标（避免误标"凭据失效"误导运维）。
+			// 冻结态读失败（store 故障）→ 记 Warn 后按**未冻结**继续（fail-open：
+			// 误标 auth_expired 比多打一次上游更糟；C 增长已由失效上报幂等守卫
+			// 兜住，故此处 fail-open 安全）。
+			frozen, source, ferr := h.svc.AccountUsageFrozen(ctx, items[i].AccountID)
+			if ferr != nil && ctx.Err() == nil && h.log != nil {
+				h.log.Warn("accounts usage: frozen-state lookup failed", logx.Int64("account_id", items[i].AccountID), logx.Error(ferr))
+			}
+			if ferr == nil && frozen {
+				if source == domain.FailureSourceSDK {
+					e := domain.UpstreamErrorAuthExpired
+					items[i].UpstreamError = &e
+				}
+				return nil
+			}
+			snap, err := h.usageSnap.GetUsageSnapshot(ctx, cred)
+			switch {
+			case err == nil:
+				items[i].Upstream = snap
+			case errors.Is(err, sdkbridge.ErrAuthExpired):
+				e := domain.UpstreamErrorAuthExpired
+				items[i].UpstreamError = &e
+			case errors.Is(err, sdkbridge.ErrUpstream):
+				e := domain.UpstreamErrorUpstreamUnavailable
+				items[i].UpstreamError = &e
+			default:
+				// 未知上游错误 → 不误标：null/null（ctx 取消为请求已死信号，
+				// 不记 Warn）。
+				if ctx.Err() == nil && h.log != nil {
+					h.log.Warn("accounts usage: account upstream lookup failed", logx.Int64("account_id", items[i].AccountID), logx.Error(err))
+				}
+			}
+			return nil
+		})
+	}
+	// 内部分支恒 nil（单账号失败只记标记）——Wait 仅作在途屏障。
+	_ = g.Wait()
 }
 
 // parseAccountIDs 解析逗号分隔 account_ids（非数字 → 错误）；1-100 条校验 +

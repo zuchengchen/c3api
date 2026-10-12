@@ -26,12 +26,6 @@ type Account struct {
 	BaseURL *string `json:"base_url,omitempty"`
 	// UpstreamKey holds the value of the "upstream_key" field.
 	UpstreamKey string `json:"upstream_key,omitempty"`
-	// Status holds the value of the "status" field.
-	Status account.Status `json:"status,omitempty"`
-	// CooldownUntil holds the value of the "cooldown_until" field.
-	CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
-	// Weight holds the value of the "weight" field.
-	Weight int `json:"weight,omitempty"`
 	// MaxConcurrency holds the value of the "max_concurrency" field.
 	MaxConcurrency int `json:"max_concurrency,omitempty"`
 	// LastError holds the value of the "last_error" field.
@@ -40,6 +34,20 @@ type Account struct {
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
 	// FailedAt holds the value of the "failed_at" field.
 	FailedAt *time.Time `json:"failed_at,omitempty"`
+	// FailureSource holds the value of the "failure_source" field.
+	FailureSource *string `json:"failure_source,omitempty"`
+	// Enabled holds the value of the "enabled" field.
+	Enabled bool `json:"enabled,omitempty"`
+	// LifecycleRevision holds the value of the "lifecycle_revision" field.
+	LifecycleRevision int64 `json:"lifecycle_revision,omitempty"`
+	// IdentityRevision holds the value of the "identity_revision" field.
+	IdentityRevision int64 `json:"identity_revision,omitempty"`
+	// UpstreamCostMultiplierBp holds the value of the "upstream_cost_multiplier_bp" field.
+	UpstreamCostMultiplierBp int `json:"upstream_cost_multiplier_bp,omitempty"`
+	// CacheDomain holds the value of the "cache_domain" field.
+	CacheDomain *string `json:"cache_domain,omitempty"`
+	// SupplierUserID holds the value of the "supplier_user_id" field.
+	SupplierUserID *int64 `json:"supplier_user_id,omitempty"`
 	// UpdatedAt holds the value of the "updated_at" field.
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
 	// DeletedAt holds the value of the "deleted_at" field.
@@ -99,11 +107,13 @@ func (*Account) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
-		case account.FieldID, account.FieldTemplateID, account.FieldWeight, account.FieldMaxConcurrency:
+		case account.FieldEnabled:
+			values[i] = new(sql.NullBool)
+		case account.FieldID, account.FieldTemplateID, account.FieldMaxConcurrency, account.FieldLifecycleRevision, account.FieldIdentityRevision, account.FieldUpstreamCostMultiplierBp, account.FieldSupplierUserID:
 			values[i] = new(sql.NullInt64)
-		case account.FieldName, account.FieldBaseURL, account.FieldUpstreamKey, account.FieldStatus, account.FieldLastError:
+		case account.FieldName, account.FieldBaseURL, account.FieldUpstreamKey, account.FieldLastError, account.FieldFailureSource, account.FieldCacheDomain:
 			values[i] = new(sql.NullString)
-		case account.FieldCooldownUntil, account.FieldLastUsedAt, account.FieldFailedAt, account.FieldUpdatedAt, account.FieldDeletedAt, account.FieldCreatedAt:
+		case account.FieldLastUsedAt, account.FieldFailedAt, account.FieldUpdatedAt, account.FieldDeletedAt, account.FieldCreatedAt:
 			values[i] = new(sql.NullTime)
 		default:
 			values[i] = new(sql.UnknownType)
@@ -151,25 +161,6 @@ func (_m *Account) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.UpstreamKey = value.String
 			}
-		case account.FieldStatus:
-			if value, ok := values[i].(*sql.NullString); !ok {
-				return fmt.Errorf("unexpected type %T for field status", values[i])
-			} else if value.Valid {
-				_m.Status = account.Status(value.String)
-			}
-		case account.FieldCooldownUntil:
-			if value, ok := values[i].(*sql.NullTime); !ok {
-				return fmt.Errorf("unexpected type %T for field cooldown_until", values[i])
-			} else if value.Valid {
-				_m.CooldownUntil = new(time.Time)
-				*_m.CooldownUntil = value.Time
-			}
-		case account.FieldWeight:
-			if value, ok := values[i].(*sql.NullInt64); !ok {
-				return fmt.Errorf("unexpected type %T for field weight", values[i])
-			} else if value.Valid {
-				_m.Weight = int(value.Int64)
-			}
 		case account.FieldMaxConcurrency:
 			if value, ok := values[i].(*sql.NullInt64); !ok {
 				return fmt.Errorf("unexpected type %T for field max_concurrency", values[i])
@@ -196,6 +187,51 @@ func (_m *Account) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.FailedAt = new(time.Time)
 				*_m.FailedAt = value.Time
+			}
+		case account.FieldFailureSource:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field failure_source", values[i])
+			} else if value.Valid {
+				_m.FailureSource = new(string)
+				*_m.FailureSource = value.String
+			}
+		case account.FieldEnabled:
+			if value, ok := values[i].(*sql.NullBool); !ok {
+				return fmt.Errorf("unexpected type %T for field enabled", values[i])
+			} else if value.Valid {
+				_m.Enabled = value.Bool
+			}
+		case account.FieldLifecycleRevision:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field lifecycle_revision", values[i])
+			} else if value.Valid {
+				_m.LifecycleRevision = value.Int64
+			}
+		case account.FieldIdentityRevision:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field identity_revision", values[i])
+			} else if value.Valid {
+				_m.IdentityRevision = value.Int64
+			}
+		case account.FieldUpstreamCostMultiplierBp:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field upstream_cost_multiplier_bp", values[i])
+			} else if value.Valid {
+				_m.UpstreamCostMultiplierBp = int(value.Int64)
+			}
+		case account.FieldCacheDomain:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field cache_domain", values[i])
+			} else if value.Valid {
+				_m.CacheDomain = new(string)
+				*_m.CacheDomain = value.String
+			}
+		case account.FieldSupplierUserID:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field supplier_user_id", values[i])
+			} else if value.Valid {
+				_m.SupplierUserID = new(int64)
+				*_m.SupplierUserID = value.Int64
 			}
 		case account.FieldUpdatedAt:
 			if value, ok := values[i].(*sql.NullTime); !ok {
@@ -281,17 +317,6 @@ func (_m *Account) String() string {
 	builder.WriteString("upstream_key=")
 	builder.WriteString(_m.UpstreamKey)
 	builder.WriteString(", ")
-	builder.WriteString("status=")
-	builder.WriteString(fmt.Sprintf("%v", _m.Status))
-	builder.WriteString(", ")
-	if v := _m.CooldownUntil; v != nil {
-		builder.WriteString("cooldown_until=")
-		builder.WriteString(v.Format(time.ANSIC))
-	}
-	builder.WriteString(", ")
-	builder.WriteString("weight=")
-	builder.WriteString(fmt.Sprintf("%v", _m.Weight))
-	builder.WriteString(", ")
 	builder.WriteString("max_concurrency=")
 	builder.WriteString(fmt.Sprintf("%v", _m.MaxConcurrency))
 	builder.WriteString(", ")
@@ -308,6 +333,33 @@ func (_m *Account) String() string {
 	if v := _m.FailedAt; v != nil {
 		builder.WriteString("failed_at=")
 		builder.WriteString(v.Format(time.ANSIC))
+	}
+	builder.WriteString(", ")
+	if v := _m.FailureSource; v != nil {
+		builder.WriteString("failure_source=")
+		builder.WriteString(*v)
+	}
+	builder.WriteString(", ")
+	builder.WriteString("enabled=")
+	builder.WriteString(fmt.Sprintf("%v", _m.Enabled))
+	builder.WriteString(", ")
+	builder.WriteString("lifecycle_revision=")
+	builder.WriteString(fmt.Sprintf("%v", _m.LifecycleRevision))
+	builder.WriteString(", ")
+	builder.WriteString("identity_revision=")
+	builder.WriteString(fmt.Sprintf("%v", _m.IdentityRevision))
+	builder.WriteString(", ")
+	builder.WriteString("upstream_cost_multiplier_bp=")
+	builder.WriteString(fmt.Sprintf("%v", _m.UpstreamCostMultiplierBp))
+	builder.WriteString(", ")
+	if v := _m.CacheDomain; v != nil {
+		builder.WriteString("cache_domain=")
+		builder.WriteString(*v)
+	}
+	builder.WriteString(", ")
+	if v := _m.SupplierUserID; v != nil {
+		builder.WriteString("supplier_user_id=")
+		builder.WriteString(fmt.Sprintf("%v", *v))
 	}
 	builder.WriteString(", ")
 	builder.WriteString("updated_at=")

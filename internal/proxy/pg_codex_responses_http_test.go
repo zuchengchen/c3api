@@ -9,8 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -27,11 +25,12 @@ import (
 	"github.com/is7qin/c3api/internal/rule"
 	"github.com/is7qin/c3api/internal/scheduler"
 	"github.com/is7qin/c3api/internal/sdkbridge"
+	"github.com/is7qin/c3api/internal/testsupport/pgtest"
 	"github.com/is7qin/c3api/internal/usage"
 	"github.com/is7qin/c3api/pkg/aiclient"
 )
 
-// 真实 PG e2e（T6 happy path——"真实凭据"= 凭据材料真实落库 account_ext，经
+// 真实 PG e2e（happy path——"真实凭据"= 凭据材料真实落库 account_ext，经
 // LoadGroupsAccounts 快照 → Selection.Ext → AccountCredential 派生直供适配层；
 // 上游为本地 mock SSE 面——真实上游不可控）：
 //
@@ -42,27 +41,13 @@ import (
 // usage 顶层五计数计费落库（cost 500 毫分）+ cred 传递（Bearer pat-pg-1 直供
 // 适配层）。
 
-const codexHTTPPGTestSchema = "c3api_test_t6"
-
 func TestCodexResponsesHTTPBillingPG(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping real-PostgreSQL test")
-	}
-	if strings.Contains(dsn, "?") {
-		dsn += "&search_path=" + codexHTTPPGTestSchema
-	} else {
-		dsn += "?search_path=" + codexHTTPPGTestSchema
-	}
+	dsn := pgtest.Clone(t)
 	ctx := context.Background()
-	pool, err := repository.OpenPG(ctx, dsn, 5)
-	require.NoError(t, err)
-	t.Cleanup(pool.Close)
+	pool := pgtest.OpenPool(t, dsn)
 	db := stdlib.OpenDBFromPool(pool)
 	t.Cleanup(func() { _ = db.Close() })
-	_, err = db.ExecContext(ctx, `DROP SCHEMA IF EXISTS `+codexHTTPPGTestSchema+` CASCADE; CREATE SCHEMA `+codexHTTPPGTestSchema+`;`)
-	require.NoError(t, err)
-	repos, err := repository.New(entsql.OpenDB(dialect.Postgres, db), true)
+	repos, err := repository.New(entsql.OpenDB(dialect.Postgres, db), false)
 	require.NoError(t, err)
 	require.NoError(t, repos.EnsureUsageLogPartitioned(ctx, time.Now()))
 	require.NoError(t, repos.EnsureErrLogPartitioned(ctx, time.Now()))
@@ -72,7 +57,7 @@ func TestCodexResponsesHTTPBillingPG(t *testing.T) {
 	defer up.Close()
 
 	// 落库数据：codex-pat 模板 + 组 + 账号 + account_ext（PAT 凭据 + 伪装身份
-	// 四元组持久化——META-2 断言面：HTTP 面注入 client_metadata）
+	// 四元组持久化——断言面：HTTP 面注入 client_metadata）
 	tpl, err := repos.Templates.CreateTemplate(ctx, &domain.Template{
 		Name: "codex-tpl", BaseURL: "",
 		CredentialType:   credential.TypeCodexPAT,
@@ -84,33 +69,29 @@ func TestCodexResponsesHTTPBillingPG(t *testing.T) {
 	g, err := repos.Groups.CreateGroup(ctx, &domain.Group{Name: "g", Visibility: domain.GroupVisibilityPublic})
 	require.NoError(t, err)
 	acc, err := repos.Accounts.CreateAccount(ctx, &domain.Account{
-		Name: "codex-acc", TemplateID: tpl.ID, Weight: 100, MaxConcurrency: 4,
+		Name: "codex-acc", TemplateID: tpl.ID, MaxConcurrency: 4, Enabled: true,
 	})
 	require.NoError(t, err)
 	require.NoError(t, repos.Accounts.SetAccountGroups(ctx, acc.ID, []int64{g.ID}))
 	_, err = repos.AccountExts.UpsertAccountExt(ctx, &domain.AccountExt{
 		AccountID: acc.ID, CredentialType: credential.TypeCodexPAT, CodexPATKey: strPtrPG("pat-pg-1"),
-		CodexIdentity: &domain.CodexIdentity{
-			InstallationID: "inst-pg-1",
-			SessionID:      "sess-pg-1",
-			ThreadID:       "thread-pg-1",
-			WindowID:       "thread-pg-1:0",
-		},
+		CodexIdentity: &domain.CodexIdentity{InstallationID: "inst-pg-1"},
 	})
 	require.NoError(t, err)
 
 	// 调度器接真实 loader（快照含 Ext eager-load；请求期零 DB）
-	re := rule.New(rule.Config{}, repos.Rules, nil)
-	sched := scheduler.New(scheduler.Config{DefaultMaxConcurrency: 4, SyncInterval: time.Hour}, repos.Groups, re, nil)
+	re := rule.New(rule.Config{}, repos.Rules, nil, nil, nil)
+	sched := scheduler.New(scheduler.Config{SyncInterval: time.Hour}, repos.Groups, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
+	publishTestRoutes(t, sched)
 
 	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{
 		"ck-1": activeKey(1, 1, g.ID),
-	}}, noopUserLoader{}, nil, true)
+	}}, noopUserLoader{}, nil, nil, true)
 	require.NoError(t, auth.Reload(context.Background()))
 
 	// 计费钩子：价格快照 + 余额快照；单写点：billable 行经 rec → repos.Usages
-	// 直落 usage_logs（F2：无 flusher 分流）。
+	// 直落 usage_logs（无 flusher 分流）。
 	bal := billing.NewBalances(fakeBalanceLoader{m: map[int64]int64{1: 1_000_000}}, nil)
 	require.NoError(t, bal.Reload(ctx), "余额快照加载")
 	rec := usage.New(usage.UsageConfig{
@@ -123,8 +104,7 @@ func TestCodexResponsesHTTPBillingPG(t *testing.T) {
 		UpstreamTimeout:       5 * time.Second,
 		UpstreamStreamTimeout: 30 * time.Second,
 	})
-	codex := sdkbridge.NewCodex(nil)
-	codex.SetTransport(newProxyOfficialRewriteTransport(up.URL))
+	codex := sdkbridge.NewCodex(nil, newProxyOfficialRewriteTransport(up.URL), sdkbridge.RotationDeps{})
 	p := New(Config{
 		MaxBodySize: 1 << 20, FailoverAttempts: 2,
 		UpstreamTimeout:       5 * time.Second,
@@ -134,8 +114,7 @@ func TestCodexResponsesHTTPBillingPG(t *testing.T) {
 	}, sched, credential.New(), rec, clients, auth, nil, &BillingHooks{
 		Resolver: &fakePriceLookup{entries: map[string]*domain.PriceEntry{"gpt-4o": proxyPricingEntry()}, variants: map[string][]*domain.PriceVariant{"gpt-4o": proxyPricingVariants()}},
 		Balances: bal,
-	}, nil)
-	p.SetCodex(codex)
+	}, nil, Deps{Codex: codex})
 	srv := httptest.NewServer(AIRouter(p))
 	defer srv.Close()
 
@@ -152,17 +131,18 @@ func TestCodexResponsesHTTPBillingPG(t *testing.T) {
 		t.Fatalf("非流式 wire 必须 stream:true（SDK 注入）, body = %s", upc.body(0))
 	}
 
-	// META-2：伪装身份注入——上游收到 client_metadata（account_ext 持久化值 →
-	// 快照 → codexIdentityFromExt → SDK 注入）：恒 4 key + turn_id UUIDv7
-	//（spec 2026-08-15 验收面）
+	// 伪装身份注入——上游收到 client_metadata：installation_id 取落库 ext
+	//（账号级稳定项）；session/thread/window = 运行时槽身份（UUIDv7，session==
+	// thread、window={thread}:0）；turn_id UUIDv7（SDK 自动）
 	cm := gjson.GetBytes(upc.body(0), "client_metadata")
-	require.Equal(t, "inst-pg-1", cm.Get("x-codex-installation-id").String(), "installation_id（ext 持久化）注入")
-	require.Equal(t, "sess-pg-1", cm.Get("session_id").String(), "session_id（ext 持久化）注入")
-	require.Equal(t, "thread-pg-1", cm.Get("thread_id").String(), "thread_id（ext 持久化）注入")
-	require.Equal(t, "thread-pg-1:0", cm.Get("x-codex-window-id").String(), "window_id（ext 持久化）注入")
+	require.Equal(t, "inst-pg-1", cm.Get("x-codex-installation-id").String(), "installation_id（ext）注入")
+	sessID := cm.Get("session_id").String()
+	require.True(t, isUUIDv7(sessID), "session_id = 槽身份（UUIDv7）")
+	require.Equal(t, sessID, cm.Get("thread_id").String(), "槽内 session==thread")
+	require.Equal(t, sessID+":0", cm.Get("x-codex-window-id").String(), "window={thread}:0")
 	require.True(t, isUUIDv7(cm.Get("turn_id").String()), "turn_id UUIDv7 格式（SDK 自动生成）")
 
-	// rec 排空（InsertBatch 落库）后断言 usage_logs 行——顶层 usage
+	// rec 排空（InsertBatch 落库）后断言 usage_logs 行——合成体顶层 usage
 	// 五计数 + cost（10×1e7+20×2e7 = 500 毫分；cache 价 nil → cache 分量 0 成本）
 	require.NoError(t, rec.Close(ctx))
 	var (
@@ -174,12 +154,12 @@ func TestCodexResponsesHTTPBillingPG(t *testing.T) {
 		FROM usage_logs WHERE format = 'openai-responses' ORDER BY id DESC LIMIT 1`).
 		Scan(&it, &ot, &tt, &cr, &cc, &cost, &format, &et, &model)
 	require.NoError(t, err, "usage_logs 必须有 resp 计费行")
-	require.Equal(t, int64(8), it, "input_tokens（顶层 usage 提取；可计费输入 = 10 − cached 2，spec 2026-08-25 归一）")
+	require.Equal(t, int64(4), it, "input_tokens（合成体顶层 usage 提取；可计费输入 = 10 − cached 2 − cache_write 4，spec 2026-08-25 + P0-2 归一）")
 	require.Equal(t, int64(20), ot, "output_tokens")
 	require.Equal(t, int64(30), tt, "total_tokens")
 	require.Equal(t, int64(2), cr, "cache_read_tokens")
-	require.Equal(t, int64(4), cc, "cache_creation_tokens")
-	require.Equal(t, int64(480), cost, "it'=8：8×1e7+20×2e7 每 M 毫分 = 480（重复计费的 cr×InputPerM 份额已消除）")
+	require.Equal(t, int64(4), cc, "cache_write_tokens")
+	require.Equal(t, int64(440), cost, "it'=4：4×1e7+20×2e7 每 M 毫分 = 440（cr/cc 不再按 InputPerM 重复计费）")
 	require.Equal(t, "openai-responses", format)
 	require.Equal(t, "none", et)
 	require.Equal(t, "gpt-4o", model)

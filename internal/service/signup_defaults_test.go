@@ -18,7 +18,7 @@ import (
 // newSnapshotSvc 构造带 settings 快照的 Service（New 初始化 = 真实装配路径；
 // 其余既有测试直构 Service，快照为零值不影响非设置路径）。
 func newSnapshotSvc(fs *fakeStore) *Service {
-	return New(fs, nil, NopInvalidator{}, nil, nil, nil, nil)
+	return New(Deps{Store: fs, Scheduler: nil, Invalidate: NopInvalidator{}, Publisher: nil, RuleReload: nil, Auth: nil, Log: nil, EmailCodeStore: testEmailCodes})
 }
 
 // TestSettingsSnapshotInitAndReload 快照：New 后可用（注册表默认值）→
@@ -54,7 +54,7 @@ func TestSettingsSnapshotInitAndReload(t *testing.T) {
 // TestRegisterUserAppliesDefaults 注册应用默认值：
 // 默认 0/0 → 用户 0/0 且不插临时额度行；设置 100/500/1000/30 → 用户
 // 100/500 + temp 行（amount=1000, expires≈now+30d, note="signup bonus"）；
-// temp_balance=0 → 不插行；temp 插行失败 → 注册仍成功（评审 M-2）。
+// temp_balance=0 → 不插行；temp 插行失败 → 注册仍成功。
 func TestRegisterUserAppliesDefaults(t *testing.T) {
 	ctx := context.Background()
 
@@ -103,7 +103,7 @@ func TestRegisterUserAppliesDefaults(t *testing.T) {
 	require.Equal(t, 8, u.MaxConcurrency)
 	require.Empty(t, fs.tempBalances, "temp_balance=0 不插行")
 
-	// 评审 M-2：temp 插行失败 → 注册仍成功（防客户端重试 → 409 email 死锁）
+	// temp 插行失败 → 注册仍成功（防客户端重试 → 409 email 死锁）
 	fs = newFakeStore()
 	fs.tempBalanceErr = errTempBalanceInjected
 	svc = newSnapshotSvc(fs)
@@ -114,7 +114,7 @@ func TestRegisterUserAppliesDefaults(t *testing.T) {
 	require.True(t, u.ID > 0)
 }
 
-// errTempBalanceInjected 评审 M-2 注入错误（模拟赠品插行失败）。
+// errTempBalanceInjected 注入错误（模拟赠品插行失败）。
 var errTempBalanceInjected = errors.New("injected: temp balance insert failed")
 
 // TestRegisterUserBootstrapFirstAdmin 首个注册用户 bootstrap（方案 A，spec
@@ -159,7 +159,7 @@ func TestCreateUserAdminNoDefaults(t *testing.T) {
 	require.NoError(t, err)
 
 	u, err := svc.CreateUser(ctx, "admin@example.com", "s3cret-pass",
-		domain.RoleUser, domain.UserStatusActive, 0, 0)
+		domain.RoleUser, domain.UserStatusActive, 0, 0, 0)
 	require.NoError(t, err)
 	require.Zero(t, u.MaxConcurrency, "管理面显式 0 不套默认")
 	require.Zero(t, u.Balance, "管理面显式 0 不套默认")

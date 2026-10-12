@@ -191,7 +191,7 @@ func TestImagesEditsJSONDirect(t *testing.T) {
 }
 
 // TestImagesMultipartHardGateSkippedAndPassthrough multipart 专用 body 分支
-// （P1-2）：body 为非 JSON（含图片文件字节）→ 必须 200（json.Valid 硬门对
+// body 为非 JSON（含图片文件字节）→ 必须 200（json.Valid 硬门对
 // multipart 跳过——不跳过则 400 误杀）；body 字节与 Content-Type（含
 // boundary）原样透传上游；model 从 form 字段取（映射不回写——form model
 // 原样透传）。
@@ -281,7 +281,7 @@ func TestImagesNoImagePrice402(t *testing.T) {
 	require.NoError(t, p.rec.Close(context.Background()))
 }
 
-// TestImagesPureImageModelNotKilledByChatPrecheck P1-1 核心断言：纯 image 价
+// TestImagesPureImageModelNotKilledByChatPrecheck 核心断言：纯 image 价
 // 模型（aiml 形态——仅 per-image 分量，无文本价 → 无 pricings 行）在 images
 // 端点不被 chat 价预检（GetPrice）误杀——预检按格式切换：images 查
 // GetImagePrice（有行 → 放行），跳过 GetPrice（空 chat 价表 → 修复前 402）。
@@ -302,8 +302,8 @@ func TestImagesPureImageModelNotKilledByChatPrecheck(t *testing.T) {
 	require.Equal(t, 200, rec.Code, "纯 image 价模型不得被 chat 价预检误杀：body=%s", rec.Body.String())
 	require.Equal(t, 1, c.calls, "预检通过 → 正常转发")
 	require.NoError(t, p.rec.Close(context.Background()))
-	// T2 起 images 日志走 applyImageBilling（价格快照有行 → 不 no_price 标记、
-	// 不落 chat 价快照列）。T2 P3-4 起直连路径接入 usage 提取（data 长 =
+	// 此后 images 日志走 applyImageBilling（价格快照有行 → 不 no_price 标记、
+	// 不落 chat 价快照列）。此后直连路径接入 usage 提取（data 长 =
 	// 张数——fake 上游返回 2 元素 data、无 usage → 无 token 分量，per-image
 	// 分量照算）——不按 0 计价的断言面 = no_price 标记不出现（有价行）+ Cost
 	// 含 image 分量。
@@ -318,8 +318,8 @@ func TestImagesPureImageModelNotKilledByChatPrecheck(t *testing.T) {
 	require.Equal(t, int64(5400), *store.logs[0].PricePerCallMillis)
 }
 
-// TestImagesDirectUsageExtractionBilling T2 P3-4 直连路径 usage 提取断言：api_key
-// 直连 /v1/images/generations（Task B 路径）计费含 image 分量——上游响应带
+// TestImagesDirectUsageExtractionBilling 直连路径 usage 提取断言：api_key
+// 直连 /v1/images/generations（路径）计费含 image 分量——上游响应带
 // 嵌套 usage image_tokens（与 codexTestImageResponse 同 wire 形态）→
 // CallCount = data 长 + ImageInput/OutputTokens = image_tokens（并入 in/out）+ ImageCost
 // 落账（与 codexImagesCaller 同口径——同一 ImageUsageFromResponse 纯函数，
@@ -409,7 +409,40 @@ func TestImagesStreamingSSE(t *testing.T) {
 	require.NoError(t, p.rec.Close(context.Background()))
 }
 
-// TestImagesStreamDirectBilling A-P1-2 直连流式 images 计费接线：api_key 模板 +
+// TestImagesStreamingKeepalive typed images（真上游 SSE 流）随五路传通用保活
+// 间隔（spec §3）：上游发出首帧后静默 → 网关按 StreamKeepaliveInterval
+// 写 ": keepalive\n"；业务帧照常透传。
+func TestImagesStreamingKeepalive(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl := w.(http.Flusher)
+		fmt.Fprintf(w, "data: %s\n\n", `{"type":"image_generation.completed","data":[{"b64_json":"QUJD"}]}`)
+		fl.Flush()
+		<-r.Context().Done() // 首帧后静默，直到上游超时/取消
+	}))
+	defer up.Close()
+	tpl := &domain.Template{
+		ID: 1, Name: "t", BaseURL: up.URL,
+		CredentialType:   credential.TypeAPIKey,
+		SupportedFormats: []domain.RequestFormat{domain.FormatOpenAIImages},
+		Models:           []string{"gpt-image-1"},
+	}
+	store := &captureLogStore{}
+	p := newTestProxyTplTimeoutLogs(t, tpl, 1, true, 150*time.Millisecond, store, nil)
+	p.cfg.StreamKeepaliveInterval = 20 * time.Millisecond
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
+		`{"model":"gpt-image-1","prompt":"a cat","stream":true}`))
+	req.Header.Set("Authorization", "Bearer ck-1")
+	rec := httptest.NewRecorder()
+	p.HandleImagesGenerations(rec, req)
+
+	require.Contains(t, rec.Body.String(), ": keepalive\n", "typed images 静默期必须发通用保活")
+	require.Contains(t, rec.Body.String(), `"type":"image_generation.completed"`, "业务帧照常透传")
+}
+
+// TestImagesStreamDirectBilling 直连流式 images 计费接线：api_key 模板 +
 // stream:true 上游 SSE completed 帧（含 usage image_tokens）→ Observer 逐帧提取
 // → 流终落账非零——count = completed 帧数累积、ii/io 取最后一个 completed 帧的
 // usage（覆盖语义，对齐 codex 流式路径——累积求和多图差 N 倍）、ImageCost
@@ -458,8 +491,8 @@ func TestImagesStreamDirectBilling(t *testing.T) {
 }
 
 // TestImagesCodexNotIntegrated501 codex 分流骨架：codex-oauth 模板在 images
-// 端点选号命中 → 501 明确"未接入"（SDK 调用 T2/T3 接；未接入前不得误报
-// 502/network），上游不收请求；评审 P2-1：post-Select 拒绝必须 recordRejected
+// 端点选号命中 → 501 明确"未接入"（SDK 调用后续接；未接入前不得误报
+// 502/network），上游不收请求；post-Select 拒绝必须 recordRejected
 // 留 err_logs 审计（error_type=billing、StatusCode=501、文案落 ErrorMessage）。
 func TestImagesCodexNotIntegrated501(t *testing.T) {
 	var hits atomic.Int64
@@ -486,7 +519,7 @@ func TestImagesCodexNotIntegrated501(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "adapter not wired", "501 文案 = 装配缺失")
 	require.Zero(t, hits.Load(), "未接入不得转发上游")
 	require.NoError(t, p.rec.Close(context.Background()))
-	// P2-1：err_logs 审计断言（拒绝行走 errlog worker，Close 显式排空）
+	// err_logs 审计断言（拒绝行走 errlog worker，Close 显式排空）
 	require.NoError(t, p.errlog.Close(context.Background()))
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -513,6 +546,11 @@ func TestImagesCodexPATNotIntegrated501(t *testing.T) {
 	}
 	store := &captureLogStore{}
 	p := newTestProxyTplTimeoutLogs(t, tpl, 1, true, 30*time.Second, store, nil)
+	// codex-pat 候选指纹要求 PAT key（routing 契约：pat 类型空 key 不可路由）——
+	// 补 Ext 使账号可被选号，从而抵达适配层未装配的 501 显式拒绝路径。
+	p.sched.Loader().(noopLoader).accs[10][0].Ext = codexPATExt(1, "pat-key")
+	require.NoError(t, p.sched.InvalidateAllSync())
+	publishTestRoutes(t, p.sched)
 	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{"model":"gpt-image-1"}`))
 	req.Header.Set("Authorization", "Bearer ck-1")
 	rec := httptest.NewRecorder()
@@ -528,7 +566,7 @@ func TestImagesCodexPATNotIntegrated501(t *testing.T) {
 }
 
 // TestImagesResponsesSpecialDirect responses-special 类型直连（用户裁决：两
-// 类型都支持两个端点）：凭据取用成功（P4 502 消灭同款——注册表必须含
+// 类型都支持两个端点）：凭据取用成功（502 消灭同款——注册表必须含
 // responses-special provider）+ 上游收到账号 key。
 func TestImagesResponsesSpecialDirect(t *testing.T) {
 	up, c := fakeImagesUpstream(t, "/v1/images/generations")
@@ -555,7 +593,7 @@ func TestImagesResponsesSpecialDirect(t *testing.T) {
 
 // TestImagesFormatValidatorOpenaiImages 枚举扩展（spec §4.3）：usage_logs /
 // err_logs 的 format 枚举必须接受 openai-images（否则 images 请求落账 COPY
-// 恒失败——评审 D4）。
+// 恒失败）。
 func TestImagesFormatValidatorOpenaiImages(t *testing.T) {
 	require.NoError(t, entusagelog.FormatValidator(entusagelog.Format(domain.FormatOpenAIImages)))
 	require.NoError(t, enterrlog.FormatValidator(enterrlog.Format(domain.FormatOpenAIImages)))

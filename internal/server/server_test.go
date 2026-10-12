@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -25,10 +26,11 @@ import (
 	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/handler/httpface"
 	"github.com/is7qin/c3api/pkg/aiclient"
+	"github.com/is7qin/c3api/pkg/sserelay"
 )
 
 func TestHealthz(t *testing.T) {
-	s := NewServer(Options{AdminToken: "tok", Logger: nil})
+	s := NewServer(Options{Logger: nil})
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 	resp, err := http.Get(ts.URL + "/healthz")
@@ -43,19 +45,22 @@ func TestHealthz(t *testing.T) {
 }
 
 func TestUnknownPath404(t *testing.T) {
-	s := NewServer(Options{AdminToken: "tok"})
+	s := NewServer(Options{})
 	req := httptest.NewRequest(http.MethodGet, "/nope", nil)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	require.Equal(t, 404, rec.Code)
 }
 
-// 规格 §6.1：/api/admin/* 需要 Bearer admin token；无/错 token → 401。
+// 规格：/api/admin/* 需要 platform_admin 身份；无/错凭证 → 401。
 func TestAdminAuthRequired(t *testing.T) {
+	iss := auth.NewIssuer("secret")
+	tok, err := iss.Issue(1, "admin@example.com", string(domain.RolePlatformAdmin), 0)
+	require.NoError(t, err)
 	admin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	})
-	s := NewServer(Options{AdminToken: "tok", AdminHandler: admin})
+	s := NewServer(Options{JWTIssuer: iss, Auth: fakeSnapshot{fakeUserStatus{roles: map[int64]domain.Role{1: domain.RolePlatformAdmin}}, fakeMgmt{}}, AdminHandler: admin})
 
 	for _, tc := range []struct {
 		name, auth string
@@ -64,7 +69,7 @@ func TestAdminAuthRequired(t *testing.T) {
 		{"no token", "", 401},
 		{"wrong token", "Bearer nope", 401},
 		{"non-bearer", "tok", 401},
-		{"right token", "Bearer tok", 200},
+		{"platform_admin JWT", "Bearer " + tok, 200},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/api/admin/groups", nil)
@@ -81,19 +86,22 @@ func TestAdminAuthRequired(t *testing.T) {
 // 回归：生产 main.go 同时设置 AdminHandler + AIHandler（各自 Mount("/") 曾
 // 触发 chi 重复 Mount panic）。断言 /api/admin/* 与 /v1/* 分别打到对应 handler。
 func TestAdminAndAIHandlersCoexist(t *testing.T) {
+	iss := auth.NewIssuer("secret")
+	tok, err := iss.Issue(1, "admin@example.com", string(domain.RolePlatformAdmin), 0)
+	require.NoError(t, err)
 	admin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		httpface.WriteJSON(w, http.StatusOK, map[string]any{"handler": "admin", "path": r.URL.Path})
 	})
 	ai := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		httpface.WriteJSON(w, http.StatusOK, map[string]any{"handler": "ai", "path": r.URL.Path})
 	})
-	s := NewServer(Options{AdminToken: "tok", AdminHandler: admin, AIHandler: ai})
+	s := NewServer(Options{JWTIssuer: iss, Auth: fakeSnapshot{fakeUserStatus{roles: map[int64]domain.Role{1: domain.RolePlatformAdmin}}, fakeMgmt{}}, MaxInflight: 1024, AdminHandler: admin, AIHandler: ai})
 
 	for _, tc := range []struct {
 		path, auth, wantHandler string
 	}{
-		{"/api/admin/templates", "Bearer tok", "admin"},
-		{"/api/admin/templates/1", "Bearer tok", "admin"},
+		{"/api/admin/templates", "Bearer " + tok, "admin"},
+		{"/api/admin/templates/1", "Bearer " + tok, "admin"},
 		{"/v1/chat/completions", "", "ai"},
 		{"/v1/images/generations", "", "ai"},
 		{"/v1/images/edits", "", "ai"},
@@ -120,7 +128,7 @@ func TestFaviconServedFromWebFS(t *testing.T) {
 		"favicon.svg":   &fstest.MapFile{Data: []byte(`<svg xmlns="http://www.w3.org/2000/svg"></svg>`)},
 		"assets/app.js": &fstest.MapFile{Data: []byte(`console.log("x")`)},
 	}
-	s := NewServer(Options{AdminToken: "tok", WebFS: fsys})
+	s := NewServer(Options{WebFS: fsys})
 
 	req := httptest.NewRequest(http.MethodGet, "/favicon.svg", nil)
 	rec := httptest.NewRecorder()
@@ -139,7 +147,7 @@ func TestFaviconServedFromWebFS(t *testing.T) {
 	require.Equal(t, "text/html; charset=utf-8", rec.Header().Get("Content-Type"))
 }
 
-// O1 收尾（评审项）：/assets/* 不得渲染 HTML 目录列表——目录请求 404、文件
+// 收尾（评审项）：/assets/* 不得渲染 HTML 目录列表——目录请求 404、文件
 // 200（go:embed all:dist 裸 FileServerFS 会把目录枚举成 HTML 列表，静态资源
 // 被遍历暴露）。
 func TestAssetsNoDirectoryListing(t *testing.T) {
@@ -148,7 +156,7 @@ func TestAssetsNoDirectoryListing(t *testing.T) {
 		"assets":        &fstest.MapFile{Mode: fs.ModeDir},
 		"assets/app.js": &fstest.MapFile{Data: []byte(`console.log(1)`)},
 	}
-	s := NewServer(Options{AdminToken: "tok", WebFS: fsys})
+	s := NewServer(Options{WebFS: fsys})
 
 	req := httptest.NewRequest(http.MethodGet, "/assets/", nil)
 	rec := httptest.NewRecorder()
@@ -162,6 +170,51 @@ func TestAssetsNoDirectoryListing(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "console.log(1)")
 }
 
+// 回归（SPA 深链 404）：AI 面曾用 Mount("/", …) 注册 /* 通配，吞掉所有
+// 未匹配路径——/app、/user 深链绕行 AI 组后落到子路由默认 404（根 SPA
+// fallback 不可达），冷启动时更会被 planReadyGate 误判 503（控制台不可达）。
+// AI 面实际只占 /v1/*（proxy.AIRouter），必须以静态前缀挂载。本用例显式同时
+// 装配 AIHandler + WebFS——此前无此组合用例，是 漏网的原因。
+func TestSPADeepLinksWithAIHandlerMounted(t *testing.T) {
+	fsys := fstest.MapFS{
+		"index.html": &fstest.MapFile{Data: []byte(`<html>app</html>`)},
+	}
+	// 门替身：AI 面一律 503（模拟计划未就绪）；SPA 页面绝不允许吃这个 503。
+	ai := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	s := NewServer(Options{MaxInflight: 1024, AIHandler: ai, WebFS: fsys})
+
+	for _, p := range []string{"/app", "/app/accounts", "/app/ops", "/user", "/user/login", "/user/keys"} {
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		req.Header.Set("Accept", "text/html")
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code, "深链 %s 必须回 index.html（不得被 AI 通配吞掉/误吃门 503）", p)
+		require.Equal(t, "text/html; charset=utf-8", rec.Header().Get("Content-Type"), "path %s", p)
+		require.Contains(t, rec.Body.String(), "<html>app</html>", "path %s", p)
+	}
+
+	// AI 面仍进入 AIHandler（替身表现为 503）——挂载改动不得放行 AI 路径。
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code, "/v1/* 必须仍进入 AIHandler")
+
+	// 非浏览器导航（无 Accept: text/html）的未知路径 → 404，不回 index.html。
+	req = httptest.NewRequest(http.MethodGet, "/app/accounts", nil)
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNotFound, rec.Code)
+
+	// 未知 API 路径 → 404（SPA fallback 不得吞 API 面）。
+	req = httptest.NewRequest(http.MethodGet, "/api/nope", nil)
+	req.Header.Set("Accept", "text/html")
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
 // 规格 §10.6：全局在途上限，超限立即 429 + Retry-After: 1。
 func TestInflightLimiterRejects(t *testing.T) {
 	release := make(chan struct{})
@@ -169,7 +222,7 @@ func TestInflightLimiterRejects(t *testing.T) {
 		<-release
 		w.WriteHeader(200)
 	})
-	s := NewServer(Options{AdminToken: "tok", MaxInflight: 1, AIHandler: ai})
+	s := NewServer(Options{MaxInflight: 1, AIHandler: ai})
 
 	firstDone := make(chan int, 1)
 	go func() {
@@ -193,13 +246,27 @@ func TestInflightLimiterRejects(t *testing.T) {
 	require.Zero(t, s.inflight.Load())
 }
 
-// --- Phase 3a：/admin 鉴权扩展（静态 token OR platform_admin JWT）+ /user 挂载 ---
+// 契约回归（b881526）：server 包不再有 MaxInflight==0 → 50000 兜底——归一
+// 唯一归 config.EffectiveMaxInflight（cmd/server 装配时传入 effective 值）。
+// Options 零值 = AI 组全拒 429，测试 fixture 必须显式设值（见本文件其余用例）。
+func TestZeroMaxInflightDeniesAllNoFallback(t *testing.T) {
+	ai := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	s := NewServer(Options{AIHandler: ai})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusTooManyRequests, rec.Code, "0 = deny-all（兜底已删，回归即 fallback 复活）")
+	require.Zero(t, s.inflight.Load(), "拒绝路径不得泄漏计数")
+}
+
+// --- /admin 鉴权扩展（静态 token OR platform_admin JWT）+ /user 挂载 ---
 
 // fakeUserStatus 测试替身（快照 provider，status+role 单次查找；roles 缺省 =
 // RoleUser——与生产"快照角色"语义对齐：admin 测试必须显式授予）。
 type fakeUserStatus struct {
-	disabled map[int64]bool
-	roles    map[int64]domain.Role
+	disabled      map[int64]bool
+	roles         map[int64]domain.Role
+	tokenVersions map[int64]int
 }
 
 func (f fakeUserStatus) UserSnapshot(userID int64) (domain.UserSnapshot, bool) {
@@ -207,21 +274,33 @@ func (f fakeUserStatus) UserSnapshot(userID int64) (domain.UserSnapshot, bool) {
 	if role == "" {
 		role = domain.RoleUser
 	}
+	tv := int64(f.tokenVersions[userID])
 	if f.disabled[userID] {
-		return domain.UserSnapshot{Status: domain.UserStatusDisabled, Role: role}, true
+		return domain.UserSnapshot{Status: domain.UserStatusDisabled, Role: role, TokenVersion: tv}, true
 	}
-	return domain.UserSnapshot{Status: domain.UserStatusActive, Role: role}, true
+	return domain.UserSnapshot{Status: domain.UserStatusActive, Role: role, TokenVersion: tv}, true
+}
+
+// fakeSnapshot 合并鉴权快照 provider（users + mgmt，spec 2026-10-09 §4.3）：adminAuth
+// 两条分支同一 provider（同一 auth 只传一次）。嵌入两个 fake 即同时满足两接口。
+type fakeSnapshot struct {
+	fakeUserStatus
+	fakeMgmt
 }
 
 // emptySnapshotProvider 快照缺失 provider（fail-closed 用例：启动首刷失败 /
-// Reload 失败保留旧快照 / NOTIFY 丢失的模拟）。
+// Reload 失败保留旧快照 / NOTIFY 丢失的模拟）。合并 provider：mgmt 恒 false。
 type emptySnapshotProvider struct{}
 
 func (emptySnapshotProvider) UserSnapshot(int64) (domain.UserSnapshot, bool) {
 	return domain.UserSnapshot{}, false
 }
 
-// 规格 Phase 3a：/admin = 静态 token OR platform_admin JWT（两个都过才拒）。
+func (emptySnapshotProvider) AuthenticateManagement(*http.Request) (domain.ManagementKeyMeta, bool) {
+	return domain.ManagementKeyMeta{}, false
+}
+
+// 规格 /admin = platform_admin JWT 或 platform_admin 身份的管理 key（两个都过才拒）。
 func TestAdminAuthTokenOrPlatformJWT(t *testing.T) {
 	iss := auth.NewIssuer("secret")
 	adminTok, err := iss.Issue(1, "admin@example.com", string(domain.RolePlatformAdmin), 0)
@@ -230,12 +309,16 @@ func TestAdminAuthTokenOrPlatformJWT(t *testing.T) {
 	require.NoError(t, err)
 	admin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	s := NewServer(Options{
-		AdminToken: "tok",
-		JWTIssuer:  iss,
+		JWTIssuer: iss,
 		// 快照 role 覆盖 claims.Role：user 1 = platform_admin（JWT 与快照一致
 		// 才放行）；user 2 快照角色 = user → 即使 claims 伪造 platform_admin
-		// 也 401（F1 降权即时生效语义）。
-		UserStatus:   fakeUserStatus{roles: map[int64]domain.Role{1: domain.RolePlatformAdmin}},
+		// 也 401（降权即时生效语义）。
+		Auth: fakeSnapshot{
+			fakeUserStatus{roles: map[int64]domain.Role{1: domain.RolePlatformAdmin, 3: domain.RolePlatformAdmin}},
+			fakeMgmt{metas: map[string]domain.ManagementKeyMeta{
+				"mk-admin": {ID: 10, UserID: 3, Status: domain.ManagementKeyStatusActive},
+			}},
+		},
 		AdminHandler: admin,
 	})
 
@@ -243,8 +326,8 @@ func TestAdminAuthTokenOrPlatformJWT(t *testing.T) {
 		name, auth string
 		want       int
 	}{
-		{"static token", "Bearer tok", 200},
 		{"platform_admin JWT", "Bearer " + adminTok, 200},
+		{"management key", "Bearer mk-admin", 200},
 		{"user JWT", "Bearer " + userTok, 401},
 		{"no token", "", 401},
 	} {
@@ -260,29 +343,44 @@ func TestAdminAuthTokenOrPlatformJWT(t *testing.T) {
 	}
 }
 
-// 中间件注入（决策 5）：JWT 鉴权路径把 claims.UserID 写入 context（兑换码
-// created_by 用）；静态 admin token 路径不注入（handler 读到 0 = 系统）。
+// 中间件注入（决策 5）：JWT 与管理 key 鉴权路径都把 owner UserID 写入 context
+// （兑换码 created_by 用），且都注入资金操作者 FundsActor（user_id + token_version，
+// 资金写命令用）。两分支逐字段断言。
 func TestAdminUserIDContextInjection(t *testing.T) {
 	iss := auth.NewIssuer("secret")
-	tok, err := iss.Issue(7, "admin@example.com", string(domain.RolePlatformAdmin), 0)
+	tok, err := iss.Issue(7, "admin@example.com", string(domain.RolePlatformAdmin), 5)
 	require.NoError(t, err)
 	var gotID int64
 	var gotOK bool
+	var gotActor domain.FundsActor
+	var gotActorOK bool
 	admin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotID, gotOK = UserIDFromContext(r.Context())
+		gotActor, gotActorOK = domain.FundsActorFrom(r.Context())
 		w.WriteHeader(200)
 	})
+	// JWT 分支：快照 TokenVersion 必须等于 claims.Ver（否则 401）；管理 key 分支：
+	// 直接取 owner 快照的 TokenVersion。
+	snaps := fakeUserStatus{
+		roles:         map[int64]domain.Role{7: domain.RolePlatformAdmin, 9: domain.RolePlatformAdmin},
+		tokenVersions: map[int64]int{7: 5, 9: 3},
+	}
+	mgmt := fakeMgmt{metas: map[string]domain.ManagementKeyMeta{
+		"mk-owner": {ID: 20, UserID: 9, Status: domain.ManagementKeyStatusActive},
+	}}
 
 	for _, tc := range []struct {
-		name, auth string
-		wantOK     bool
-		wantID     int64
+		name, auth  string
+		wantOK      bool
+		wantID      int64
+		wantActorTv int64
 	}{
-		{"platform_admin JWT 注入 UserID", "Bearer " + tok, true, 7},
-		{"静态 admin token 不注入", "Bearer tok", false, 0},
+		{"platform_admin JWT 注入 UserID+FundsActor", "Bearer " + tok, true, 7, 5},
+		{"管理 key 注入 owner UserID+FundsActor", "Bearer mk-owner", true, 9, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := NewServer(Options{AdminToken: "tok", JWTIssuer: iss, UserStatus: fakeUserStatus{roles: map[int64]domain.Role{7: domain.RolePlatformAdmin}}, AdminHandler: admin})
+			gotID, gotOK, gotActor, gotActorOK = 0, false, domain.FundsActor{}, false
+			s := NewServer(Options{JWTIssuer: iss, Auth: fakeSnapshot{snaps, mgmt}, AdminHandler: admin})
 			req := httptest.NewRequest(http.MethodGet, "/api/admin/groups", nil)
 			req.Header.Set("Authorization", tc.auth)
 			rec := httptest.NewRecorder()
@@ -290,13 +388,17 @@ func TestAdminUserIDContextInjection(t *testing.T) {
 			require.Equal(t, 200, rec.Code)
 			require.Equal(t, tc.wantOK, gotOK, "context 注入标记")
 			require.Equal(t, tc.wantID, gotID, "UserID 值")
+			require.True(t, gotActorOK, "FundsActor 注入标记")
+			require.Equal(t, tc.wantID, gotActor.UserID, "FundsActor.UserID")
+			require.Equal(t, tc.wantActorTv, gotActor.TokenVersion, "FundsActor.TokenVersion")
 		})
 	}
 
-	// UserStatus=nil（未装配提供者）→ JWT 路径整体拒绝（F1 行为变化：旧实现
+	// UserStatus=nil（未装配提供者）→ JWT 路径整体拒绝（行为变化：旧实现
 	// nil 放行——无快照角色可校验，fail-closed 语义一致；生产恒装配）。
 	t.Run("UserStatus nil JWT 路径拒绝", func(t *testing.T) {
-		s := NewServer(Options{AdminToken: "tok", JWTIssuer: iss, AdminHandler: admin})
+		gotID, gotOK, gotActor, gotActorOK = 0, false, domain.FundsActor{}, false
+		s := NewServer(Options{JWTIssuer: iss, AdminHandler: admin})
 		req := httptest.NewRequest(http.MethodGet, "/api/admin/groups", nil)
 		req.Header.Set("Authorization", "Bearer "+tok)
 		rec := httptest.NewRecorder()
@@ -304,6 +406,7 @@ func TestAdminUserIDContextInjection(t *testing.T) {
 		require.Equal(t, 401, rec.Code, "nil 提供者 = 无快照角色 → 拒绝（fail-closed）")
 		require.False(t, gotOK, "拒绝路径不注入 UserID")
 		require.Zero(t, gotID)
+		require.False(t, gotActorOK, "拒绝路径不注入 FundsActor")
 	})
 }
 
@@ -313,11 +416,10 @@ func TestAdminPlatformJWTPartialAdmin(t *testing.T) {
 	tok, err := iss.Issue(1, "admin@example.com", string(domain.RolePlatformAdmin), 0)
 	require.NoError(t, err)
 	s := NewServer(Options{
-		AdminToken: "tok",
-		JWTIssuer:  iss,
+		JWTIssuer: iss,
 		// 快照角色 = platform_admin 但状态 disabled：快照 status 校验拒绝
 		// （角色已过、状态不过——两条件独立校验）。
-		UserStatus:   fakeUserStatus{disabled: map[int64]bool{1: true}, roles: map[int64]domain.Role{1: domain.RolePlatformAdmin}},
+		Auth:         fakeSnapshot{fakeUserStatus{disabled: map[int64]bool{1: true}, roles: map[int64]domain.Role{1: domain.RolePlatformAdmin}}, fakeMgmt{}},
 		AdminHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }),
 	})
 	req := httptest.NewRequest(http.MethodGet, "/api/admin/groups", nil)
@@ -327,7 +429,7 @@ func TestAdminPlatformJWTPartialAdmin(t *testing.T) {
 	require.Equal(t, 401, rec.Code, "禁用 platform_admin JWT 必须拒绝")
 }
 
-// F1 降权即时生效：旧 JWT（claims 仍 platform_admin）在快照刷新（模拟
+// 降权即时生效：旧 JWT（claims 仍 platform_admin）在快照刷新（模拟
 // invalidate → Reload）后立即 401——快照 role 覆盖 claims.Role，无需等
 // 24h TTL 过期。快照刷新 = 原地改 fake 共享 map（引用不变，中间件可见）。
 func TestAdminRoleDowngradeImmediate(t *testing.T) {
@@ -337,9 +439,8 @@ func TestAdminRoleDowngradeImmediate(t *testing.T) {
 	roles := map[int64]domain.Role{1: domain.RolePlatformAdmin}
 	admin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	s := NewServer(Options{
-		AdminToken:   "tok",
 		JWTIssuer:    iss,
-		UserStatus:   fakeUserStatus{roles: roles},
+		Auth:         fakeSnapshot{fakeUserStatus{roles: roles}, fakeMgmt{}},
 		AdminHandler: admin,
 	})
 	do := func() *httptest.ResponseRecorder {
@@ -355,16 +456,15 @@ func TestAdminRoleDowngradeImmediate(t *testing.T) {
 	require.Equal(t, 401, do().Code, "降权后旧 JWT 立即拒绝（无需等 TTL 过期）")
 }
 
-// F1 快照缺失 fail-closed：平台_admin JWT + 快照查无此人（启动首刷失败 /
+// 快照缺失 fail-closed：平台_admin JWT + 快照查无此人（启动首刷失败 /
 // Reload 失败保留旧快照 / NOTIFY 丢失）→ 401，绝不放行。
 func TestAdminSnapshotMissingFailClosed(t *testing.T) {
 	iss := auth.NewIssuer("secret")
 	tok, err := iss.Issue(1, "admin@example.com", string(domain.RolePlatformAdmin), 0)
 	require.NoError(t, err)
 	s := NewServer(Options{
-		AdminToken:   "tok",
 		JWTIssuer:    iss,
-		UserStatus:   emptySnapshotProvider{},
+		Auth:         emptySnapshotProvider{},
 		AdminHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }),
 	})
 	req := httptest.NewRequest(http.MethodGet, "/api/admin/groups", nil)
@@ -377,7 +477,7 @@ func TestAdminSnapshotMissingFailClosed(t *testing.T) {
 // /user 挂载：注册公开可达；/user 其余路径经用户面路由器处理（401 无 JWT）。
 func TestUserMount(t *testing.T) {
 	userH := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
-	s := NewServer(Options{AdminToken: "tok", UserHandler: userH})
+	s := NewServer(Options{UserHandler: userH})
 	req := httptest.NewRequest(http.MethodGet, "/api/user/whatever", nil)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
@@ -404,7 +504,7 @@ func TestWSUpgradeThroughMiddlewareChain(t *testing.T) {
 		}
 		_ = conn.Write(context.Background(), typ, msg)
 	})
-	s := NewServer(Options{AdminToken: "tok", AIHandler: ai})
+	s := NewServer(Options{MaxInflight: 1024, AIHandler: ai})
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 
@@ -457,7 +557,7 @@ func TestStatusWriterHijackSemantics(t *testing.T) {
 	})
 }
 
-// TestStatusWriterUnwrapResponseController statusWriter.Unwrap 语义（C-P2-1
+// TestStatusWriterUnwrapResponseController statusWriter.Unwrap 语义（
 // 前置）：包装 statusWriter 后 http.ResponseController.SetWriteDeadline 必须
 // 沿 Unwrap 链穿透到真实 writer——无 Unwrap 的包装层全链 ErrNotSupported，
 // sserelay 的写侧 deadline 与 ctx 取消联动（半开客户端写卡死修复）在
@@ -493,14 +593,79 @@ func (w *deadlineRecorder) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-// --- F4 recoverer：debug.Stack + 已写头静默关连接（受益面仅 SSE） ---
+// TestStatusWriterFlushError statusWriter.FlushError 转发语义（§3.6）：
+// 向内层转发；成功 flush 引发隐式 200 → 同步置 status/headersWritten（防
+// recoverer 误判未写头）；底层单独 FlushError 失败原样返回且不置标志；不支持
+// flush 的底层 → ErrNotSupported 且不置标志。
+func TestStatusWriterFlushError(t *testing.T) {
+	t.Run("success updates implicit 200", func(t *testing.T) {
+		fw := &flushOnlyWriter{}
+		sw := &statusWriter{ResponseWriter: fw}
+		require.NoError(t, sw.FlushError())
+		require.Equal(t, 1, fw.flushes, "必须向内层 flush")
+		require.True(t, sw.headersWritten, "隐式写头必须同步置标志")
+		require.Equal(t, http.StatusOK, sw.status)
+	})
+	t.Run("underlying FlushError error returned", func(t *testing.T) {
+		boom := errors.New("flush boom")
+		sw := &statusWriter{ResponseWriter: &flushErrWriter{err: boom}}
+		require.ErrorIs(t, sw.FlushError(), boom)
+		require.False(t, sw.headersWritten, "flush 失败不得置已写头标志")
+	})
+	t.Run("no flush support -> ErrNotSupported", func(t *testing.T) {
+		sw := &statusWriter{ResponseWriter: plainNoFlush{}}
+		require.ErrorIs(t, sw.FlushError(), http.ErrNotSupported)
+		require.False(t, sw.headersWritten)
+	})
+}
+
+type flushOnlyWriter struct{ flushes int }
+
+func (w *flushOnlyWriter) Header() http.Header         { return http.Header{} }
+func (w *flushOnlyWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *flushOnlyWriter) WriteHeader(int)             {}
+func (w *flushOnlyWriter) Flush()                      { w.flushes++ }
+
+type flushErrWriter struct{ err error }
+
+func (w *flushErrWriter) Header() http.Header         { return http.Header{} }
+func (w *flushErrWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *flushErrWriter) WriteHeader(int)             {}
+func (w *flushErrWriter) FlushError() error           { return w.err }
+
+type plainNoFlush struct{}
+
+func (plainNoFlush) Header() http.Header         { return http.Header{} }
+func (plainNoFlush) Write(p []byte) (int, error) { return len(p), nil }
+func (plainNoFlush) WriteHeader(int)             {}
+
+// TestOutputThroughStatusWriterFlushError 真实包装层集成（statusWriter → Output）：
+// sserelay 的可返错 flush 探测链必须命中 statusWriter.FlushError（而非被包装层
+// 吞掉）。Write 成功但内层 FlushError 失败 → Output 置 writeFailed、取消上游；
+// 字节已过底层写边界（businessSent=true）但不推进可见调度。
+func TestOutputThroughStatusWriterFlushError(t *testing.T) {
+	boom := errors.New("flush boom")
+	sw := &statusWriter{ResponseWriter: &flushErrWriter{err: boom}}
+	var canceled atomic.Bool
+	out := sserelay.NewOutput(sw, 0, sserelay.OutputOptions{Cancel: func() { canceled.Store(true) }})
+	defer out.Release()
+
+	_, err := out.WriteFrame([]byte("data: x\n\n"))
+	require.ErrorIs(t, err, boom, "包装层 FlushError 必须被探测链命中并返错")
+	require.True(t, out.WriteFailed())
+	require.ErrorIs(t, out.IOErr(), boom)
+	require.True(t, canceled.Load(), "flush 失败必须取消上游 ctx")
+	require.True(t, out.BusinessFrameSent(), "字节已过底层写边界（Write 成功）→ 真实下行")
+}
+
+// --- recoverer：debug.Stack + 已写头静默关连接（受益面仅 SSE） ---
 
 // 未写头 panic → 500 JSON 照旧（行为不变）。
 func TestRecovererUnwrittenHeaders(t *testing.T) {
 	ai := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		panic("boom before headers")
 	})
-	s := NewServer(Options{AdminToken: "tok", AIHandler: ai})
+	s := NewServer(Options{MaxInflight: 1024, AIHandler: ai})
 	req := httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
@@ -519,7 +684,7 @@ func TestRecovererSSENotPolluted(t *testing.T) {
 		}
 		panic("sse panic after headers")
 	})
-	s := NewServer(Options{AdminToken: "tok", AIHandler: ai})
+	s := NewServer(Options{MaxInflight: 1024, AIHandler: ai})
 	req := httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
@@ -540,7 +705,7 @@ func TestRecovererSSEConnectionClosed(t *testing.T) {
 		}
 		panic("sse panic after headers")
 	})
-	s := NewServer(Options{AdminToken: "tok", AIHandler: ai})
+	s := NewServer(Options{MaxInflight: 1024, AIHandler: ai})
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 
@@ -551,4 +716,22 @@ func TestRecovererSSEConnectionClosed(t *testing.T) {
 	require.Equal(t, "data: {\"ok\":true}\n\n", string(body), "流零污染")
 	require.Error(t, err, "已写头 + panic → 连接被关闭：读取以异常终止而非干净 EOF")
 	require.False(t, errors.Is(err, io.EOF), "必须非干净流尾（关闭连接语义：无终结 chunk）")
+}
+
+// TestSupplierMountPrecedence /api/user/supplier/* 更具体的静态前缀优先于
+// /api/user/*（供应商面挂载不与用户面冲突）。
+func TestSupplierMountPrecedence(t *testing.T) {
+	userH := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	supH := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusCreated) })
+	s := NewServer(Options{UserHandler: userH, SupplierHandler: supH})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/user/supplier/accounts", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusCreated, rec.Code, "供应商面路径必须由 SupplierHandler 处理")
+
+	req2 := httptest.NewRequest(http.MethodGet, "/api/user/keys", nil)
+	rec2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec2, req2)
+	require.Equal(t, http.StatusOK, rec2.Code, "其余 /api/user/* 由 UserHandler 处理")
 }

@@ -23,17 +23,17 @@ type TemplateRepo struct {
 }
 
 func (r *TemplateRepo) CreateTemplate(ctx context.Context, t *domain.Template) (*domain.Template, error) {
-	if isCodexType(t.CredentialType) && t.BaseURL != "" {
+	if t.CredentialType.IsCodex() && t.BaseURL != "" {
 		return nil, fmt.Errorf("%w: codex template base_url must be empty", ErrInvalidInput)
 	}
 	row, err := r.client.Template.Create().
 		SetName(t.Name).SetBaseURL(t.BaseURL).
-		// 全字段 Set（含 credential_type）：空串兜底在 service 层（M-1，防默认值被绕过）
+		// 全字段 Set（含 credential_type）：空串兜底在 service 层（防默认值被绕过）
 		SetCredentialType(string(t.CredentialType)).
 		SetSupportedFormats(formatsToStrings(t.SupportedFormats)).
 		SetModels(t.Models).
 		SetFormatModels(formatModelsToStrings(t.FormatModels)).
-		SetModelMapping(nonNilModelMapping(t.ModelMapping)).
+		SetModelMapping(t.ModelMapping).
 		Save(ctx)
 	if err != nil {
 		if sqlgraph.IsUniqueConstraintError(err) {
@@ -117,7 +117,7 @@ func (r *TemplateRepo) UpdateTemplate(ctx context.Context, t *domain.Template) (
 			SetSupportedFormats(formatsToStrings(t.SupportedFormats)).
 			SetModels(t.Models).
 			SetFormatModels(formatModelsToStrings(t.FormatModels)).
-			SetModelMapping(nonNilModelMapping(t.ModelMapping)).
+			SetModelMapping(t.ModelMapping).
 			Save(ctx)
 		return saveErr
 	})
@@ -160,11 +160,4 @@ func formatModelsToStrings(m map[domain.RequestFormat][]string) map[string][]str
 		out[string(k)] = v
 	}
 	return out
-}
-
-func nonNilModelMapping(m domain.ModelMapping) domain.ModelMapping {
-	if m == nil {
-		return domain.ModelMapping{}
-	}
-	return m
 }

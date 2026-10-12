@@ -125,6 +125,19 @@ func fakeAnthropic(t *testing.T, failMode string) *httptest.Server {
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "bad request"}})
 			return
 		}
+		// "abort-stream"：已发出部分 Anthropic 事件后 panic 断开连接——代理 relay
+		// 读到读错误（chunked 未终结 → io.ErrUnexpectedEOF），触发已提交流的中止
+		// 路径（客户端协议 error 帧补写回归用）。
+		if failMode == "abort-stream" && stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(200)
+			fl := w.(http.Flusher)
+			fmt.Fprint(w, `event: message_start`+"\n"+`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"gpt-4o","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}`+"\n\n")
+			fl.Flush()
+			fmt.Fprint(w, `event: content_block_delta`+"\n"+`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`+"\n\n")
+			fl.Flush()
+			panic("abort-stream: connection cut mid-stream")
+		}
 		if stream {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(200)
@@ -190,7 +203,7 @@ func newTestProxyFormatLogs(t *testing.T, upstream string, format domain.Request
 	}
 	accs := map[int64][]*domain.Account{10: {{
 		ID: 1, TemplateID: 1, Template: tpl, UpstreamKey: "sk-upstream",
-		Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4,
+		Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4,
 	}}}
 	cfg := Config{
 		MaxBodySize: 1 << 20, FailoverAttempts: 2,
@@ -198,19 +211,21 @@ func newTestProxyFormatLogs(t *testing.T, upstream string, format domain.Request
 		UpstreamStreamTimeout: 30 * time.Second,
 		UsageCapture:          true,
 	}
-	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil)
+	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil, testHealthSink, nil)
 	require.NoError(t, re.Reload(context.Background())) // 空表写种子
 	sched := scheduler.New(scheduler.Config{
-		DefaultMaxConcurrency: 4, SyncInterval: time.Hour,
-	}, noopLoader{accs: accs}, re, nil)
+		SyncInterval: time.Hour,
+	}, noopLoader{accs: accs}, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
+	publishTestRoutes(t, sched)
+
 	rec := usage.New(usage.UsageConfig{
 		BatchSize: 100, FlushInterval: time.Hour,
 		QuotaFlushInterval: time.Hour,
 	}, logs, nil)
 	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{
 		"ck-1": activeKey(1, 1, 10),
-	}}, noopUserLoader{}, nil, true)
+	}}, noopUserLoader{}, nil, nil, true)
 	require.NoError(t, auth.Reload(context.Background())) // 构造不再自载——测试显式首刷（快照注册表单一入口）
 	hc := &http.Client{Transport: http.DefaultTransport}
 	clients := aiclient.NewFactory(hc, aiclient.Config{
@@ -220,7 +235,7 @@ func newTestProxyFormatLogs(t *testing.T, upstream string, format domain.Request
 	// errlog worker（分表设计）：错误明细与 usage_logs 共用捕获 store（错误路径
 	// 断言经 p.errlog.Close 显式排空）；成功路径不投递。
 	errlogW := usage.NewErrLogWorker(usage.ErrLogConfig{QueueSize: 4096, FlushInterval: time.Hour}, errLogStoreFrom(logs), nil)
-	return New(cfg, sched, credential.New(), rec, clients, auth, nil, nil, errlogW)
+	return New(cfg, sched, credential.New(), rec, clients, auth, nil, nil, errlogW, Deps{})
 }
 
 func TestProxyResponsesNonStreaming(t *testing.T) {
@@ -279,7 +294,7 @@ func TestProxyResponsesStreaming(t *testing.T) {
 	require.Equal(t, "", lg.MappedModel, "无映射 → MappedModel 空")
 }
 
-// TestProxyResponsesStreamingDataOnly P3：上游 resp 流缺 event: 名（只发
+// TestProxyResponsesStreamingDataOnly：上游 resp 流缺 event: 名（只发
 // data: 行，同仓库 fakeupstream /v1/responses）→ 直接 resp 路径不得丢帧、
 // 用量提取不得静默缺失——字节原样透传 + Observer 按 data.type 推断
 // response.completed 提取 usage。
@@ -306,7 +321,7 @@ func TestProxyResponsesStreamingDataOnly(t *testing.T) {
 
 	require.Equal(t, 200, rec.Code, "body=%s", rec.Body.String())
 	body := rec.Body.String()
-	require.NotEmpty(t, body, "缺名帧不得静默全丢（P3）")
+	require.NotEmpty(t, body, "缺名帧不得静默全丢")
 	require.Contains(t, body, `"type":"response.output_text.delta"`, "字节原样透传")
 	require.Contains(t, body, `"type":"response.completed"`)
 	require.Contains(t, body, "data: [DONE]")
@@ -470,6 +485,7 @@ func TestProxyResponsesPassthrough4xx(t *testing.T) {
 
 // 回归（评审 Minor）：responses 流式 4xx 透传（上游非 200 在 relay 前检出）。
 func TestProxyResponsesStreamingPassthrough4xx(t *testing.T) {
+	testHealthSink.reset()
 	up := fakeResponses(t, "400-stream")
 	defer up.Close()
 	p := newTestProxyFormat(t, up.URL, domain.FormatOpenAIResponses)
@@ -487,7 +503,7 @@ func TestProxyResponsesStreamingPassthrough4xx(t *testing.T) {
 	ri, ok := p.sched.Runtime(1)
 	require.True(t, ok)
 	require.Equal(t, domain.StatusActive, ri.Status)
-	require.Nil(t, ri.CooldownUntil)
+	require.Zero(t, testHealthSink.throttleCount(), "4xx 透传不投递惩罚")
 	require.Zero(t, ri.Concurrency, "4xx 透传后并发槽必须释放")
 	require.Zero(t, p.rec.Pending(), "4xx 透传不产生明细 pending（err_logs 承载）")
 }
@@ -514,6 +530,7 @@ func TestProxyAnthropicPassthrough4xx(t *testing.T) {
 
 // 回归（评审 Minor）：anthropic 流式 4xx 透传（上游非 200 在 relay 前检出）。
 func TestProxyAnthropicStreamingPassthrough4xx(t *testing.T) {
+	testHealthSink.reset()
 	up := fakeAnthropic(t, "400-stream")
 	defer up.Close()
 	p := newTestProxyFormat(t, up.URL, domain.FormatAnthropic)
@@ -531,7 +548,7 @@ func TestProxyAnthropicStreamingPassthrough4xx(t *testing.T) {
 	ri, ok := p.sched.Runtime(1)
 	require.True(t, ok)
 	require.Equal(t, domain.StatusActive, ri.Status)
-	require.Nil(t, ri.CooldownUntil)
+	require.Zero(t, testHealthSink.throttleCount(), "4xx 透传不投递惩罚")
 	require.Zero(t, ri.Concurrency, "4xx 透传后并发槽必须释放")
 	require.Zero(t, p.rec.Pending(), "4xx 透传不产生明细 pending（err_logs 承载）")
 }
@@ -592,7 +609,7 @@ func TestProxyAnthropicStreaming(t *testing.T) {
 	require.Equal(t, "", lg.MappedModel, "无映射 → MappedModel 空")
 }
 
-// 兼容性钉（Task 3）：anthropic 流式转发必须保留上游原始字节——event: 行与
+// 兼容性钉：anthropic 流式转发必须保留上游原始字节——event: 行与
 // 用量字段（input_tokens/output_tokens）原样透传。
 func TestProxyAnthropicStreamingPreservesEventLines(t *testing.T) {
 	up := fakeAnthropic(t, "")

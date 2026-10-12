@@ -3,7 +3,7 @@
 // deployment exemption); see LICENSE and LICENSE.commercial. Copyright (c) 2026 is7Qin.
 
 // 展示格式化工具（页面共享，放 components/ 以便与提交范围一致）。
-// 后端 err_rate 为比率（0~1），按 brief 以百分比展示。
+// 后端 err_rate 为比率（0~1），以百分比展示。
 export function formatPercent(v?: number): string {
   return v == null ? '—' : `${(v * 100).toFixed(1)}%`
 }
@@ -29,7 +29,7 @@ export function browserTimeZone(): string | undefined {
   }
 }
 
-// 冷却剩余时长（A-4 增量，2026-08-19）：untilISO → 人类可读剩余。向上取整秒、
+// 冷却剩余时长（增量，2026-08-19）：untilISO → 人类可读剩余。向上取整秒、
 // 最小显示 1s（避免 0s 闪烁）；分段：≥24h → "Xd Xh"（10086h → "420d 6h"）、
 // ≥1h → "Xh Ym"、≥1m → "Xm Ys"、<1m → "Xs"；整除时零段省略（恰好 24h →
 // "1d"）。空值/非法/已过期 → null（调用方不渲染）。不做实时倒计时——列表

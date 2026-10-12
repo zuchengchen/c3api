@@ -5,41 +5,20 @@
 package service
 
 import (
+	"cmp"
 	"context"
-	"errors"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/is7qin/c3api/internal/billing"
 	"github.com/is7qin/c3api/internal/domain"
-	"github.com/is7qin/c3api/internal/pricing"
+	"github.com/is7qin/c3api/internal/notify"
 	"github.com/is7qin/c3api/internal/repository"
+	"github.com/is7qin/c3api/internal/scheduler"
 	"github.com/is7qin/c3api/pkg/logx"
 )
-
-var ErrPriceFetch = errors.New("service: price fetch failed")
-
-type PricingSyncStats struct {
-	Rows     int
-	Skipped  int
-	Updated  int
-	Variants int
-}
-
-type PricingPreview struct {
-	ToAdd           int                   `json:"to_add"`
-	ToUpdate        int                   `json:"to_update"`
-	Skipped         int                   `json:"skipped"`
-	Entries         []PricingPreviewEntry `json:"entries"`
-	VariantsChanged int                   `json:"variants_changed"`
-}
-
-type PricingPreviewEntry struct {
-	Model  string `json:"model"`
-	Mode   string `json:"mode"`
-	Action string `json:"action"` // add/update
-}
 
 type priceSnapshot struct {
 	entries  map[string]*domain.PriceEntry
@@ -48,7 +27,35 @@ type priceSnapshot struct {
 
 const pricingReloadPage = 1000
 
-func (s *Service) ReloadPricing() { s.reloadPricing(context.Background()) }
+// ReloadPricingAndNotifyCompiler 快照重载 + 编译通知（定价写面统一出口）：
+// 重载前后解析价格不变 → 静默（同值 PUT 不驱逐重编译）；变化 → 非阻塞通知。
+// 管理面冷路径，O(模型数) 纯内存比较。
+func (s *Service) ReloadPricingAndNotifyCompiler() {
+	s.reloadPricingAndNotifyCompiler(context.Background())
+}
+
+func (s *Service) reloadPricingAndNotifyCompiler(ctx context.Context) {
+	// 未装配编译通知面 = 纯重载（测试/降级路径），连 before 快照都省了。
+	// 定价写面统一出口：全部 6 处写面（5 手工写面 + pricing sync worker 的
+	// Reload 回调）汇聚于此；跨实例传播不依赖编译通知的变化检测，无条件发布。
+	if s.compileNotify == nil {
+		s.reloadPricing(ctx)
+		s.publish(ctx, notify.Change{Pricing: true})
+		return
+	}
+	at := time.Now()
+	before := s.ResolvedPricesByModel(at)
+	s.reloadPricing(ctx)
+	after := s.ResolvedPricesByModel(at)
+	// 相等性唯一主人是编译道（scheduler.EqualResolvedPrices）：service 不再
+	// 手写对偶比较，字段增减自动跟随。
+	if !maps.EqualFunc(before, after, scheduler.EqualResolvedPrices) {
+		s.compileNotify()
+	}
+	// 跨实例传播不依赖上面的变化检测：同值写本地静默编译，但对端实例仍需
+	// 重载（快照内容一致则重载无害）。
+	s.publish(ctx, notify.Change{Pricing: true})
+}
 func (s *Service) ReloadPricingCtx(ctx context.Context) error {
 	m, err := s.loadPricingSnapshot(ctx)
 	if err != nil {
@@ -95,7 +102,7 @@ func (s *Service) loadPricingSnapshot(ctx context.Context) (*priceSnapshot, erro
 		vMap[v.Model] = append(vMap[v.Model], v)
 	}
 	for _, lst := range vMap {
-		sort.Slice(lst, func(i, j int) bool { return lst[i].Seq < lst[j].Seq })
+		slices.SortFunc(lst, func(a, b *domain.PriceVariant) int { return cmp.Compare(a.Seq, b.Seq) })
 	}
 	return &priceSnapshot{entries: entriesMap, variants: vMap}, nil
 }
@@ -111,6 +118,29 @@ func (s *Service) ResolvePrices(model string, promptTokens int64, tier string, a
 		at = at.In(s.tzLoc)
 	}
 	return domain.ResolveEntryPrices((*snap).entries[model], (*snap).variants[model], tier, promptTokens, at)
+}
+
+// ResolvedPricesByModel 编译道价格源：整张定价快照 → 模型→生效单价映射
+// （routing compiler pricesFn 的装配面）。基底解析口径：tier 空、
+// promptTokens=0、at 由调用方给定（经 tzLoc 归一，与 ResolvePrices 同纪律）；
+// 解析失败（无 entry）的模型缺席——compiler 侧 costKnown=false 落 Explore，
+// 与缺价语义一致。快照未加载返回 nil（编译道按无价处理，不 panic）。
+// 冷路径（compile lane 后台专用），O(模型数) 纯内存。
+func (s *Service) ResolvedPricesByModel(at time.Time) map[string]domain.ResolvedPrices {
+	snap := s.priceSnapshot.Load()
+	if snap == nil {
+		return nil
+	}
+	if s.tzLoc != nil {
+		at = at.In(s.tzLoc)
+	}
+	out := make(map[string]domain.ResolvedPrices, len((*snap).entries))
+	for model, entry := range (*snap).entries {
+		if rp, ok := domain.ResolveEntryPrices(entry, (*snap).variants[model], "", 0, at); ok {
+			out[model] = rp
+		}
+	}
+	return out
 }
 
 // validation helpers
@@ -156,7 +186,7 @@ func (s *Service) UpsertPriceEntry(ctx context.Context, m *repository.PriceEntry
 	if err != nil {
 		return nil, err
 	}
-	s.reloadPricing(ctx)
+	s.reloadPricingAndNotifyCompiler(ctx)
 	return p, nil
 }
 
@@ -173,7 +203,7 @@ func (s *Service) DeletePriceEntry(ctx context.Context, model string) error {
 	if err != nil {
 		return mapRepoErr(err)
 	}
-	s.reloadPricing(ctx)
+	s.reloadPricingAndNotifyCompiler(ctx)
 	return nil
 }
 
@@ -217,7 +247,7 @@ func (s *Service) ReplacePriceVariants(ctx context.Context, model string, varian
 	if err != nil {
 		return nil, err
 	}
-	s.reloadPricing(ctx)
+	s.reloadPricingAndNotifyCompiler(ctx)
 	return out, nil
 }
 
@@ -239,98 +269,19 @@ func (s *Service) ServiceTierPolicy(tier billing.Tier) billing.TierPolicyMode {
 	}
 }
 
-func (s *Service) SetPriceFetcher(f pricing.Fetcher) { s.priceFetcher = f }
-
-func (s *Service) SyncPricingNow(ctx context.Context) (*PricingSyncStats, error) {
-	if s.priceFetcher == nil {
-		return nil, errors.New("pricing: fetcher not injected")
-	}
-	url := s.settingValue("price_source_url")
-	if url == "" {
-		return nil, fmt.Errorf("%w: price_source_url not set, skip sync", ErrInvalidInput)
-	}
-	res, err := s.priceFetcher.Fetch(ctx, url)
-	if err != nil {
-		if s.log != nil {
-			s.log.Warn("pricing sync failed", logx.Error(err))
-		}
-		return nil, fmt.Errorf("%w: %w", ErrPriceFetch, err)
-	}
-	entries := res.PriceEntries
-	n, err := s.store.UpsertPriceEntriesFromLiteLLM(ctx, entries)
-	if err != nil {
-		s.reloadPricing(ctx)
-		return nil, err
-	}
-	if len(res.Variants) > 0 {
-		filtered := res.Variants
-		if manualModels, merr := s.store.ManualEntryModels(ctx); merr == nil && len(manualModels) > 0 {
-			manualSet := make(map[string]struct{}, len(manualModels))
-			for _, m := range manualModels {
-				manualSet[m] = struct{}{}
-			}
-			tmp := filtered[:0]
-			for _, v := range filtered {
-				if _, isManual := manualSet[v.Model]; !isManual {
-					tmp = append(tmp, v)
-				}
-			}
-			filtered = tmp
-		}
-		if len(filtered) > 0 {
-			if verr := func() error {
-				_, e := s.store.UpsertPriceVariantsFromLiteLLM(ctx, filtered)
-				return e
-			}(); verr != nil {
-				err = verr
-			}
-		}
-	}
-	s.reloadPricing(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return &PricingSyncStats{Rows: len(entries), Skipped: res.Skipped, Updated: n, Variants: len(res.Variants)}, nil
-}
-
-func (s *Service) PreviewPricingSync(ctx context.Context) (*PricingPreview, error) {
-	if s.priceFetcher == nil {
-		return nil, errors.New("pricing: fetcher not injected")
-	}
-	url := s.settingValue("price_source_url")
-	if url == "" {
-		return nil, fmt.Errorf("%w: price_source_url not set, skip sync", ErrInvalidInput)
-	}
-	res, err := s.priceFetcher.Fetch(ctx, url)
-	if err != nil {
-		if s.log != nil {
-			s.log.Warn("pricing sync preview failed", logx.Error(err))
-		}
-		return nil, fmt.Errorf("%w: %w", ErrPriceFetch, err)
-	}
-	entries := res.PriceEntries
-	snap := s.priceSnapshot.Load()
-	preview := &PricingPreview{Skipped: res.Skipped}
-	if snap == nil {
-		preview.ToAdd = len(entries)
-		for _, e := range entries {
-			preview.Entries = append(preview.Entries, PricingPreviewEntry{Model: e.Model, Mode: string(e.Mode), Action: "add"})
-		}
-		preview.VariantsChanged = len(res.Variants)
-		return preview, nil
-	}
-	for _, e := range entries {
-		if _, ok := (*snap).entries[e.Model]; ok {
-			preview.ToUpdate++
-			preview.Entries = append(preview.Entries, PricingPreviewEntry{Model: e.Model, Mode: string(e.Mode), Action: "update"})
-		} else {
-			preview.ToAdd++
-			preview.Entries = append(preview.Entries, PricingPreviewEntry{Model: e.Model, Mode: string(e.Mode), Action: "add"})
-		}
-	}
-	preview.VariantsChanged = len(res.Variants)
-	return preview, nil
-}
-
 func (s *Service) PriceSourceURL() string { return s.settingValue("price_source_url") }
 func (s *Service) PriceSyncCron() string  { return s.settingValue("price_sync_cron") }
+
+// PriceModels 定价快照 membership（pricing.SyncWorker Preview 的 SnapshotReader
+// 实现）：nil = 快照未加载（预览全量 ToAdd）；冷路径，O(模型数) 纯内存拷贝键集。
+func (s *Service) PriceModels() map[string]struct{} {
+	snap := s.priceSnapshot.Load()
+	if snap == nil {
+		return nil
+	}
+	out := make(map[string]struct{}, len((*snap).entries))
+	for m := range (*snap).entries {
+		out[m] = struct{}{}
+	}
+	return out
+}

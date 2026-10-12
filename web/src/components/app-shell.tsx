@@ -4,11 +4,11 @@
 
 import { Link, Outlet, useLocation } from 'react-router-dom'
 import { motion } from 'framer-motion'
-import { LayoutDashboard, Boxes, Users, UserCog, FolderOpen, FileText, BarChart3, ScrollText, Ticket, Coins, Settings, KeyRound, Cpu, Menu } from 'lucide-react'
+import { LayoutDashboard, Boxes, Users, UserCog, FolderOpen, FileText, BarChart3, ScrollText, Ticket, Coins, Settings, KeyRound, Cpu, Menu, Wallet, HandCoins } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { userApi } from '@/lib/api/client'
-import { setLang, type AppLang } from '@/lib/i18n'
+import { setLang, type AppLang, type DynamicKey } from '@/lib/i18n'
 import { Button } from '@/components/ui/button'
 import { ModeToggle } from '@/components/mode-toggle'
 import { cn } from '@/lib/utils'
@@ -19,7 +19,8 @@ import {
   BreadcrumbPage,
   BreadcrumbSeparator,
 } from '@/components/ui/breadcrumb'
-import AppSidebar from '@/components/app-sidebar'
+import AppSidebar, { type NavItem, type NavGroup } from '@/components/app-sidebar'
+import { AccountMenuItems } from '@/components/account-menu-items'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 
@@ -28,7 +29,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem,
 // platform_admin 同时看到管理组（/app）与用户组（/user），普通用户仅用户组。
 
 // 用户中心菜单组（个人中心入口在底部用户卡内——用户裁决 2026-08-15，不放导航）
-const userNav = [
+const userNav: readonly NavItem[] = [
   { to: '/user', key: 'user.nav.overview', icon: LayoutDashboard, end: true },
   { to: '/user/keys', key: 'user.nav.keys', icon: KeyRound, end: false },
   { to: '/user/logs', key: 'user.nav.logs', icon: FileText, end: false },
@@ -40,7 +41,7 @@ const userNav = [
 // 概览独立首位 → 代理配置域（模板/账户/规则——上游资源与转发策略）→ 客户域
 // （用户/分组——下游消费方，与账户不直接相邻）→ 观测域（日志/统计）→ 商业域
 // （兑换码/计费）→ 系统域（设置/运维）。平铺不拆子分组标题。
-const adminNav = [
+const adminNav: readonly NavItem[] = [
   { to: '/app/dashboard', key: 'nav.overview', icon: LayoutDashboard },
   { to: '/app/templates', key: 'nav.templates', icon: Boxes },
   { to: '/app/accounts', key: 'nav.accounts', icon: Users },
@@ -51,8 +52,16 @@ const adminNav = [
   { to: '/app/stats', key: 'nav.stats', icon: BarChart3 },
   { to: '/app/redemption-codes', key: 'nav.redemptions', icon: Ticket },
   { to: '/app/pricing', key: 'nav.pricing', icon: Coins },
+  { to: '/app/supplier', key: 'nav.supplierWorkbench', icon: HandCoins },
   { to: '/app/settings', key: 'nav.settings', icon: Settings },
   { to: '/app/ops', key: 'nav.ops', icon: Cpu },
+]
+
+// 供应商控制台菜单组（spec 2026-10-09 §6.1）：仅 supplier / platform_admin 可见。
+// 账号管理页复用同一 /app/accounts 组件（作用域参数化），此处只提供入口路径。
+const supplierNav: readonly NavItem[] = [
+  { to: '/user/supplier', key: 'supplier.nav.console', icon: Wallet, end: true },
+  { to: '/user/supplier/accounts', key: 'supplier.nav.accounts', icon: Users, end: false },
 ]
 
 const LANGS: { code: AppLang; label: string }[] = [
@@ -63,7 +72,7 @@ const LANGS: { code: AppLang; label: string }[] = [
 // 路径 → 面包屑两级（分组根 + 当前页）；未知路径返回 null（顶栏不渲染面包屑）。
 // 映射直接复用 adminNav/userNav（同一来源，避免漂移）：
 // /app/* → 管理台 + 对应页名；/user/* → 用户中心 + 对应页名。
-function breadcrumbFor(pathname: string): { root: string; section: string; page: string } | null {
+function breadcrumbFor(pathname: string): { root: string; section: DynamicKey; page: DynamicKey } | null {
   if (pathname.startsWith('/app')) {
     if (pathname === '/app') return { root: '/app', section: 'user.nav.adminSection', page: 'nav.overview' }
     const item = adminNav.find((n) => n.to === pathname)
@@ -71,6 +80,10 @@ function breadcrumbFor(pathname: string): { root: string; section: string; page:
   }
   if (pathname.startsWith('/user')) {
     if (pathname === '/user/profile') return { root: '/user', section: 'user.nav.userSection', page: 'user.nav.profile' }
+    // 管理 API key 页面已从 userNav 移除（入口改在账户菜单），面包屑需特判保留视觉。
+    if (pathname === '/user/management-keys') return { root: '/user', section: 'user.nav.userSection', page: 'user.nav.managementKeys' }
+    const supplierItem = supplierNav.find((n) => n.to === pathname)
+    if (supplierItem) return { root: '/user', section: 'user.nav.supplierSection', page: supplierItem.key }
     const item = userNav.find((n) => n.to === pathname)
     return item ? { root: '/user', section: 'user.nav.userSection', page: item.key } : null
   }
@@ -90,9 +103,13 @@ export default function AppShell() {
     staleTime: 60_000,
   })
   const isAdmin = me?.Role === 'platform_admin'
-  const navs = isAdmin
-    ? [{ titleKey: 'user.nav.adminSection', items: adminNav }, { titleKey: 'user.nav.userSection', items: userNav }]
-    : [{ titleKey: 'user.nav.userSection', items: userNav }]
+  const isSupplier = me?.Role === 'supplier'
+  // 菜单组顺序：管理域（仅 admin）→ 供应商域（supplier | admin）→ 用户中心（全员）。
+  const navs: NavGroup[] = [
+    ...(isAdmin ? [{ titleKey: 'user.nav.adminSection' as const, items: adminNav }] : []),
+    ...(isAdmin || isSupplier ? [{ titleKey: 'user.nav.supplierSection' as const, items: supplierNav }] : []),
+    { titleKey: 'user.nav.userSection' as const, items: userNav },
+  ]
   // 顶栏面包屑（两级）：未知路径返回 null 不渲染
   const crumb = breadcrumbFor(location.pathname)
   return (
@@ -144,6 +161,9 @@ export default function AppShell() {
                       ))}
                     </DropdownMenuGroup>
                   ))}
+                  {/* 账户条目（个人中心 / 管理 API key / 登出）——移动端（< md）亦可达。 */}
+                  <DropdownMenuSeparator />
+                  <AccountMenuItems />
                 </DropdownMenuContent>
               </DropdownMenu>
               <span className="hidden max-w-48 truncate text-sm text-muted-foreground xl:block">{me?.Email ?? ''}</span>

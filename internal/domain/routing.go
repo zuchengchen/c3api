@@ -1,0 +1,360 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+package domain
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"net"
+	"net/url"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/is7qin/c3api/internal/credential"
+)
+
+const RoutingIdentityVersion byte = 1
+
+type RouteClassIDVal [32]byte
+type QualityClassIDVal [32]byte
+type CandidateFingerprintVal [32]byte
+
+type OperationTag string
+
+const (
+	OpChatCompletions   OperationTag = "chat_completions"
+	OpResponses         OperationTag = "responses"
+	OpResponsesWS       OperationTag = "responses_ws"
+	OpAnthropicMessages OperationTag = "anthropic_messages"
+	OpImagesGenerations OperationTag = "images_generations"
+	OpImagesEdits       OperationTag = "images_edits"
+	OpSearch            OperationTag = "search"
+)
+
+func (o OperationTag) Valid() bool {
+	switch o {
+	case OpChatCompletions, OpResponses, OpResponsesWS, OpAnthropicMessages, OpImagesGenerations, OpImagesEdits, OpSearch:
+		return true
+	}
+	return false
+}
+
+type CallerKind string
+
+const (
+	CallerChat      CallerKind = "chat"
+	CallerResponses CallerKind = "responses"
+	CallerAnthropic CallerKind = "anthropic"
+	CallerImages    CallerKind = "images"
+	CallerSearch    CallerKind = "search"
+	CallerWS        CallerKind = "responses_ws"
+	CallerConverted CallerKind = "converted"
+)
+
+func (c CallerKind) Valid() bool {
+	switch c {
+	case CallerChat, CallerResponses, CallerAnthropic, CallerImages, CallerSearch, CallerWS, CallerConverted:
+		return true
+	}
+	return false
+}
+
+func encodeUvarint(n uint64) []byte {
+	var buf [10]byte
+	l := binary.PutUvarint(buf[:], n)
+	return buf[:l]
+}
+
+func hashFields(fields ...[]byte) [32]byte {
+	h := sha256.New()
+	h.Write([]byte{RoutingIdentityVersion})
+	for _, f := range fields {
+		h.Write(encodeUvarint(uint64(len(f))))
+		h.Write(f)
+	}
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+func fieldInt64(v int64) []byte {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(v))
+	return b[:]
+}
+
+func fieldUint64(v uint64) []byte {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], v)
+	return b[:]
+}
+
+func fieldString(s string) ([]byte, error) {
+	if !utf8.ValidString(s) {
+		return nil, fmt.Errorf("routing: string not valid UTF-8")
+	}
+	return []byte(s), nil
+}
+
+func fieldBool(v bool) []byte {
+	if v {
+		return []byte{1}
+	}
+	return []byte{0}
+}
+
+func RouteClassIDHex(id RouteClassIDVal) string        { return hex.EncodeToString(id[:]) }
+func QualityClassIDHex(id QualityClassIDVal) string    { return hex.EncodeToString(id[:]) }
+func CandidateFPHex(id CandidateFingerprintVal) string { return hex.EncodeToString(id[:]) }
+
+func HexToID(s string) ([32]byte, error) {
+	var out [32]byte
+	if len(s) != 64 {
+		return out, fmt.Errorf("routing: hex id must be 64 chars")
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return out, err
+	}
+	copy(out[:], b)
+	return out, nil
+}
+
+// CanonicalOrigin 把 base_url 收成源：scheme://host:port。
+//
+// 源只由这三样决定。路径是上游协议前缀（/v1、/zen、/zen/go），查询串、片段、
+// userinfo 都不是源的组成部分——一律剥掉，不因此拒绝。带路径的 base_url 若被
+// 拒绝，账号指纹为空，调度器预留的空指纹门会把该路由的全部候选刷掉，表现为
+// 429 "no available account"。
+//
+// 仍拒绝：空串、无 scheme/host、非 http(s)、下划线主机名、非法端口。
+func CanonicalOrigin(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("routing: empty origin")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "", fmt.Errorf("routing: invalid origin %q", raw)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "https" && scheme != "http" {
+		return "", fmt.Errorf("routing: origin scheme must be http or https %q", raw)
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" || strings.Contains(host, "_") {
+		return "", fmt.Errorf("routing: invalid hostname %q", raw)
+	}
+	if net.ParseIP(host) == nil && len(host) > 253 {
+		return "", fmt.Errorf("routing: hostname too long %q", raw)
+	}
+	port := u.Port()
+	if port == "" {
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	} else if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {
+		return "", fmt.Errorf("routing: invalid port %q", raw)
+	}
+	return scheme + "://" + net.JoinHostPort(host, port), nil
+}
+
+func RouteClassID(groupID int64, clientFormat RequestFormat, requestedModel string, opTag OperationTag) (RouteClassIDVal, error) {
+	if !clientFormat.Valid() {
+		return RouteClassIDVal{}, fmt.Errorf("routing: invalid client_format %q", clientFormat)
+	}
+	if !opTag.Valid() {
+		return RouteClassIDVal{}, fmt.Errorf("routing: invalid operation_tag %q", opTag)
+	}
+	if !utf8.ValidString(requestedModel) {
+		return RouteClassIDVal{}, fmt.Errorf("routing: requested_model not valid UTF-8")
+	}
+	g := fieldInt64(groupID)
+	cf, _ := fieldString(string(clientFormat))
+	rm, _ := fieldString(requestedModel)
+	ot, _ := fieldString(string(opTag))
+	h := hashFields(g, cf, rm, ot)
+	return RouteClassIDVal(h), nil
+}
+
+func QualityClassID(callerKind CallerKind, upstreamFormat RequestFormat, resolvedModel string, opTag OperationTag) (QualityClassIDVal, error) {
+	if !callerKind.Valid() {
+		return QualityClassIDVal{}, fmt.Errorf("routing: invalid caller_kind %q", callerKind)
+	}
+	if !upstreamFormat.Valid() {
+		return QualityClassIDVal{}, fmt.Errorf("routing: invalid upstream_format %q", upstreamFormat)
+	}
+	if !opTag.Valid() {
+		return QualityClassIDVal{}, fmt.Errorf("routing: invalid operation_tag %q", opTag)
+	}
+	if !utf8.ValidString(resolvedModel) {
+		return QualityClassIDVal{}, fmt.Errorf("routing: resolved_model not valid UTF-8")
+	}
+	ck, _ := fieldString(string(callerKind))
+	uf, _ := fieldString(string(upstreamFormat))
+	rm, _ := fieldString(resolvedModel)
+	ot, _ := fieldString(string(opTag))
+	h := hashFields(ck, uf, rm, ot)
+	return QualityClassIDVal(h), nil
+}
+
+func stableCredentialDigest(credType credential.Type, upstreamKey string, patKey string) ([]byte, error) {
+	switch credType {
+	case credential.TypeAPIKey, credential.TypeResponsesSpecial:
+		if upstreamKey == "" {
+			return nil, fmt.Errorf("routing: upstream key empty for %s", credType)
+		}
+		h := sha256.Sum256([]byte(upstreamKey))
+		b := make([]byte, 32)
+		copy(b, h[:])
+		return b, nil
+	case credential.TypeCodexPAT:
+		if patKey == "" {
+			return nil, fmt.Errorf("routing: pat key empty")
+		}
+		h := sha256.Sum256([]byte(patKey))
+		b := make([]byte, 32)
+		copy(b, h[:])
+		return b, nil
+	case credential.TypeCodexOAuth:
+		h := sha256.Sum256([]byte("codex-oauth-stable-v1"))
+		b := make([]byte, 32)
+		copy(b, h[:])
+		return b, nil
+	default:
+		return nil, fmt.Errorf("routing: unsupported credential type %q", credType)
+	}
+}
+
+// CandidateKey 是 CandidateFingerprint 的具名输入。此前该函数吃 10 个位置参数
+// （7 个 string + bool 连排），调用点（含测试）成片 `"","","","",false` 占位——
+// 一旦错位，编译器不会报错，只会静默算出另一个指纹。逐字段具名后调用点自解释、
+// 字段错位由编译器兜住。
+//
+// 字段集与下列 CandidateFingerprint 头注一致；字段声明顺序无关哈希顺序——
+// hashFields 的实参顺序由 CandidateFingerprint 内部固定，保证指纹逐字节不变。
+type CandidateKey struct {
+	AccountID        int64
+	TemplateID       int64
+	CredType         credential.Type
+	EffectiveBaseURL string // 生效 baseURL（账号覆盖优先，否则模板值）
+	UpstreamKey      string // 静态上游鉴权键（api_key 族）；进凭据摘要
+	PATKey           string // codex-pat 身份键；进凭据摘要
+	CodexAccountID   string // codex 账号级稳定项
+	InstallationID   string // codex 账号级稳定项（installation_id）
+	CodexEmail       string // 仅为语义完整；当前 hashFields 未纳入（见 static_key.go）
+	StripImageTools  bool
+}
+
+// CandidateFingerprint 汇总“候选身份”的全部**账号级稳定输入**：账号/模板/凭据类型/
+// 生效源/凭据摘要/strip 旗 + codex 账号级稳定项（installation_id、codex_account_id）。
+// 身份三件套 session/thread/window 已
+// 退役为运行时槽状态（scheduler 槽位池按完成轮数演化），**不得**再进指纹：否则
+// 每次槽轮换都会击穿 continuation 绑定与在途 (指纹,K) 工件。
+func CandidateFingerprint(k CandidateKey) (CandidateFingerprintVal, error) {
+	if !k.CredType.Valid() {
+		return CandidateFingerprintVal{}, fmt.Errorf("routing: invalid credential_type %q", k.CredType)
+	}
+	if k.EffectiveBaseURL == "" {
+		// codex 凭据 base_url 合法为空：数据面 URL 归 SDK 官方默认所有
+		//（accountcred.go 契约），凭据身份由 PAT/OAuth 身份输入承载（均入
+		// digest）——空 base_url 拒绝只适用于静态路由族（api_key 无
+		// base_url = 不可路由）。
+		switch k.CredType {
+		case credential.TypeCodexOAuth, credential.TypeCodexPAT:
+		default:
+			return CandidateFingerprintVal{}, fmt.Errorf("routing: effectiveBaseURL must not be empty")
+		}
+	}
+	var canonicalOrigin string
+	if k.EffectiveBaseURL != "" {
+		var err error
+		canonicalOrigin, err = CanonicalOrigin(k.EffectiveBaseURL)
+		if err != nil {
+			return CandidateFingerprintVal{}, err
+		}
+	}
+	digest, err := stableCredentialDigest(k.CredType, k.UpstreamKey, k.PATKey)
+	if err != nil {
+		return CandidateFingerprintVal{}, err
+	}
+	for _, s := range []string{k.InstallationID, k.CodexAccountID} {
+		if !utf8.ValidString(s) {
+			return CandidateFingerprintVal{}, fmt.Errorf("routing: codex identity field not valid UTF-8")
+		}
+	}
+	if !utf8.ValidString(canonicalOrigin) {
+		return CandidateFingerprintVal{}, fmt.Errorf("routing: canonical origin not valid UTF-8")
+	}
+	acc := fieldInt64(k.AccountID)
+	tpl := fieldInt64(k.TemplateID)
+	ct, _ := fieldString(string(k.CredType))
+	orig, _ := fieldString(canonicalOrigin)
+	strip := fieldBool(k.StripImageTools)
+	inst, _ := fieldString(k.InstallationID)
+	caid, _ := fieldString(k.CodexAccountID)
+	h := hashFields(acc, tpl, ct, orig, digest, strip, inst, caid)
+	return CandidateFingerprintVal(h), nil
+}
+
+func AccountCandidateFingerprint(a *Account) (CandidateFingerprintVal, error) {
+	if a == nil || a.Template == nil {
+		return CandidateFingerprintVal{}, fmt.Errorf("routing: missing account or template")
+	}
+	baseURL := a.Template.BaseURL
+	if a.BaseURL != nil && *a.BaseURL != "" {
+		baseURL = *a.BaseURL
+	}
+	// 只读账号级稳定身份项：installation_id（CodexIdentity 退役为运行时槽状态后
+	// session/thread/window 不再是决策输入）；CodexIdentity 仅保留 InstallationID。
+	var patKey, email, codexAccountID, installationID string
+	if a.Ext != nil {
+		if a.Ext.CodexPATKey != nil {
+			patKey = *a.Ext.CodexPATKey
+		}
+		if a.Ext.CodexEmail != nil {
+			email = *a.Ext.CodexEmail
+		}
+		if a.Ext.CodexAccountID != nil {
+			codexAccountID = *a.Ext.CodexAccountID
+		}
+		if a.Ext.CodexIdentity != nil {
+			installationID = a.Ext.CodexIdentity.InstallationID
+		}
+	}
+	return CandidateFingerprint(CandidateKey{
+		AccountID:        a.ID,
+		TemplateID:       a.TemplateID,
+		CredType:         a.Template.CredentialType,
+		EffectiveBaseURL: baseURL,
+		UpstreamKey:      a.UpstreamKey,
+		PATKey:           patKey,
+		CodexEmail:       email,
+		CodexAccountID:   codexAccountID,
+		StripImageTools:  a.Template.StripImageTools,
+		InstallationID:   installationID,
+	})
+}
+
+var _ = fieldUint64
+
+// CompileStaleness is the §9-A1 probe tuple: the snapshot-source table counts
+// plus per-table freshness maxima. UpdatedAt nanos ride as int64 (UnixNano —
+// exact == comparison; time.Time carries location/monotonic hazards). Owner:
+// repository (sole producer, GroupRepo.CompileStalenessSnapshot); the compile
+// lane maps it 1:1 and never queries for it. Lifecycle: fire-owned.
+type CompileStaleness struct {
+	Accounts               int64
+	MaxLifecycleRevision   int64
+	AccountsUpdatedAtNano  int64
+	Groups                 int64
+	GroupsUpdatedAtNano    int64
+	Templates              int64
+	TemplatesUpdatedAtNano int64
+	Memberships            int64
+	Exts                   int64
+}

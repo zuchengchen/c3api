@@ -30,12 +30,13 @@ func (f *fakeInvalidatorBW) Users()                     { f.users++ }
 func (f *fakeInvalidatorBW) Templates()                 {}
 func (f *fakeInvalidatorBW) Accounts(_ []int64, _ bool) {}
 func (f *fakeInvalidatorBW) Multipliers()               {}
+func (f *fakeInvalidatorBW) Settings()                  {}
 
 func newBWService(t *testing.T) (*Service, *fakeStore, *fakeInvalidatorBW) {
 	t.Helper()
 	fs := newFakeStore()
 	inv := &fakeInvalidatorBW{}
-	svc := New(fs, nil, inv, nil, nil, nil, nil)
+	svc := New(Deps{Store: fs, Scheduler: nil, Invalidate: inv, Publisher: nil, RuleReload: nil, Auth: nil, Log: nil, EmailCodeStore: testEmailCodes})
 	// Ensure settings snapshot loaded with defaults (balance_warning.enabled = false).
 	// New already reloads settings via GetAllSettings which includes default.
 	return svc, fs, inv

@@ -14,9 +14,10 @@ import (
 // --- fake 重载目标（记录各自被调用的重载方式；后沿测试可阻塞） ---
 
 type recSched struct {
-	mu     sync.Mutex
-	full   int
-	groups []int64
+	mu      sync.Mutex
+	full    int
+	groups  []int64
+	batches int // InvalidateGroups 调用次数（批路径合并断言）
 }
 
 func (r *recSched) InvalidateAll() {
@@ -29,10 +30,21 @@ func (r *recSched) InvalidateGroup(gid int64) {
 	r.groups = append(r.groups, gid)
 	r.mu.Unlock()
 }
+func (r *recSched) InvalidateGroups(ids []int64) {
+	r.mu.Lock()
+	r.groups = append(r.groups, ids...)
+	r.batches++
+	r.mu.Unlock()
+}
 func (r *recSched) groupCalls() []int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]int64(nil), r.groups...)
+}
+func (r *recSched) batchCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.batches
 }
 func (r *recSched) fullCalls() int {
 	r.mu.Lock()
@@ -91,7 +103,7 @@ func (r *recBal) multCalls() int {
 	return r.mult
 }
 
-// recRules 记录 ReloadRules 调用（#14 T1 新增分支的 fake 目标）。
+// recRules 记录 ReloadRules 调用（新增分支的 fake 目标）。
 type recRules struct {
 	mu sync.Mutex
 	n  int
@@ -219,7 +231,7 @@ func requireNoErr(t *testing.T, err error) {
 // TestDebounceMerge 同窗口多次变更（含同类型重复）= 1 次合并重载。
 func TestDebounceMerge(t *testing.T) {
 	r := newRig(t, &recAuth{})
-	gen := r.clock.genNow() // 评审 M-1：代数读取必须放在首次 mark 前——执行 goroutine
+	gen := r.clock.genNow() // 代数读取必须放在首次 mark 前——执行 goroutine
 	// 可能已在 mark 后建好定时器（代数已推进），后读会等到永不出现的新定时器。
 	r.d.Users()
 	r.d.Users() // 重复并入
@@ -304,7 +316,7 @@ func TestMatrixPerEntity(t *testing.T) {
 func TestGroupMergeAndSubsume(t *testing.T) {
 	t.Run("多组并集", func(t *testing.T) {
 		r := newRig(t, &recAuth{})
-		gen := r.clock.genNow() // 评审 M-1：代数读取在首次 mark 前（见 TestDebounceMerge）
+		gen := r.clock.genNow() // 代数读取在首次 mark 前（见 TestDebounceMerge）
 		r.d.Accounts([]int64{5}, false)
 		r.d.Accounts([]int64{6}, false) // 窗口内并入
 		r.d.mark(0, nil)
@@ -314,10 +326,13 @@ func TestGroupMergeAndSubsume(t *testing.T) {
 		if got := r.sched.groupCalls(); len(got) != 2 || !contains(got, 5) || !contains(got, 6) {
 			t.Fatalf("组级并集 = %v, want {5,6}", got)
 		}
+		if got := r.sched.batchCalls(); got != 1 {
+			t.Fatalf("组级并集应合并为一次 InvalidateGroups, got %d 次", got)
+		}
 	})
 	t.Run("模板全量包含组级", func(t *testing.T) {
 		r := newRig(t, &recAuth{})
-		gen := r.clock.genNow() // 评审 M-1：代数读取在首次 mark 前
+		gen := r.clock.genNow() // 代数读取在首次 mark 前
 		r.d.Accounts([]int64{5}, false)
 		r.d.Templates() // 同窗口：full ⊇ 组级
 		r.d.mark(0, nil)
@@ -330,7 +345,7 @@ func TestGroupMergeAndSubsume(t *testing.T) {
 	})
 }
 
-// TestTrailingEdge 后沿语义（评审 C-6）：长 reload 期间新脏标记 → 完成后
+// TestTrailingEdge 后沿语义：长 reload 期间新脏标记 → 完成后
 // 立即再执行（无需重新起窗口定时器）。
 func TestTrailingEdge(t *testing.T) {
 	auth := &recAuth{started: make(chan struct{}, 1), block: make(chan struct{})}
@@ -404,7 +419,7 @@ func TestBillingDisabled(t *testing.T) {
 	}
 }
 
-// TestNewBranches #14 T1 新增 keys/rules 分支逐实体断言：
+// TestNewBranches 新增 keys/rules 分支逐实体断言：
 // 各自只走自己的重载目标。
 func TestNewBranches(t *testing.T) {
 	t.Run("keys→auth 全量，不动 balances/rules", func(t *testing.T) {
@@ -413,6 +428,15 @@ func TestNewBranches(t *testing.T) {
 		waitCalls(t, r.auth.calls, 1)
 		if r.bal.relCalls() != 0 || r.rules.calls() != 0 || r.sched.fullCalls() != 0 {
 			t.Fatalf("keys 只应 auth 全量：auth=%d bal=%d rules=%d schedFull=%d",
+				r.auth.calls(), r.bal.relCalls(), r.rules.calls(), r.sched.fullCalls())
+		}
+	})
+	t.Run("management_keys→auth 全量，不动其他", func(t *testing.T) {
+		r := newRig(t, &recAuth{})
+		r.markAndFire(KindManagementKeys, nil)
+		waitCalls(t, r.auth.calls, 1)
+		if r.bal.relCalls() != 0 || r.rules.calls() != 0 || r.sched.fullCalls() != 0 {
+			t.Fatalf("management_keys 只应 auth 全量：auth=%d bal=%d rules=%d schedFull=%d",
 				r.auth.calls(), r.bal.relCalls(), r.rules.calls(), r.sched.fullCalls())
 		}
 	})
@@ -430,7 +454,7 @@ func TestNewBranches(t *testing.T) {
 // （与用户/模板等既有位的并集语义一致）。
 func TestNewBranchesMerge(t *testing.T) {
 	r := newRig(t, &recAuth{})
-	gen := r.clock.genNow() // 评审 M-1：代数读取在首次 mark 前
+	gen := r.clock.genNow() // 代数读取在首次 mark 前
 	r.d.Keys()
 	r.d.Rules()
 	r.d.Keys() // 重复并入
@@ -439,6 +463,25 @@ func TestNewBranchesMerge(t *testing.T) {
 	waitCalls(t, r.auth.calls, 1)
 	if r.auth.calls() != 1 || r.rules.calls() != 1 {
 		t.Fatalf("同窗口合并各 1 次：auth=%d rules=%d", r.auth.calls(), r.rules.calls())
+	}
+}
+
+// TestSettingsBranch KindSettings 分支：auth 全量 1 次，其余目标不动（余额
+// 快照/settings 快照由发布端同步刷新，本分支只承担 scope 声明方重载）。
+func TestSettingsBranch(t *testing.T) {
+	r := newRig(t, &recAuth{})
+	gen := r.clock.genNow()
+	r.d.Settings()
+	r.clock.waitTimer(t, gen)
+	r.clock.fire()
+	waitCalls(t, r.auth.calls, 1)
+	if got := r.auth.calls(); got != 1 {
+		t.Fatalf("settings 只应 auth 全量 1 次，got %d", got)
+	}
+	if r.bal.relCalls() != 0 || r.bal.multCalls() != 0 || r.sched.fullCalls() != 0 ||
+		len(r.sched.groupCalls()) != 0 || r.cl.calls() != 0 || r.rules.calls() != 0 {
+		t.Fatalf("settings 不得碰其他目标：bal=%d mult=%d schedFull=%d groups=%v clients=%d rules=%d",
+			r.bal.relCalls(), r.bal.multCalls(), r.sched.fullCalls(), r.sched.groupCalls(), r.cl.calls(), r.rules.calls())
 	}
 }
 

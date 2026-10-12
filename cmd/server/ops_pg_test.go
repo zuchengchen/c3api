@@ -11,8 +11,8 @@ package main
 //	TEST_DATABASE_URL=postgres://postgres:c3api@localhost:5432/c3api_test_ops \
 //	  go test ./cmd/server/ -run TestOpsWorkersPG -v
 //
-// 独立测试库 c3api_test_ops（本任务专用，避开并行 worktree 竞争）；另用独立
-// schema（ops_test）与同库其它 schema 隔离。未设置 TEST_DATABASE_URL → t.Skip。
+// 每测试克隆一个私有数据库（pgtest.Clone，隔离粒度 = database，取自迁移模板）。
+// 未设置 TEST_DATABASE_URL → t.Skip。
 
 import (
 	"context"
@@ -20,8 +20,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +29,7 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/require"
 
+	jwtauth "github.com/is7qin/c3api/internal/auth"
 	"github.com/is7qin/c3api/internal/billing"
 	"github.com/is7qin/c3api/internal/credential"
 	"github.com/is7qin/c3api/internal/domain"
@@ -42,34 +41,35 @@ import (
 	"github.com/is7qin/c3api/internal/server"
 	"github.com/is7qin/c3api/internal/service"
 	"github.com/is7qin/c3api/internal/snapshot"
+	"github.com/is7qin/c3api/internal/testsupport/pgtest"
 	"github.com/is7qin/c3api/internal/usage"
+
+	// Registers pgtest's repository-dependent hooks.
+	_ "github.com/is7qin/c3api/internal/testsupport/pgtest/pgrepo"
 )
 
 func ptrI64(v int64) *int64 { return &v }
 
-// opsTestSchema 本测试专用 schema（同一数据库内隔离命名空间）。
-const opsTestSchema = "ops_test"
+// opsAdminUsers 静态快照 provider：任意 user 恒 platform_admin/active（ops 用例
+// 只需通过 /api/admin 组鉴权）。
+type opsAdminUsers struct{}
+
+func (opsAdminUsers) UserSnapshot(int64) (domain.UserSnapshot, bool) {
+	return domain.UserSnapshot{Status: domain.UserStatusActive, Role: domain.RolePlatformAdmin}, true
+}
+
+func (opsAdminUsers) AuthenticateManagement(*http.Request) (domain.ManagementKeyMeta, bool) {
+	return domain.ManagementKeyMeta{}, false
+}
 
 func newOpsPGRepos(t *testing.T) (*repository.Repository, *pgxpool.Pool) {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping real-PostgreSQL test")
-	}
-	if strings.Contains(dsn, "?") {
-		dsn += "&search_path=" + opsTestSchema
-	} else {
-		dsn += "?search_path=" + opsTestSchema
-	}
+	dsn := pgtest.Clone(t)
 	ctx := context.Background()
-	pool, err := repository.OpenPG(ctx, dsn, 5)
-	require.NoError(t, err)
-	t.Cleanup(pool.Close)
+	pool := pgtest.OpenPool(t, dsn)
 	db := stdlib.OpenDBFromPool(pool)
 	t.Cleanup(func() { _ = db.Close() })
-	_, err = db.ExecContext(ctx, `DROP SCHEMA IF EXISTS `+opsTestSchema+` CASCADE; CREATE SCHEMA `+opsTestSchema+`;`)
-	require.NoError(t, err)
-	repos, err := repository.NewWithPG(ctx, entsql.OpenDB(dialect.Postgres, db), true, pool)
+	repos, err := repository.NewWithPG(ctx, entsql.OpenDB(dialect.Postgres, db), false, pool)
 	require.NoError(t, err)
 	return repos, pool
 }
@@ -108,7 +108,7 @@ func TestOpsWorkersPG(t *testing.T) {
 	require.NoError(t, err)
 	acc, err := repos.CreateAccount(ctx, &domain.Account{
 		Name: "ops-acc", TemplateID: tpl.ID, UpstreamKey: "sk-upstream",
-		Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4,
+		MaxConcurrency: 4, Enabled: true,
 	})
 	require.NoError(t, err)
 	require.NoError(t, repos.SetAccountGroups(ctx, acc.ID, []int64{g.ID}))
@@ -124,13 +124,13 @@ func TestOpsWorkersPG(t *testing.T) {
 	require.NoError(t, err)
 
 	// --- 构造链（与 main 装配序一致：模块构造零 reload——单一入口） ---
-	ruleEngine := rule.New(rule.Config{}, repos.Rules, nil)
+	ruleEngine := rule.New(rule.Config{}, repos.Rules, nil, nil, nil)
 	sched := scheduler.New(scheduler.Config{
-		DefaultMaxConcurrency: 4, SyncInterval: time.Hour,
-	}, repos.Groups, ruleEngine, nil)
-	auth := proxy.NewAuth(repos.Keys, repos.Users, nil, true)
+		SyncInterval: time.Hour,
+	}, repos.Groups, ruleEngine, nil, nil, nil, nil)
+	auth := proxy.NewAuth(repos.Keys, repos.Users, nil, nil, true)
 	balances := billing.NewBalances(repos, nil)
-	svc := service.New(repos, sched, service.NopInvalidator{}, nil, ruleEngine, auth, nil)
+	svc := service.New(service.Deps{Store: repos, Scheduler: sched, Invalidate: service.NopInvalidator{}, Publisher: nil, RuleReload: ruleEngine, Auth: auth, Log: nil, EmailCodeStore: testEmailCodes})
 	rec := usage.New(usage.UsageConfig{
 		BatchSize: 100, FlushInterval: time.Hour, QuotaFlushInterval: time.Hour,
 	}, repos.Usages, nil)
@@ -140,6 +140,8 @@ func TestOpsWorkersPG(t *testing.T) {
 	statsAgg := usage.NewStatsAgg(usage.StatsAggConfig{Interval: 20 * time.Millisecond, Lag: 50 * time.Millisecond}, repos.Stats, nil)
 	retention := usage.NewRetention(usage.RetentionConfig{
 		LogRetentionDays: 1, ErrLogRetentionDays: 0, StatsRetentionDays: 0, TickerInterval: time.Hour,
+		// 路由观测保留打开：兜底观测面（A17）只在配置了观测保留期时才成立。
+		RoutingObservationRetentionDays: 7,
 	}, repos, nil)
 
 	reg := snapshot.New()
@@ -180,6 +182,12 @@ func TestOpsWorkersPG(t *testing.T) {
 	// 分区保留、2 天前分区删除） ---
 	stale := now.AddDate(0, 0, -2)
 	require.NoError(t, repos.EnsureUsageLogPartitions(ctx, stale, stale))
+	// 路由事实表分区：兜底观测（A17）必须有真实分区可观测。必须先建父表 + 当日
+	// 分区——EnsureRoutingFactPartitions 对「父表缺失」是**静默跳过**
+	// （isMissingObject 分支，见 partition.go），只调它会既不报错也不建分区。
+	// 再补建 day-2..today；它们都在观测保留 cutoff（now-7d）内，巡检不会 DROP。
+	require.NoError(t, repos.Partitions.EnsureRoutingPartitions(ctx, now))
+	require.NoError(t, repos.EnsureRoutingFactPartitions(ctx, stale, now))
 	require.NoError(t, retention.Start(ctx))
 	require.Eventually(t, func() bool {
 		return retention.Stats().(usage.RetentionWorkerStats).LastPatrolUnixMs > 0
@@ -194,8 +202,12 @@ func TestOpsWorkersPG(t *testing.T) {
 		Workers:   opsWorkers,
 		Snapshots: func() []handler.SnapshotState { return snapshotStates(reg.Status()) },
 	})
+	iss := jwtauth.NewIssuer("ops-pg-test-secret")
+	adminJWT, err := iss.Issue(1, "admin@example.com", string(domain.RolePlatformAdmin), 0)
+	require.NoError(t, err)
 	srv := server.NewServer(server.Options{
-		AdminToken:   "tok",
+		JWTIssuer:    iss,
+		Auth:         opsAdminUsers{},
 		AdminHandler: ah.Router(),
 	})
 
@@ -227,7 +239,7 @@ func TestOpsWorkersPG(t *testing.T) {
 
 	// admin → 200 + typed struct 解码断言。
 	req = httptest.NewRequest(http.MethodGet, "/api/admin/ops/workers", nil)
-	req.Header.Set("Authorization", "Bearer tok")
+	req.Header.Set("Authorization", "Bearer "+adminJWT)
 	recw = httptest.NewRecorder()
 	srv.Handler().ServeHTTP(recw, req)
 	require.Equal(t, http.StatusOK, recw.Code)
@@ -243,7 +255,29 @@ func TestOpsWorkersPG(t *testing.T) {
 	require.Equal(t, float64(2), got["errlog"]["inserted"], "errlog 落盘计数与真实一致")
 	require.NotZero(t, got["retention"]["last_patrol_unix_ms"], "retention 巡检时刻已记")
 	require.Equal(t, float64(1), got["retention"]["last_dropped_log_partitions"], "DROP 分区数")
-	require.GreaterOrEqual(t, got["scheduler"]["writeback_cap"].(float64), float64(4096))
+	// A17 保留期兜底：/ops 必须能读到路由事实表的分区数与最老分区时刻，且与库内
+	// 真实值一致。这是「保留 worker 停摆 ⇒ 分区静默无界增长」的唯一观测面。
+	// 分表值（quality/flow）、快照行数、无名分区数、stale 标记、路由 DROP 计数与
+	// 观测保留天数同样逐一 cross-check——聚合只告警，分表才定位。
+	wantStats, err := repos.RoutingFactPartitionStats(ctx)
+	require.NoError(t, err)
+	require.Greater(t, wantStats.Count, 0, "夹具必须真的建出了路由分区（否则断言无意义）")
+	require.False(t, wantStats.Oldest.IsZero(), "夹具的最老分区必须非零")
+	gotRetention := got["retention"]
+	require.Equal(t, float64(wantStats.Count), gotRetention["partition_count"], "/ops 分区数 = 库内真实值")
+	require.Equal(t, float64(wantStats.Oldest.UnixMilli()), gotRetention["oldest_partition_unix_ms"], "/ops 最老分区 = 库内真实值")
+	require.Equal(t, float64(wantStats.QualityCount), gotRetention["quality_partition_count"], "/ops quality 分区数 = 库内真实值")
+	require.Equal(t, float64(wantStats.QualityOldest.UnixMilli()), gotRetention["quality_oldest_partition_unix_ms"], "/ops quality 最老分区 = 库内真实值")
+	require.Equal(t, float64(wantStats.FlowCount), gotRetention["flow_partition_count"], "/ops flow 分区数 = 库内真实值")
+	require.Equal(t, float64(wantStats.FlowOldest.UnixMilli()), gotRetention["flow_oldest_partition_unix_ms"], "/ops flow 最老分区 = 库内真实值")
+	require.Equal(t, float64(wantStats.SnapshotRows), gotRetention["snapshot_state_rows"], "/ops 快照行数 = 库内真实值")
+	require.Equal(t, float64(wantStats.UndatedCount), gotRetention["undated_partition_count"], "/ops 无名分区数 = 库内真实值")
+	require.Equal(t, false, gotRetention["partition_stats_stale"], "成功巡检后 stale 必须为 false")
+	require.Equal(t, float64(7), gotRetention["routing_observation_retention_days"], "/ops 观测保留天数 = 装配值")
+	rstLive := retention.Stats().(usage.RetentionWorkerStats)
+	require.Equal(t, float64(rstLive.LastDroppedRoutingQualityParts), gotRetention["last_dropped_routing_quality_partitions"], "/ops quality DROP 计数 = worker 真实值")
+	require.Equal(t, float64(rstLive.LastDroppedRoutingFlowParts), gotRetention["last_dropped_routing_flow_partitions"], "/ops flow DROP 计数 = worker 真实值")
+	require.Equal(t, float64(1), got["scheduler"]["compile_cap"], "scheduler 编译道信号 cap=1（trailing-edge 合并）")
 	require.NotZero(t, got["rule-engine"]["queue_cap"].(float64))
 	// stats-agg 观测（spec 2026-08-14 §6）：watermark 与 stats_agg_watermark
 	// 表真实值一致（停摆冻结后 GET 的快照值 == 读表值——见上文前置比对）；

@@ -30,7 +30,7 @@ var (
 // 快照读 settings.signup_enabled 开关（UpdateSetting 即时生效）→ email
 // 唯一/格式 → 密码 ≤72 字节 → bcrypt DefaultCost(10)（sub2api 同参数）→
 // 快照读 4 个新用户初始资源默认值 → CreateUser → temp_balance > 0 送临时
-// 额度（插行失败不阻断注册，评审 M-2）。
+// 额度（插行失败不阻断注册）。
 func (s *Service) RegisterUser(ctx context.Context, email, password string) (*domain.User, error) {
 	if s.settingValue("signup_enabled") != "true" {
 		return nil, ErrSignupDisabled
@@ -46,7 +46,7 @@ func (s *Service) RegisterUser(ctx context.Context, email, password string) (*do
 		return nil, err
 	}
 	if existing != nil {
-		return nil, ErrConflict // email 唯一 → 409
+		return nil, ErrEmailExists // email 唯一 → 409
 	}
 	hash, err := auth.HashPassword(password)
 	if err != nil {
@@ -68,22 +68,38 @@ func (s *Service) RegisterUser(ctx context.Context, email, password string) (*do
 	}
 	// 新用户初始资源：仅公开注册路径套默认；管理面 CreateUser 显式传值
 	// （用户拍板，0 就是 0）。
-	created, err := s.store.CreateUser(ctx, &domain.User{
-		Email: email, PasswordHash: hash,
-		Role: role, Status: domain.UserStatusActive,
-		MaxConcurrency: int(s.settingInt("default_user_max_concurrency")),
-		Balance:        s.settingInt("default_user_balance"),
+	// 建用户 + 注册默认余额入表在同一事务内提交（spec §4.1 不变量）：
+	// Balance == 0 → 不写行（0→0 非变动）。
+	var created *domain.User
+	err = s.store.WithTx(ctx, func(tr repository.TxStore) error {
+		u, err := tr.CreateUser(ctx, &domain.User{
+			Email: email, PasswordHash: hash,
+			Role: role, Status: domain.UserStatusActive,
+			MaxConcurrency: int(s.settingInt("default_user_max_concurrency")),
+			Balance:        s.settingInt("default_user_balance"),
+		})
+		if err != nil {
+			return err
+		}
+		created = u
+		if u.Balance > 0 {
+			return writeBalanceLog(ctx, tr, u.ID, u.Balance, u.Balance, domain.BalanceSourceSignupDefault, 0, nil)
+		}
+		return nil
 	})
 	if err != nil {
 		// 并发重复邮箱：双过 pre-check 后一者撞 DB 唯一冲突 → repo 已映射
-		// ErrConflict → 这里映射 409（不映射 → 裸错 500）。
+		// repository.ErrConflict（本事务唯一冲突源即 email）→ ErrEmailExists。
+		if errors.Is(err, repository.ErrConflict) {
+			return nil, ErrEmailExists
+		}
 		return nil, mapRepoErr(err)
 	}
 	if temp := s.settingInt("default_user_temp_balance"); temp > 0 {
 		expiresAt := time.Now().AddDate(0, 0, int(s.settingInt("default_user_temp_balance_ttl_days")))
 		note := "signup bonus"
 		if err := s.store.CreateTempBalance(ctx, created.ID, temp, &expiresAt, &note); err != nil {
-			// 评审 M-2：赠品插行失败不阻断注册（否则注册报错 → 客户端重试
+			// 赠品插行失败不阻断注册（否则注册报错 → 客户端重试
 			// → 409 email 死锁）；仅告警，用户已创建成功。
 			if s.log != nil {
 				s.log.Warn("signup temp balance insert failed", logx.Int64("user_id", created.ID), logx.Error(err))
@@ -179,9 +195,9 @@ func (s *Service) GetUserMe(ctx context.Context, userID int64) (*domain.User, er
 
 // CreateUser 管理面创建用户（platform_admin 专属）：email 唯一/格式、密码
 // ≤72 字节 → bcrypt（sub2api 同参数）→ role/status/max_concurrency/balance
-// 落库 → invalidate（新用户入 Auth 状态快照）。价格倍率按组（T3.5 修正）经
+// 落库 → invalidate（新用户入 Auth 状态快照）。价格倍率按组经
 // group_assignment 设置（SetGroupAssignments），用户本体无倍率字段。
-func (s *Service) CreateUser(ctx context.Context, email, password string, role domain.Role, status domain.UserStatus, maxConcurrency int, balance int64) (*domain.User, error) {
+func (s *Service) CreateUser(ctx context.Context, email, password string, role domain.Role, status domain.UserStatus, maxConcurrency int, balance int64, operatorID int64) (*domain.User, error) {
 	if !validEmail(email) {
 		return nil, ErrInvalidInput
 	}
@@ -196,19 +212,36 @@ func (s *Service) CreateUser(ctx context.Context, email, password string, role d
 		return nil, err
 	}
 	if existing != nil {
-		return nil, ErrConflict // email 唯一 → 409
+		return nil, ErrEmailExists // email 唯一 → 409
 	}
 	hash, err := auth.HashPassword(password)
 	if err != nil {
 		return nil, err
 	}
-	created, err := s.store.CreateUser(ctx, &domain.User{
-		Email: email, PasswordHash: hash,
-		Role: role, Status: status,
-		MaxConcurrency: maxConcurrency, Balance: balance,
+	// 建用户 + 初始余额入表在同一事务内提交（spec §4.2 不变量）：
+	// Balance == 0 → 不写行（0→0 非变动）。
+	var created *domain.User
+	err = s.store.WithTx(ctx, func(tr repository.TxStore) error {
+		u, err := tr.CreateUser(ctx, &domain.User{
+			Email: email, PasswordHash: hash,
+			Role: role, Status: status,
+			MaxConcurrency: maxConcurrency, Balance: balance,
+		})
+		if err != nil {
+			return err
+		}
+		created = u
+		if u.Balance > 0 {
+			return writeBalanceLog(ctx, tr, u.ID, u.Balance, u.Balance, domain.BalanceSourceAdminCreate, operatorID, nil)
+		}
+		return nil
 	})
 	if err != nil {
-		return nil, err
+		// 并发重复邮箱（管理面并发建同一 email）：repo 唯一冲突 → ErrEmailExists。
+		if errors.Is(err, repository.ErrConflict) {
+			return nil, ErrEmailExists
+		}
+		return nil, mapRepoErr(err)
 	}
 	s.upsertUserSnapshot(created)
 	s.inv.Users()
@@ -233,12 +266,12 @@ const maxUserUpdateRetries = 3
 
 // UpdateUser 用户管理面更新（role/status/max_concurrency/balance 按 patch 显式
 // 字段生效——未提供字段不触碰 DB 列，杜绝 GET 快照陈旧值写回覆盖计费扣费）。
-// 校验按 patch 字段生效（评审 P3-B：只改 balance 的 PUT 不被未提供字段的
+// 校验按 patch 字段生效（只改 balance 的 PUT 不被未提供字段的
 // 零值误拒）。balance/max_concurrency 显式设置 → 条件更新（旧值 = GET 快照）；
 // 0 行 → 重读当前值刷新旧值条件重试 ≤3 次 → 超限 ErrConflict（409）。用户
-// 状态/并发/额度变更 → invalidate → Auth.Reload 全量刷新（评审 I-2）。价格
-// 倍率按组（T3.5 修正）经 group_assignment 设置，用户本体无倍率字段。
-func (s *Service) UpdateUser(ctx context.Context, p *repository.UserPatch) (*domain.User, error) {
+// 状态/并发/额度变更 → invalidate → Auth.Reload 全量刷新。价格
+// 倍率按组经 group_assignment 设置，用户本体无倍率字段。
+func (s *Service) UpdateUser(ctx context.Context, p *repository.UserPatch, operatorID int64) (*domain.User, error) {
 	if p.Role != nil && !p.Role.Valid() {
 		return nil, ErrInvalidInput
 	}
@@ -252,7 +285,22 @@ func (s *Service) UpdateUser(ctx context.Context, p *repository.UserPatch) (*dom
 		return nil, ErrInvalidInput
 	}
 	for attempt := 0; ; attempt++ {
-		updated, err := s.store.UpdateUser(ctx, p)
+		// 单次尝试包 WithTx：条件更新 + 实际变动时写 admin_adjust 行同事务
+		// 提交（spec §4.3 不变量）；0 行命中（ErrConflict）一并回滚 → 外层重读重试。
+		var updated *domain.User
+		err := s.store.WithTx(ctx, func(tr repository.TxStore) error {
+			u, err := tr.UpdateUser(ctx, p) // 条件更新（旧值 CAS，现行语义不变）
+			if err != nil {
+				return err // 0 行 → ErrConflict（外层重读重试）
+			}
+			updated = u
+			// 仅 balance 显式提供且实际改变才写行（只改 role/status、或新值==旧值 → 不写）。
+			if p.Balance != nil && p.OldBalance != nil && *p.Balance != *p.OldBalance {
+				delta := *p.Balance - *p.OldBalance
+				return writeBalanceLog(ctx, tr, p.ID, delta, u.Balance, domain.BalanceSourceAdminAdjust, operatorID, nil)
+			}
+			return nil
+		})
 		if err == nil {
 			s.upsertUserSnapshot(updated)
 			s.inv.Users()

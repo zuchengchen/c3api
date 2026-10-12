@@ -20,7 +20,7 @@ import (
 )
 
 // TestGetUsageLogsCacheTokens /api/admin/usage_logs 响应含 cache read/creation 字段
-// （toAPIUsageLog 手写映射接线，评审 I-3）。
+// （toAPIUsageLog 手写映射接线）。
 func TestGetUsageLogsCacheTokens(t *testing.T) {
 	store := newFakeStore()
 	store.logs = []*domain.UsageLog{{
@@ -30,7 +30,7 @@ func TestGetUsageLogsCacheTokens(t *testing.T) {
 		CacheReadTokens: 4, CacheCreationTokens: 2,
 		CreatedAt: time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC),
 	}}
-	svc := service.New(store, fakeSched{}, service.NopInvalidator{}, nil, nil, &fakeKeys{}, nil)
+	svc := service.New(service.Deps{Store: store, Scheduler: fakeSched{}, Invalidate: service.NopInvalidator{}, Publisher: nil, RuleReload: nil, Auth: &fakeKeys{}, Log: nil, EmailCodeStore: store})
 	h := New(svc)
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler { // admin token 中间件

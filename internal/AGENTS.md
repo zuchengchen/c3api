@@ -25,8 +25,8 @@ chi(internal/server/server.go)
 ```
 
 - **domain 是万能依赖汇**：60+ 文件引用，业务层(scheduler/proxy/service)只依赖它取共享类型
-- **Service 注入模式**：不逐仓注入——一个复合 `Store` 接口(repository.Repository 实现)；构造 `New(store, sched, inv, pub, ruleReload, keys, log)`；循环依赖用 Set* 事后回填(SetLocalDispatcher/SetPriceFetcher/SetUsageSnapshotter)；读路径状态=4 个 atomic.Pointer 快照(settings/pricing/imagePrice/functionPrice)
-- **角色模型仅两级** platform_admin|user；空表首个注册者自动 platform_admin；JWT HS256 TTL 24h，快照 status fail-closed
+- **Service 注入模式**：不逐仓注入——一个复合 `Store` 接口(repository.Repository 实现)；构造 `New(store, sched, inv, pub, ruleReload, keys, log)`；**禁止新增 Set* 事后回填**（构造环结构性消除：抽组件按序构造或走既有直连路径；settings 本地生效已回归 invalidate KindSettings，`svc.SetLocalDispatcher` 已删），存量回填（SetUsageSnapshotter 等）在清理队列；读路径状态=4 个 atomic.Pointer 快照(settings/pricing/imagePrice/functionPrice)
+- **角色模型三级** platform_admin|supplier|user（spec 2026-10-09：`supplier` 为消费能力超集，供应商面可达集单一事实源 `domain.SupplierSurfaceRoles()={supplier,platform_admin}`；`supplier` 不得访问 `/api/admin/*`）；空表首个注册者自动 platform_admin；JWT HS256 TTL 24h，快照 status fail-closed
 
 ## 常驻 Worker（注册序=反序排空序，main.go:476-486）
 
@@ -40,13 +40,13 @@ chi(internal/server/server.go)
 | pricing-sync | settings `price_sync_cron`(默认 0 3 * * *) | 启动即拉一次+gronx cron |
 | retention | 每小时 | DROP 过期日分区+预建今明；redemption_uses 有界 DELETE≤5000/轮 TTL 固定 90d |
 | stats-agg | `usage.stats_agg_interval`(5m，0=禁用) | 双区间分离：watermark 只推进到 T=now−lag，绝不推进到重算上界 R1；advisory lock 单写者 |
-| billing(条件) | `billing.flush_interval`(1s)+`balance_refresh_interval`(10s) | 账本游标消费（F2/F2-opt 三车道语句化）：排空式循环+单取批面（零价行内存路由）；Balance/Fefo 双车道 K=4 桶级并行结算语句+零价扫（SET LOCAL sync_commit=off）；batchController 以实测语句时长自适应批规模（[500,64000]，种子 8000，时间预算 8s=0.8×repo settleTimeout，见 batch_controller.go）；结算失败保持 unbilled，失败桶本周期抑制、下周期重放；lag ≥1s 节流（Close 排空绕过） |
+| billing(条件) | `billing.flush_interval`(1s)+`balance_refresh_interval`(10s) | 账本游标消费（三车道语句化）：排空式循环+单取批面（零价行内存路由）；Balance/Fefo 双车道 K=4 桶级并行结算语句+零价扫（SET LOCAL sync_commit=off）；batchController 以实测语句时长自适应批规模（[500,64000]，种子 8000，时间预算 8s=0.8×repo settleTimeout，见 batch_controller.go）；结算失败保持 unbilled，失败桶本周期抑制、下周期重放；lag ≥1s 节流（Close 排空绕过） |
 | notify | 阻塞 LISTEN | **专用 pgx.Conn 非池连接**(池回收会静默丢订阅)；断线退避 1s→30s，重连必 FullRefresh |
 | auth-sync | 60s 兜底 Auth.Reload | cmd/server/auth_sync.go |
 
 排空惯用法（billing 与 usage 两包各自声明，有意重复）：loopDone + baseCtx/baseCancel + flushMu 作在途屏障 + inflightAbandonGrace 500ms。
 
-## Goroutine 监督契约（评审 2026-08-26 F2）
+## Goroutine 监督契约（2026-08-26）
 
 生产代码**禁止裸 `go` 起常驻循环**——统一走 `internal/worker`：可重启循环 `worker.GoLoop`/`Loop`（panic→Error 日志带栈→5s 重启，尊重 ctx 取消）；一次性收尾 goroutine `worker.GoRecover`；既有 defer 形态的单点兜底用 `worker.CatchPanic`。可预期的失败一律 error 化（comma-ok 断言、nil 守卫），监督者只兜真正的异常残渣——panic 是 bug 的症状，别让重启掩盖该修的错误处理。
 

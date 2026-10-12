@@ -8,92 +8,87 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/rule"
 	"github.com/is7qin/c3api/internal/scheduler"
+	"github.com/is7qin/c3api/internal/sdkbridge"
 	"github.com/is7qin/c3api/pkg/logx"
+	"github.com/is7qin/c3api/pkg/sserelay"
 )
 
-// imageStreamGenerator 流式生图能力——sdkbridge.Codex.GenerateImageStream
-// 同签名（cred → Auth 缓存 / 信封包装 / fatal 统一回调全在适配层内，网关侧只
-// 消费本签名）。生产接线：codexImagesCaller stream 分支同签名直赋适配层方法
-// （T3 接线提交）；单测传 fake 替身（替身不落生产代码——调用面独立验证）。
+// imageStreamGenerator 流式生图能力，与 sdkbridge.Codex.GenerateImageStream 同签名。
 type imageStreamGenerator func(ctx context.Context, cred *domain.AccountCredential, p *domain.ImageGenParams, fn func(domain.ImageStreamEvent) error) error
 
-// streamImageGeneration codex 类型流式生图分支（T3——caller_images 流式面）：
-// 适配层 GenerateImageStream 事件流 → SSE 透传 + 流终/abort 计费。调用方
-// （T2/B images 路由）负责：codex 类型判定、body → params 解析、GetImagePrice
-// 预检、cred 派生（AccountExt → AccountCredential）。超时由本分支自行施加
-// （UpstreamStreamTimeout 语义，镜像 responsesCaller——上游停滞超时走上游
-// 错误分支，不得当作客户端断开）。
-//
-// SSE 透传语义（spec §5.2 + T3 spec，wire 形态 P2-1/P2-2 定死）：
-//   - 收到首事件即发 SSE 响应头（CF 524 免疫——响应头一旦发出 524 即免疫；
-//     keepalive 保证 120s 内必有字节流）；响应头对齐既有三件套
-//     （caller_responses.go:60-62）+ WriteHeader(200)；每事件写入后 Flush
-//     （keepalive 后不 Flush = 假免疫）
-//   - keepalive 事件 → SSE 注释行 ": ping"（透传）
-//   - image_generation.completed 事件 → SSE 帧（b64_json + usage——usage 仅
-//     末事件携带；字段映射 = ImageUsage JSON tag 直透）；completed 计数
-//     （call_count，每张图一个）
-//   - 未知事件类型跳过（SDK 合成流不产出，防御）
-//
-// 错误与计费（对齐 recordStreamAbort 既有语义 + abort 双分支镜像
-// caller_responses.go:92-101）：
-//   - 首事件前失败（响应头未发）→ 错误原样透传（HTTP 状态可用；信封/fatal
-//     文案复用 T2 提取机制）
-//   - 响应头已发后失败 → HTTP 状态不可用 → SSE error 帧（event: error +
-//     data {"message": "…"}）+ EOF；计费走 recordStreamAbort（已收集张数
-//     落账，无 completed 则 0 张）+ MarkResult(连接级/5xx 分流)
-//   - fn 回调错误 → 立即终止并透传（客户端断开/网关中止——写入失败即断连）
-//   - 客户端断开（r.Context().Err() != nil）→ 不 MarkResult（镜像既有结构）
-//   - 0 图成功边界（SDK Data 空 → 无任何事件）→ 网关自行收尾：200 + 记 0
-//     张落账
-//
-// 计费口径（与 T2 非流式同口径——ImageCost + GetImagePrice 快照）：流终按已
-// 收集张数落账；usage 取末事件（completed 携带）；image token 分量并入
-// Input/OutputTokens、张数入 CallCount、TotalTokens = image tokens 之和（张数
-// 不入 TotalTokens——评审 P3-6；统一计费模型 spec 2026-08-13）；text token
-// 分量恒 0。
+// errStreamWriteFailed 兜底错误：WriteFailed 已置但无保存的 I/O 错时的失败出口用。
+var errStreamWriteFailed = errors.New("image stream write failed")
+
 func (p *Proxy) streamImageGeneration(ctx context.Context, w http.ResponseWriter, r *http.Request, reqID string, groupID int64, start time.Time, sel *scheduler.Selection, reqModel string, cred *domain.AccountCredential, params *domain.ImageGenParams, gen imageStreamGenerator) (int, []byte, bool, error) {
+	// 首事件前保留 HTTP 错误语义；首事件后只能写 SSE error 帧，计费使用已收集的图片和令牌。
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.UpstreamStreamTimeout)
 	defer cancel()
 
-	var (
-		count       int64
-		usage       *domain.ImageUsage
-		headersSent bool
-	)
-	writeFrame := func(frame []byte) error {
-		if !headersSent {
-			headersSent = true
-			writeSSEHeaders(w)
-			flushWriter(w)
+	opTag := OperationTag(domain.OpImagesGenerations)
+	if params != nil && len(params.Images) > 0 {
+		// edits vs generations identity: request carries images
+		opTag = OperationTag(domain.OpImagesEdits)
+	}
+	if r != nil && r.URL != nil && r.URL.Path != "" {
+		if len(r.URL.Path) >= 6 && r.URL.Path[len(r.URL.Path)-6:] == "/edits" {
+			opTag = OperationTag(domain.OpImagesEdits)
+		} else if len(r.URL.Path) >= 12 && r.URL.Path[len(r.URL.Path)-12:] == "/generations" {
+			opTag = OperationTag(domain.OpImagesGenerations)
 		}
-		if _, err := w.Write(frame); err != nil {
+	}
+	// 统一下行 owner：该路径始终关闭通用定时保活（SDK 60s 驱动）；Interval=0
+	// 不关 images SDK 自带保活。首事件时序保留：CommitAndFlush → caller 记
+	// TTFT → Heartbeat/WriteFrame；无事件成功也提交并 flush。Output 不采 TTFT。
+	out := sserelay.NewOutput(w, 0, sserelay.OutputOptions{Ctx: ctx, Cancel: cancel})
+	defer out.Release()
+	var (
+		count int64
+		usage *domain.ImageUsage
+		ttft  *int64
+	)
+	commitOnce := func() error {
+		if out.Committed() {
+			return nil
+		}
+		if err := out.Commit(); err != nil {
 			return err
 		}
-		flushWriter(w)
+		if ttft == nil {
+			ms := time.Since(start).Milliseconds()
+			ttft = &ms
+		}
 		return nil
 	}
 
 	genErr := gen(ctx, cred, params, func(ev domain.ImageStreamEvent) error {
 		switch ev.Type {
 		case domain.ImageStreamEventKeepalive:
-			return writeFrame([]byte(": ping\n\n"))
+			// SDK 合成 keepalive → 网关统一注释帧（: keepalive\n）。
+			if err := commitOnce(); err != nil {
+				return err // 传播 Commit/FlushError 失败（不得吞掉）
+			}
+			return out.Heartbeat()
 		case domain.ImageStreamEventCompleted:
 			count++
 			if ev.Usage != nil {
 				usage = ev.Usage
 			}
-			return writeFrame(buildCompletedFrame(&ev))
+			if err := commitOnce(); err != nil {
+				return err // 传播 Commit/FlushError 失败（不得吞掉）
+			}
+			if _, err := out.WriteFrame(buildCompletedFrame(&ev)); err != nil {
+				return err
+			}
+			// 逐事件 Flush（与原 writeFrame 语义一致，保首字节/事件级延迟）。
+			return out.DrainFlush()
 		default:
-			// 未知事件类型——跳过 + Warn（A-P2-10：SDK 升级改事件名 → 落账 0 张
-			// 的静默面收敛——不静默吞，告警留痕；适配层已显式映射过滤，此处为
-			// 分层防御）。
 			if p.log != nil {
 				p.log.Warn("image stream: unknown event type skipped",
 					logx.String("request_id", reqID),
@@ -107,83 +102,101 @@ func (p *Proxy) streamImageGeneration(ctx context.Context, w http.ResponseWriter
 	if usage != nil {
 		ii, io = usage.InputImageTokens, usage.OutputImageTokens
 	}
-	// 已收集张数/usage 落账元组：tt = image tokens 之和（张数不入 TotalTokens）。
+	// 张数按 completed 事件计数，tokens 取末帧 usage。
 	u := usageTuple{ii: ii, io: io, tt: ii + io, calls: count}
+	usageObs := AttemptUsage{InputTokens: ii, OutputTokens: io, CallCount: count}
+	timing := AttemptTiming{LatencyMS: time.Since(start).Milliseconds(), TTFTMS: ttft}
+
+	// 无事件成功也提交并 flush；Commit/FlushError 失败（含零事件路径）须进失败
+	// 出口，不得记成功——最终观测前复核 WriteFailed/IOErr。
+	if genErr == nil {
+		if err := commitOnce(); err != nil {
+			genErr = err
+		} else {
+			// 零事件成功路径：ttft 在 commitOnce 内才固化，而 timing 在此前构建
+			//（*int64 指针按值拷贝），须回填否则 TTFT 丢失。
+			timing.TTFTMS = ttft
+			if out.WriteFailed() {
+				genErr = out.IOErr()
+				if genErr == nil {
+					// 纯防御：WriteFailed()==true 蕴含 IOErr()!=nil（failLocked 是唯一
+					// 起点且恒带非 nil 错误），此分支理论上不可达。
+					genErr = errStreamWriteFailed
+				}
+			}
+		}
+	}
 
 	if genErr != nil {
-		if !headersSent {
-			// 首事件前失败：HTTP 状态可用——错误原样透传（信封/fatal 文案复用
-			// T2 提取机制；骨架按 statusOf 分类：4xx 透传 / 5xx·连接级转移 /
-			// 首字节前断连 499）。
-			return statusOf(genErr), upstreamBody(genErr), false, genErr
-		}
-		// 响应头已发后失败：HTTP 状态不可用 → SSE error 帧 + EOF（写失败 = 客户端
-		// 已断，best effort 忽略——abort 双分支按 r.Context() 判定）。
-		_, _ = w.Write(buildErrorFrame(streamErrMessage(genErr)))
-		flushWriter(w)
-		// abort 双分支（镜像 caller_responses.go:92-101 既有结构）：客户端断开 →
-		// 释放槽位 + 已收集张数照常计费、不 MarkResult（无法转移）；上游错误 →
-		// recordStreamAbort + 连接级/5xx 分流。
-		if r.Context().Err() != nil {
-			p.finish(sel.AccountID, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), sel.Format, http.StatusOK, domain.ErrAbort, u, start)))
+		// 统一出口判定（§3.7）：取消/写失败不补写；未提交交 pipeline；已提交写 SSE error。
+		// 出口判定用请求 ctx 识别客户端断开（r.Context 与内部超时 ctx 的取消在
+		// 生产路径同源；genErr 未必携带 context.Canceled）。
+		switch classifyStreamExit(r.Context(), out, genErr, usageObs, ttft) {
+		case streamExitClientCancel:
+			// 客户端断开：已收集张数照常计费落账，不 MarkResult（不可转移）。
+			outcome := mergeDispatchBase(ctx, imagesStreamOutcome(reqID, sel, reqModel, opTag, timing, usageObs, ResultClientCancel, 0, CommitResponseStarted, true, true, false))
+			p.observeDispatchOutcome(ctx, outcome, nil)
+			p.finish(sel, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), sel.Format, http.StatusOK, domain.ErrAbort, u, start)))
+			return 0, nil, true, nil
+		case streamExitUncommitted:
+			// 未提交失败 → pipeline（handled=false，可 failover/写 JSON）；缓冲残余丢弃。
+			if sdkbridge.IsFatal(genErr) {
+				code := streamUpstreamStatus(statusOf(genErr))
+				if code == 0 {
+					code = http.StatusBadGateway
+				}
+				return code, upstreamBody(genErr), false, genErr
+			}
+			return streamUpstreamStatus(statusOf(genErr)), upstreamBody(genErr), false, genErr
+		default: // 写失败 / 已提交
+			if out.Committed() {
+				writeClientStreamError(out, domain.FormatOpenAIImages, genErr)
+			}
+			code := statusOf(genErr)
+			commit := CommitUpstreamResponded
+			business := false
+			if code == 0 {
+				commit = CommitSentAmbiguous
+				business = true
+			}
+			outcome := mergeDispatchBase(ctx, imagesStreamOutcome(reqID, sel, reqModel, opTag, timing, usageObs, ResultFailed, AttemptStatus(code), commit, business, true, false))
+			health := &AttemptHealthEvent{Kind: scheduler.RuleKindOf(code), ErrorMessage: genErr.Error()}
+			p.observeDispatchOutcome(ctx, outcome, health)
+			p.finish(sel, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), sel.Format, http.StatusOK, domain.ErrAbort, u, start)))
 			return 0, nil, true, nil
 		}
-		p.recordStreamAbort(ctx, reqID, groupID, start, sel, reqModel, u, genErr)
-		p.sched.MarkResult(sel.AccountID, scheduler.RuleKindOf(statusOf(genErr)), nil, statusOf(genErr), genErr.Error(), sel.Model)
-		return 0, nil, true, nil
 	}
 
-	// 成功（含 0 图边界——SDK Data 空无任何事件）：首事件前成功 → 网关自行
-	// 收尾 200（空 SSE 流 + Flush）；MarkResult OK + 流终计费落账。
-	if !headersSent {
-		writeSSEHeaders(w)
-		flushWriter(w)
-	}
-	p.sched.MarkResult(sel.AccountID, rule.KindOK, nil, http.StatusOK, "", sel.Model)
-	p.finish(sel.AccountID, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), sel.Format, http.StatusOK, domain.ErrNone, u, start)))
+	outcome := mergeDispatchBase(ctx, imagesStreamOutcome(reqID, sel, reqModel, opTag, timing, usageObs, ResultSuccess, 200, CommitResponseStarted, true, true, false))
+	health := &AttemptHealthEvent{Kind: rule.KindOK}
+	p.observeDispatchOutcome(ctx, outcome, health)
+	p.finish(sel, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), sel.Format, http.StatusOK, domain.ErrNone, u, start)))
 	return http.StatusOK, nil, true, nil
 }
 
-// writeSSEHeaders 发 SSE 响应头三件套（对齐 caller_responses.go:60-62）：
-// Content-Type: text/event-stream + Cache-Control: no-cache +
-// X-Accel-Buffering: no + WriteHeader(200)。
+func imagesStreamOutcome(reqID string, sel *scheduler.Selection, reqModel string, op OperationTag, timing AttemptTiming, usage AttemptUsage, result AttemptResult, status AttemptStatus, commit CommitState, businessSent, terminal, malformed bool) AttemptOutcome {
+	return syntheticOutcome(CallerImagesCodex, reqID, sel, reqModel, op, timing, usage, result, status, commit, businessSent, terminal, malformed)
+}
+
+// writeSSEHeaders 设置 SSE 响应头三件套（text/event-stream）——单一 SSE 头
+// 助手，所有响应头三件套站点与 sserelay.Output.Commit 共用（委托
+// sserelay.SetSSEHeaders）。仅设置头、不提交状态码：提交时机交由首个 Write 或
+// 紧随的显式 WriteHeader 决定，保持「首帧前不提交头」的惰性语义（sserelay
+// 站点首帧前失败仍可失败重分类；需立即提交的调用方自行 WriteHeader(200)）。
 func writeSSEHeaders(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
+	sserelay.SetSSEHeaders(w.Header())
 }
 
-// flushWriter 逐事件 Flush（keepalive 后不 Flush = 假免疫；httptest 记录器
-// 支持 Flush 接口——测试可断言 Flushed 时序）。
-func flushWriter(w http.ResponseWriter) {
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-// buildCompletedFrame completed 事件 SSE 帧（wire 形态 P2-1 定死，逐帧构造不
-// 整体缓冲）：
-//
-//	event: image_generation.completed
-//	data: {"b64_json":"<base64>"[, "usage": {"input_tokens":…,"input_image_tokens":…,"output_tokens":…,"output_image_tokens":…}]
-//	<空行>
-//
-// usage 仅末事件携带（SDK 语义）；字段映射 = ImageUsage JSON tag 直透。
+// buildCompletedFrame 构造 completed 事件的 SSE 帧：
 func buildCompletedFrame(ev *domain.ImageStreamEvent) []byte {
 	var b64len int
 	if ev.B64JSON != nil {
 		b64len = len(*ev.B64JSON)
 	}
-	// 事件名收敛为 domain.ImageStreamEventCompleted（wire 事件名四处生产字面量
-	// 收敛，A-P2-10——编译期常量拼接，零运行时开销）。
 	const evLine = "event: " + string(domain.ImageStreamEventCompleted) + "\ndata: "
 	buf := bytes.NewBuffer(make([]byte, 0, len(evLine)+b64len+96))
 	buf.WriteString(evLine)
 	buf.WriteString(`{"b64_json":`)
-	// base64 字符集 A-Za-z0-9+/= 不含 " 与 \ → 免 json.Marshal 转义扫描，直接
-	// 手写引号零分配；nil（B64JSON 为 *string，keepalive 恒 nil）须显式写字面
-	// null 保字节不变（json.Marshal 对 nil 同样产 null）。
 	if ev.B64JSON != nil {
 		b64 := *ev.B64JSON
 		buf.WriteByte('"')
@@ -201,25 +214,34 @@ func buildCompletedFrame(ev *domain.ImageStreamEvent) []byte {
 	return buf.Bytes()
 }
 
-// buildErrorFrame 生成失败 SSE error 帧（P2-2 wire 形态）：
+// buildErrorFrame 生成客户端协议 SSE error 帧。载荷按客户端协议（§2.3）：
+//   - OpenAI（Chat/Responses/Images）：`event: error` + 顶层 `error` 键
+//     （`{"error":{"message":…,"type":"server_error"}}`）——openai-go `ssestream`
+//     以此判失败（packages/ssestream/ssestream.go:169/181）；
+//   - Anthropic：`event: error` + `{"type":"error","error":{"type":"api_error",
+//     "message":…}}`。
 //
-//	event: error
-//	data: {"message": "…"}
-//	<空行>
-func buildErrorFrame(message string) []byte {
-	buf := bytes.NewBuffer(make([]byte, 0, len("event: error\ndata: ")+len(message)+32))
-	buf.WriteString("event: error\ndata: ")
-	m, _ := json.Marshal(map[string]string{"message": message})
+// 不得只发 `{"message":…}`：SDK 不将其识别为失败，截断会被当作正常结束。
+func buildErrorFrame(format domain.RequestFormat, message string) []byte {
+	if format == domain.FormatAnthropic {
+		buf := bytes.NewBuffer(make([]byte, 0, len("event: error\ndata: ")+len(message)+64))
+		buf.WriteString(`event: error` + "\ndata: ")
+		buf.WriteString(`{"type":"error","error":{"type":"api_error","message":`)
+		m, _ := json.Marshal(message)
+		buf.Write(m)
+		buf.WriteString("}}\n\n")
+		return buf.Bytes()
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, len("event: error\ndata: ")+len(message)+48))
+	buf.WriteString(`event: error` + "\ndata: ")
+	buf.WriteString(`{"error":{"message":`)
+	m, _ := json.Marshal(message)
 	buf.Write(m)
-	buf.WriteString("\n\n")
+	buf.WriteString(`,"type":"server_error"}}` + "\n\n")
 	return buf.Bytes()
 }
 
-// streamErrMessage 错误帧 message 文案（信封/fatal 文案——T2 提取机制复用：
-// 信封错误实现 RawJSON() 协议，取上游原始 body 的 message 字段——与
-// upstreamErrMsg 同款提取；无 body → 固定网关文案 "upstream connection
-// error"（既有 "upstream X" 族内兄弟——连接级内部文本不上用户帧；Warn 留痕
-// forward.go:555 保全文）。
+// streamErrMessage 提取错误帧的 message 文案：
 func streamErrMessage(err error) string {
 	type rawJSONer interface{ RawJSON() string }
 	if rj, ok := err.(rawJSONer); ok {

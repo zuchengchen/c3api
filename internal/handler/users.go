@@ -14,18 +14,20 @@ import (
 
 // 用户管理面（/api/admin/users）：余额字段在 API 边界换算 USD float64（内部存储
 // 毫分——1 USD = 100,000 毫分；usdToMillis/millisToUSD）。价格倍率按组
-// （T3.5 修正）经 /api/admin/groups/{id}/assignments 的 multipliers 设置，用户
+// 经 /api/admin/groups/{id}/assignments 的 multipliers 设置，用户
 // 本体无倍率字段。
 
 // GetUsers 用户列表（platform_admin 专属；/admin 组中间件已鉴权，
 // ServerInterface）。
 func (h *AdminAPI) GetUsers(w http.ResponseWriter, r *http.Request, params GetUsersParams) {
 	q := repository.ListQuery{
-		Limit:  httpface.ClampLimit(int(deref(params.Limit))),
-		Offset: int(deref(params.Offset)),
-		Email:  deref(params.Email),
-		Sort:   deref(params.Sort),
-		Order:  string(deref(params.Order)),
+		Limit:           httpface.ClampLimit(int(httpface.Deref(params.Limit))),
+		Offset:          int(httpface.Deref(params.Offset)),
+		Email:           httpface.Deref(params.Email),
+		Role:            string(httpface.Deref(params.Role)),
+		SupplierSurface: httpface.Deref(params.SupplierSurface),
+		Sort:            httpface.Deref(params.Sort),
+		Order:           string(httpface.Deref(params.Order)),
 	}
 	rows, total, err := h.svc.ListUsers(r.Context(), q)
 	if err != nil {
@@ -43,7 +45,7 @@ func (h *AdminAPI) GetUsers(w http.ResponseWriter, r *http.Request, params GetUs
 // service；balance 输入 USD 换算毫分，ServerInterface）。
 func (h *AdminAPI) PostUsers(w http.ResponseWriter, r *http.Request) {
 	var in UserCreate
-	if err := decode(r, &in); err != nil {
+	if err := httpface.Decode(r, &in); err != nil {
 		httpface.WriteErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
@@ -56,7 +58,7 @@ func (h *AdminAPI) PostUsers(w http.ResponseWriter, r *http.Request) {
 		status = domain.UserStatus(*in.Status)
 	}
 	u, err := h.svc.CreateUser(r.Context(), in.Email, in.Password, role, status,
-		deref(in.MaxConcurrency), usdToMillis(deref(in.Balance)))
+		httpface.Deref(in.MaxConcurrency), usdToMillis(httpface.Deref(in.Balance)), createdBy(r))
 	if err != nil {
 		httpface.WriteServiceErr(w, err)
 		return
@@ -66,13 +68,13 @@ func (h *AdminAPI) PostUsers(w http.ResponseWriter, r *http.Request) {
 
 // PutUsersId 更新用户（role/status/max_concurrency/balance；变更即时生效——
 // Auth 快照刷新，ServerInterface）。
-// patch 形态（v02 核实 P1 修复）：只把请求显式提供的字段传给更新——请求不带
+// patch 形态（v02 核实修复）：只把请求显式提供的字段传给更新——请求不带
 // balance 时不再把 GET 快照陈旧值全量写回（与 flusher 扣费双向覆盖、余额凭空
 // 复活）；balance/max_concurrency 显式设置时带 GET 快照旧值条件（期间有扣费
 // → 0 行 → service 重读重试，new 保持管理员显式意图）。
 func (h *AdminAPI) PutUsersId(w http.ResponseWriter, r *http.Request, id int64) {
 	var in UserUpdate
-	if err := decode(r, &in); err != nil {
+	if err := httpface.Decode(r, &in); err != nil {
 		httpface.WriteErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
@@ -99,7 +101,7 @@ func (h *AdminAPI) PutUsersId(w http.ResponseWriter, r *http.Request, id int64) 
 		patch.Balance = &bal
 		patch.OldBalance = &u.Balance // 旧值条件：GET 快照
 	}
-	updated, err := h.svc.UpdateUser(r.Context(), patch)
+	updated, err := h.svc.UpdateUser(r.Context(), patch, createdBy(r))
 	if err != nil {
 		httpface.WriteServiceErr(w, err)
 		return
@@ -128,7 +130,7 @@ func (h *AdminAPI) GetUsersIdGroups(w http.ResponseWriter, r *http.Request, id i
 // null = 清除为未设置 → 回退组倍率；键必须 ∈ group_ids）。
 func (h *AdminAPI) PutUsersIdGroups(w http.ResponseWriter, r *http.Request, id int64) {
 	var in UserGroupsBody
-	if err := decode(r, &in); err != nil {
+	if err := httpface.Decode(r, &in); err != nil {
 		httpface.WriteErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
@@ -150,4 +152,27 @@ func (h *AdminAPI) PutUsersIdGroups(w http.ResponseWriter, r *http.Request, id i
 		GroupIds:    applied,
 		Multipliers: toAPIMultipliers(postMults),
 	})
+}
+
+// GetUsersIdBalanceLogs 某用户的余额变动记录（platform_admin 专属；分页；
+// limit 经 ClampLimit 上限 200 裁剪，≤0 由 repo 归一 20，ServerInterface）。
+// 先 GetUser 校验用户存在（缺失 → 404，对齐 GetRedemptionCodesIdUses 取码范式）。
+func (h *AdminAPI) GetUsersIdBalanceLogs(w http.ResponseWriter, r *http.Request, id int64, params GetUsersIdBalanceLogsParams) {
+	if _, err := h.svc.GetUser(r.Context(), id); err != nil {
+		httpface.WriteServiceErr(w, err)
+		return
+	}
+	rows, total, err := h.svc.ListUserBalanceLogs(r.Context(), id, repository.ListQuery{
+		Limit:  httpface.ClampLimit(int(httpface.Deref(params.Limit))),
+		Offset: int(httpface.Deref(params.Offset)),
+	})
+	if err != nil {
+		httpface.WriteServiceErr(w, err)
+		return
+	}
+	out := make([]BalanceLog, 0, len(rows))
+	for _, l := range rows {
+		out = append(out, toAPIBalanceLog(l))
+	}
+	httpface.WriteJSON(w, http.StatusOK, BalanceLogListResponse{Total: total, Rows: out})
 }

@@ -4,9 +4,9 @@
 
 package protoconv
 
-// chat→resp 方向（压测主路径，W5 优化）：请求/响应/流式帧转换均为字节级——
+// chat→resp 方向（压测主路径 优化）：请求/响应/流式帧转换均为字节级——
 // 不 Unmarshal 到 map[string]any/结构体中间对象，直接对源 JSON 做字段级
-// 原始字节提取（gjson，SDK FilterCodexPayload 模式：预筛 + 提取 + 拼接），
+// 原始字节提取（gjson，SDK 字节级白名单过滤模式：预筛 + 提取 + 拼接），
 // 无需改写的值原字节透传（转义/格式原样保留，解析结果与 map 重排重编码
 // 等价）；仅 messages→input、tools、tool_choice 等结构差异字段做消息级/
 // 工具级局部处理。输出单缓冲直写（请求/响应按输入长度预分配一次；流式帧
@@ -21,18 +21,20 @@ import (
 
 // chatToRespRequest 客户端 chat 请求体 → resp 请求体。字段映射按 Responses
 // API 规范（语义与 map 版完全一致）：
-//   - messages → input：system → developer 消息项；user/assistant → message
-//     项（assistant 文本 → output_text 部件）；assistant tool_calls → 独立
-//     function_call 项；tool 消息 → function_call_output 项
+//   - messages → input：system / developer → developer 消息项（文本规则相同，
+//     assistant 历史仍写 input_text，EasyInputMessage 不使用 output_text）；
+//     user/assistant → message 项；assistant tool_calls → 独立 function_call
+//     项；tool 消息 → function_call_output 项
 //   - max_tokens / max_completion_tokens → max_output_tokens（两者都给时以
 //     max_completion_tokens 为准）
 //   - tools → tools（{type:"function"} 内嵌扁平化，strict 透传）；
 //     tool_choice → tool_choice（{type:"function",function:{name}} 扁平化）
 //   - 同名字段透传：model/temperature/top_p/stream/parallel_tool_calls/
 //     user/metadata/store（null 值省略，pass 语义）
+//   - response_format → text.format；reasoning_effort → reasoning.effort
 //   - resp 无对应参数 → 按规范丢弃
 //
-// 输出顶层键序与 map marshal 的排序键序一致（评审 I-5：透传值保留源格式
+// 输出顶层键序与 map marshal 的排序键序一致（透传值保留源格式
 // 而非重排重编码——如 parameters 内空白/键序原样，JSON 语义等价非逐字节）。
 func chatToRespRequest(body []byte) ([]byte, error) {
 	if !json.Valid(body) {
@@ -40,8 +42,8 @@ func chatToRespRequest(body []byte) ([]byte, error) {
 	}
 	root := gjson.ParseBytes(body)
 	if !root.IsObject() {
-		// null 体与 map 版对齐（decodeObj 解码 null → nil map → 空输出 {}；
-		// 评审 I-2）；其余非对象顶层拒绝。
+		// null 体与 map 版对齐：decodeObj 解码 null → nil map → 空输出 {}；
+		// 其余非对象顶层拒绝。
 		if root.Type != gjson.Null {
 			return nil, errors.New("invalid JSON: top-level must be an object")
 		}
@@ -49,7 +51,7 @@ func chatToRespRequest(body []byte) ([]byte, error) {
 	// 预筛：顶层单遍 ForEach 提取各字段原始文本（Raw 零拷贝切片；重复键
 	// 后者覆盖——与 map 解码 last-wins 语义一致）。
 	var (
-		msgs, maxCT, maxT, toolChoice, tools                              gjson.Result
+		msgs, maxCT, maxT, toolChoice, tools, respFormat, reasoningEffort gjson.Result
 		model, temperature, topP, stream, parallel, user, metadata, store string
 	)
 	root.ForEach(func(k, v gjson.Result) bool {
@@ -64,6 +66,10 @@ func chatToRespRequest(body []byte) ([]byte, error) {
 			toolChoice = v
 		case gjsonKeyEq(k, "tools"):
 			tools = v
+		case gjsonKeyEq(k, "response_format"):
+			respFormat = v
+		case gjsonKeyEq(k, "reasoning_effort"):
+			reasoningEffort = v
 		case gjsonKeyEq(k, "model"):
 			model = v.Raw
 		case gjsonKeyEq(k, "temperature"):
@@ -109,6 +115,9 @@ func chatToRespRequest(body []byte) ([]byte, error) {
 	if rawNotNull(parallel) {
 		out = appendField(out, &first, "parallel_tool_calls", parallel)
 	}
+	if effort := reasoningEffortRaw(reasoningEffort); effort != "" {
+		out = appendField(out, &first, "reasoning", `{"effort":`+effort+`}`)
+	}
 	if rawNotNull(store) {
 		out = appendField(out, &first, "store", store)
 	}
@@ -121,13 +130,16 @@ func chatToRespRequest(body []byte) ([]byte, error) {
 	if tc := chatToolChoiceRaw(toolChoice); tc != "" {
 		out = appendField(out, &first, "tool_choice", tc)
 	}
+	if tf := textFormatRaw(respFormat); tf != "" {
+		out = appendField(out, &first, "text", tf)
+	}
 	if tools.Exists() && tools.IsArray() {
 		if !first {
 			out = append(out, ',')
 		}
 		first = false
 		out = append(out, `"tools":[`...)
-		out = appendRespTools(out, tools)
+		out = appendToolsMapped(out, tools, toolsRespFromChat)
 		out = append(out, ']')
 	}
 	if rawNotNull(topP) {
@@ -153,8 +165,8 @@ func appendChatInputItems(out []byte, msgs gjson.Result) []byte {
 		role := m.Get("role")
 		content := m.Get("content")
 		switch {
-		case rawStrEq(role.Raw, "system"):
-			// system → developer 消息项（文本非空才产生，contentText 语义）
+		case rawStrEq(role.Raw, "system"), rawStrEq(role.Raw, "developer"):
+			// system / developer → developer 消息项（文本非空才产生，contentTextRaw 语义）
 			if t, ok, nonEmpty := contentTextRaw(content); ok && nonEmpty {
 				if n > 0 {
 					out = append(out, ',')
@@ -197,7 +209,7 @@ func appendChatInputItems(out []byte, msgs gjson.Result) []byte {
 						}
 						n++
 						// 请求方向取 id（与 map 版一致：chat tool_calls 仅 id；
-						// fcIDRaw 的 call_id 优先仅响应方向——评审 I-3）
+						// fcIDRaw 的 call_id 优先仅响应方向）
 						idRaw := strOrEmpty(tc.Get("id"))
 						out = append(out, `{"arguments":`...)
 						out = append(out, strOrEmpty(fn.Get("arguments"))...)
@@ -239,7 +251,7 @@ func appendChatInputItems(out []byte, msgs gjson.Result) []byte {
 
 // contentTextRaw 返回 content 的文本 JSON 字符串字面量：字符串 → 原字节透传
 // （零拷贝）；text 块数组 → 各块 text 剥离首尾引号后以 \n 拼接再整体包裹
-// （joinStrings("\n") 语义，转义逐字符保持、concat 即等价转义——评审 M-3 修复：
+// （joinStrings("\n") 语义，转义逐字符保持、concat 即等价转义——修复：
 // raw 自带引号直接拼接会产出 ""a"" 非法 JSON；重建仅发生在多部件场景）。
 // 返回 (字面量, 是否有文本, 文本是否非空)。字符串形态零分配。
 func contentTextRaw(content gjson.Result) (string, bool, bool) {
@@ -256,7 +268,7 @@ func contentTextRaw(content gjson.Result) (string, bool, bool) {
 			}
 			if rawStrEq(p.Get("type").Raw, "text") {
 				if t := p.Get("text"); t.Type == gjson.String {
-					// 分隔符按部件计数而非 joined 长度（评审 I-2：空字符串
+					// 分隔符按部件计数而非 joined 长度（空字符串
 					// 首部件剥引号后 0 字节，按长度判空会丢前导 \n）
 					if hasText {
 						joined = append(joined, '\\', 'n')
@@ -283,9 +295,10 @@ func contentTextRaw(content gjson.Result) (string, bool, bool) {
 }
 
 // appendContentParts content → resp 内容部件数组（直接写入 out）：字符串 →
-// 单 input_text（原字节）；text 部件 → input_text；image_url 部件 →
-// input_image（url 原字节，string 或 {url} 两种形态）；其余部件按规范丢弃。
-// 返回 (out, 部件数)。
+// 单 input_text（原字节，含 assistant 历史——EasyInputMessage 的 content 就是
+// input_text，不是 output_text）；text 部件 → input_text；image_url 部件 →
+// input_image（url 原字节，string 或 {url}；detail 为 auto|low|high 时原样写入）。
+// 其余部件按规范丢弃。返回 (out, 部件数)。
 func appendContentParts(out []byte, content gjson.Result) ([]byte, int) {
 	if content.Type == gjson.String {
 		out = append(out, `{"text":`...)
@@ -318,7 +331,13 @@ func appendContentParts(out []byte, content gjson.Result) ([]byte, int) {
 					out = append(out, ',')
 				}
 				n++
-				out = append(out, `{"image_url":`...)
+				out = append(out, '{')
+				if d := imageDetailRaw(p); d != "" {
+					out = append(out, `"detail":`...)
+					out = append(out, d...)
+					out = append(out, ',')
+				}
+				out = append(out, `"image_url":`...)
 				out = append(out, u...)
 				out = append(out, `,"type":"input_image"}`...)
 			}
@@ -343,61 +362,74 @@ func imageURLRaw(p gjson.Result) (string, bool) {
 	return "", false
 }
 
-// appendRespTools resp tools 数组（转换后扁平化 function 工具）：非 function
-// 工具按规范丢弃；输出 {type:"function", name?, description?, parameters?,
-// strict?}（原字节透传）。
-func appendRespTools(out []byte, tools gjson.Result) []byte {
-	n := 0
-	tools.ForEach(func(_, tv gjson.Result) bool {
-		if !tv.IsObject() {
-			return true
+// imageDetailRaw image_url.detail 为 auto|low|high 时返回 JSON 字符串字面量。
+// 缺省或其它取值不写（上游默认 auto）。
+func imageDetailRaw(p gjson.Result) string {
+	img := p.Get("image_url")
+	if !img.IsObject() {
+		return ""
+	}
+	d := img.Get("detail")
+	if d.Type != gjson.String {
+		return ""
+	}
+	switch d.Str {
+	case "auto", "low", "high":
+		return d.Raw
+	}
+	return ""
+}
+
+// reasoningEffortRaw reasoning_effort 原样放入 reasoning.effort。枚举外丢弃。
+func reasoningEffortRaw(v gjson.Result) string {
+	if v.Type != gjson.String {
+		return ""
+	}
+	switch v.Str {
+	case "none", "minimal", "low", "medium", "high", "xhigh", "max":
+		return v.Raw
+	}
+	return ""
+}
+
+// textFormatRaw response_format → {"format":...}（text 字段的值）。
+// json_schema 缺 name 或 schema 则整段丢弃。
+func textFormatRaw(v gjson.Result) string {
+	if !v.IsObject() {
+		return ""
+	}
+	switch v.Get("type").Str {
+	case "text":
+		return `{"format":{"type":"text"}}`
+	case "json_object":
+		return `{"format":{"type":"json_object"}}`
+	case "json_schema":
+		js := v.Get("json_schema")
+		if !js.IsObject() {
+			return ""
 		}
-		fn := tv.Get("function")
-		if !fn.IsObject() {
-			return true
+		name := js.Get("name")
+		schema := js.Get("schema")
+		if name.Type != gjson.String || len(name.Raw) <= 2 || !schema.Exists() || schema.Type == gjson.Null {
+			return ""
 		}
-		if n > 0 {
-			out = append(out, ',')
+		buf := make([]byte, 0, len(js.Raw)+32)
+		buf = append(buf, `{"format":{"name":`...)
+		buf = append(buf, name.Raw...)
+		buf = append(buf, `,"schema":`...)
+		buf = append(buf, schema.Raw...)
+		if d := js.Get("description"); d.Type == gjson.String {
+			buf = append(buf, `,"description":`...)
+			buf = append(buf, d.Raw...)
 		}
-		n++
-		w := 0
-		out = append(out, '{')
-		if d := fn.Get("description"); d.Type == gjson.String {
-			out = append(out, `"description":`...)
-			out = append(out, d.Raw...)
-			w++
+		if s := js.Get("strict"); s.Type == gjson.True || s.Type == gjson.False {
+			buf = append(buf, `,"strict":`...)
+			buf = append(buf, s.Raw...)
 		}
-		if nm := fn.Get("name"); nm.Type == gjson.String {
-			if w > 0 {
-				out = append(out, ',')
-			}
-			out = append(out, `"name":`...)
-			out = append(out, nm.Raw...)
-			w++
-		}
-		if p := fn.Get("parameters"); p.Exists() && p.Type != gjson.Null {
-			if w > 0 {
-				out = append(out, ',')
-			}
-			out = append(out, `"parameters":`...)
-			out = append(out, p.Raw...)
-			w++
-		}
-		if s := fn.Get("strict"); s.Type == gjson.True || s.Type == gjson.False {
-			if w > 0 {
-				out = append(out, ',')
-			}
-			out = append(out, `"strict":`...)
-			out = append(out, s.Raw...)
-			w++
-		}
-		if w > 0 {
-			out = append(out, ',')
-		}
-		out = append(out, `"type":"function"}`...)
-		return true
-	})
-	return out
+		buf = append(buf, `,"type":"json_schema"}}`...)
+		return string(buf)
+	}
+	return ""
 }
 
 // chatToolChoiceRaw tool_choice 转换（字节级）：字符串 → 原样透传；
@@ -423,7 +455,7 @@ func chatToolChoiceRaw(tc gjson.Result) string {
 
 // respToChatResponse resp 响应对象 → chat completion 对象（非流式，字节级）：
 // output message 项文本拼接 content、function_call 项 → tool_calls（call_id
-// 优先，M-1）；status/输出 → finish_reason；usage 同构映射。输出键序与 map
+// 优先）；status/输出 → finish_reason；usage 同构映射。输出键序与 map
 // marshal 排序一致。
 func respToChatResponse(body []byte) ([]byte, error) {
 	if !json.Valid(body) {
@@ -431,7 +463,7 @@ func respToChatResponse(body []byte) ([]byte, error) {
 	}
 	r := gjson.ParseBytes(body)
 	if !r.IsObject() {
-		// null 体与 map 版对齐（评审 I-2，同 chatToRespRequest）
+		// null 体与 map 版对齐（同 chatToRespRequest）
 		if r.Type != gjson.Null {
 			return nil, errors.New("invalid JSON: top-level must be an object")
 		}
@@ -439,11 +471,11 @@ func respToChatResponse(body []byte) ([]byte, error) {
 	id := r.Get("id")
 	model := r.Get("model")
 	created := gjsonNumInt(r.Get("created_at"))
-	// finish_reason：incomplete → "length"；含 function_call → "tool_calls"；
-	// 其余 "stop"。
+	// finish_reason：incomplete 只看 incomplete_details.reason（不再看
+	// function_call）；否则含 function_call → "tool_calls"；其余 "stop"。
 	finish := `"stop"`
 	if rawStrEq(r.Get("status").Raw, "incomplete") {
-		finish = `"length"`
+		finish = `"` + chatFinishFromIncomplete(r.Get("incomplete_details.reason").Str) + `"`
 	} else if hasRespFunctionCall(r.Get("output")) {
 		finish = `"tool_calls"`
 	}
@@ -468,16 +500,16 @@ func respToChatResponse(body []byte) ([]byte, error) {
 	out = append(out, `,"object":"chat.completion"`...)
 	if u := r.Get("usage"); u.IsObject() {
 		out = append(out, `,"usage":`...)
-		out = appendRespUsage(out, u)
+		out = appendChatUsage(out, u)
 	}
 	out = append(out, '}')
 	return out, nil
 }
 
 // appendChatMessageBody resp output → chat assistant message 的 content 文本
-// 拼接（message 项 text 部件 join ""，恒为合法 JSON 字符串——评审 M-2 修复：
+// 拼接（message 项 text 部件 join ""，恒为合法 JSON 字符串——修复：
 // 部件 raw 剥离首尾引号拼接，转义逐字符保持，concat 即等价转义）与 tool_calls
-// 数组字节。无文本部件 → ""。返回 (out, tcs)。
+// 数组字节。无文本 → JSON null（纯工具调用）；有文本时仍为字符串。返回 (out, tcs)。
 func appendChatMessageBody(out, tcs []byte, output gjson.Result) ([]byte, []byte) {
 	hasText := false
 	output.ForEach(func(_, item gjson.Result) bool {
@@ -518,7 +550,7 @@ func appendChatMessageBody(out, tcs []byte, output gjson.Result) ([]byte, []byte
 		return true
 	})
 	if !hasText {
-		out = append(out, `""`...)
+		out = append(out, `null`...)
 	} else {
 		out = append(out, '"')
 	}
@@ -541,50 +573,43 @@ func hasRespFunctionCall(output gjson.Result) bool {
 	return found
 }
 
-// appendRespUsage resp usage → chat usage（input/output/total 同构；
-// input_tokens_details.cached_tokens > 0 → prompt_tokens_details.cached_tokens）。
-func appendRespUsage(out []byte, u gjson.Result) []byte {
+// appendChatUsage resp usage → chat usage 字节追加到 buf（input/output/total
+// 同构；input_tokens_details.cached_tokens/cache_write_tokens > 0 →
+// prompt_tokens_details）。调用方自持缓冲与截断语义：非流式直接续写输出
+// 缓冲；流式传 m.dbuf[:0] 写入复用缓冲。
+func appendChatUsage(buf []byte, u gjson.Result) []byte {
 	it := gjsonNumInt(u.Get("input_tokens"))
 	ot := gjsonNumInt(u.Get("output_tokens"))
 	tt := gjsonNumInt(u.Get("total_tokens"))
-	out = append(out, `{"completion_tokens":`...)
-	out = appendInt64(out, ot)
-	out = append(out, `,"prompt_tokens":`...)
-	out = appendInt64(out, it)
+	buf = append(buf, `{"completion_tokens":`...)
+	buf = appendInt64(buf, ot)
+	buf = append(buf, `,"prompt_tokens":`...)
+	buf = appendInt64(buf, it)
 	if d := u.Get("input_tokens_details"); d.IsObject() {
-		if c := gjsonNumInt(d.Get("cached_tokens")); c > 0 {
-			out = append(out, `,"prompt_tokens_details":{"cached_tokens":`...)
-			out = appendInt64(out, c)
-			out = append(out, '}')
+		c := gjsonNumInt(d.Get("cached_tokens"))
+		w := gjsonNumInt(d.Get("cache_write_tokens"))
+		if c > 0 || w > 0 {
+			buf = appendChatPromptDetails(buf, c, w)
 		}
 	}
-	out = append(out, `,"total_tokens":`...)
-	out = appendInt64(out, tt)
-	out = append(out, '}')
-	return out
+	buf = append(buf, `,"total_tokens":`...)
+	buf = appendInt64(buf, tt)
+	buf = append(buf, '}')
+	return buf
 }
 
-// contentText chat 消息 content（string 或 text 部件数组）→ 拼接文本（map 版
-// 助手，chat_mess.go 共用；字节级路径用 contentTextRaw）。
-func contentText(content any) (string, bool) {
-	switch c := content.(type) {
-	case string:
-		return c, true
-	case []any:
-		var parts []string
-		for _, p := range c {
-			if pm, ok := p.(map[string]any); ok && pm["type"] == "text" {
-				if t, ok := str(pm, "text"); ok {
-					parts = append(parts, t)
-				}
-			}
-		}
-		if len(parts) == 0 {
-			return "", false
-		}
-		return joinStrings(parts, "\n"), true
+// appendChatPromptDetails 向 buf 追加 prompt_tokens_details 原始字节：cached_tokens
+// 恒写，cache_write_tokens 仅在 cc>0 时写（零值策略与 chat_mess.go chatPromptDetails
+// 一致——调用方负责 c>0||w>0 门控）。
+func appendChatPromptDetails(buf []byte, cr, cc int64) []byte {
+	buf = append(buf, `,"prompt_tokens_details":{"cached_tokens":`...)
+	buf = appendInt64(buf, cr)
+	if cc > 0 {
+		buf = append(buf, `,"cache_write_tokens":`...)
+		buf = appendInt64(buf, cc)
 	}
-	return "", false
+	buf = append(buf, '}')
+	return buf
 }
 
 // mapRespToChat 流式：resp SSE 事件 → chat 流（字节级：事件字段 gjson 原始
@@ -594,10 +619,30 @@ func contentText(content any) (string, bool) {
 //	response.output_text.delta        → content delta chunk
 //	response.output_item.added(FC)    → tool_calls 前导 chunk（id+name）
 //	response.function_call_arguments.delta → tool_calls arguments delta
-//	response.completed                → 收尾 chunk（finish_reason+usage）+ [DONE]
-//	response.failed                   → data-only {"error":{...}} 帧（chat 流式错误约定）
+//	response.completed                → 收尾 chunk（finish_reason，usage 省略）
+//	                                  + 单独 usage 帧（choices 为空）+ [DONE]
+//	response.failed                   → data-only {"error":{...}} 帧 + [DONE]
+//	                                  （无 error 时只写 [DONE]）
 //	其余（in_progress/output_item.done/content_part.* 等）→ 丢弃
 func (m *StreamMapper) mapRespToChat(name string, data []byte) ([]byte, bool) {
+	switch name {
+	case "response.output_text.delta":
+		if raw, _, ok := literalTop(data, "delta", ""); ok {
+			m.dbuf = append(m.dbuf[:0], `{"content":`...)
+			m.dbuf = append(m.dbuf, raw...)
+			m.dbuf = append(m.dbuf, '}')
+			return m.chatChunkFrame(m.dbuf, nil, nil), false
+		}
+	case "response.function_call_arguments.delta":
+		if raw, index, ok := literalTop(data, "delta", "output_index"); ok {
+			m.dbuf = append(m.dbuf[:0], `{"tool_calls":[{"function":{"arguments":`...)
+			m.dbuf = append(m.dbuf, raw...)
+			m.dbuf = append(m.dbuf, `},"index":`...)
+			m.dbuf = appendInt64(m.dbuf, index)
+			m.dbuf = append(m.dbuf, `}]}`...)
+			return m.chatChunkFrame(m.dbuf, nil, nil), false
+		}
+	}
 	if !json.Valid(data) {
 		return nil, true
 	}
@@ -632,7 +677,7 @@ func (m *StreamMapper) mapRespToChat(name string, data []byte) ([]byte, bool) {
 		if !item.IsObject() || !rawStrEq(item.Get("type").Raw, "function_call") {
 			return nil, true
 		}
-		idRaw := fcIDRaw(item) // call_id 优先（客户端回传匹配键，M-1）
+		idRaw := fcIDRaw(item) // call_id 优先（客户端回传匹配键）
 		index := gjsonNumInt(ev.Get("output_index"))
 		m.dbuf = append(m.dbuf[:0], `{"tool_calls":[{"function":{"arguments":"","name":`...)
 		m.dbuf = append(m.dbuf, strOrEmpty(item.Get("name"))...)
@@ -655,23 +700,27 @@ func (m *StreamMapper) mapRespToChat(name string, data []byte) ([]byte, bool) {
 			return nil, true
 		}
 		m.done = true
-		finish := []byte(`"stop"`)
+		finish := stopFinish
 		var usage []byte
 		if resp := ev.Get("response"); resp.IsObject() {
 			if rawStrEq(resp.Get("status").Raw, "incomplete") {
-				finish = []byte(`"length"`)
+				finish = finishQuoted(chatFinishFromIncomplete(resp.Get("incomplete_details.reason").Str))
 			} else if hasRespFunctionCall(resp.Get("output")) {
-				finish = []byte(`"tool_calls"`)
+				finish = toolFinish
 			}
-			// resp 无 usage（或非对象）→ 收尾 chunk 省略 "usage" 字段而非
-			// 写 "usage":null——与 map 版一致（usage 提取失败 → nil → 省略；
-			// 评审 I-3 接受并注释）
+			// 上游 usage 存在时单独成帧（choices 为空）。finish 帧省略 usage
+			// （不是 null）。中间 delta 不写 usage:null。usage 先写入 ubuf，
+			// chatChunkFrame 会覆盖 dbuf。
 			if u := resp.Get("usage"); u.IsObject() {
-				usage = m.appendUsageToBuf(u)
+				m.dbuf = appendChatUsage(m.dbuf[:0], u)
+				usage = append(m.ubuf[:0], m.dbuf...)
+				m.ubuf = usage
 			}
 		}
-		// 收尾 chunk：finish_reason + 内联 usage（chat 流式 include_usage 语义）
-		m.buf = m.chatChunkFrame([]byte(`{}`), finish, usage)
+		m.buf = m.chatChunkFrame([]byte(`{}`), finish, nil)
+		if usage != nil {
+			m.buf = m.appendUsageOnlyChunk(m.buf, usage)
+		}
 		m.buf = append(m.buf, `data: [DONE]`...)
 		m.buf = append(m.buf, '\n', '\n')
 		return m.buf, false
@@ -685,6 +734,8 @@ func (m *StreamMapper) mapRespToChat(name string, data []byte) ([]byte, bool) {
 				m.buf = append(m.buf[:0], `data: {"error":{"message":`...)
 				m.buf = append(m.buf, strOrEmpty(e.Get("message"))...)
 				m.buf = append(m.buf, '}', '}', '\n', '\n')
+				m.buf = append(m.buf, `data: [DONE]`...)
+				m.buf = append(m.buf, '\n', '\n')
 				return m.buf, false
 			}
 		}
@@ -695,31 +746,47 @@ func (m *StreamMapper) mapRespToChat(name string, data []byte) ([]byte, bool) {
 	return nil, true
 }
 
-// appendUsageToBuf resp usage → chat usage 字节（写入复用缓冲 m.dbuf）。
-func (m *StreamMapper) appendUsageToBuf(u gjson.Result) []byte {
-	it := gjsonNumInt(u.Get("input_tokens"))
-	ot := gjsonNumInt(u.Get("output_tokens"))
-	tt := gjsonNumInt(u.Get("total_tokens"))
-	m.dbuf = append(m.dbuf[:0], `{"completion_tokens":`...)
-	m.dbuf = appendInt64(m.dbuf, ot)
-	m.dbuf = append(m.dbuf, `,"prompt_tokens":`...)
-	m.dbuf = appendInt64(m.dbuf, it)
-	if d := u.Get("input_tokens_details"); d.IsObject() {
-		if c := gjsonNumInt(d.Get("cached_tokens")); c > 0 {
-			m.dbuf = append(m.dbuf, `,"prompt_tokens_details":{"cached_tokens":`...)
-			m.dbuf = appendInt64(m.dbuf, c)
-			m.dbuf = append(m.dbuf, '}')
-		}
+// 结束原因字面量。包级常量，避免每条流的 completed 帧再分配。
+var (
+	stopFinish = []byte(`"stop"`)
+	toolFinish = []byte(`"tool_calls"`)
+	lenFinish  = []byte(`"length"`)
+	filtFinish = []byte(`"content_filter"`)
+)
+
+func finishQuoted(reason string) []byte {
+	switch reason {
+	case "stop":
+		return stopFinish
+	case "tool_calls":
+		return toolFinish
+	case "length":
+		return lenFinish
+	case "content_filter":
+		return filtFinish
+	default:
+		return []byte(`"` + reason + `"`)
 	}
-	m.dbuf = append(m.dbuf, `,"total_tokens":`...)
-	m.dbuf = appendInt64(m.dbuf, tt)
-	m.dbuf = append(m.dbuf, '}')
-	return m.dbuf
+}
+
+// appendUsageOnlyChunk 在已写完的 finish 帧之后追加 choices:[] 的 usage 帧。
+// 不经 chatChunkFrame（那会清空 m.buf）。id/model 与 finish 帧同一状态。
+func (m *StreamMapper) appendUsageOnlyChunk(out, usage []byte) []byte {
+	out = append(out, `data: {"choices":[],"created":`...)
+	out = appendInt64(out, m.created)
+	out = append(out, `,"id":`...)
+	out = appendJSONString(out, m.id)
+	out = append(out, `,"model":`...)
+	out = appendJSONString(out, m.model)
+	out = append(out, `,"object":"chat.completion.chunk","usage":`...)
+	out = append(out, usage...)
+	out = append(out, '}', '\n', '\n')
+	return out
 }
 
 // chatChunkFrame 组装 chat 流式 chunk 帧（字节级，写入复用缓冲 m.buf）：
 // delta/finish/usage 为预组装 JSON 值字节（nil → null）。帧为完整 SSE 形态：
-// `data: ` 前缀 + 载荷 + 空行终止（评审 M-1 修复）。返回 m.buf 当前字节——
+// `data: ` 前缀 + 载荷 + 空行终止（修复）。返回 m.buf 当前字节——
 // 生命周期仅限本次 Map 调用（sserelay 契约：Mapper 返回后立即写出，调用方
 // 可复用缓冲）。
 func (m *StreamMapper) chatChunkFrame(delta, finish, usage []byte) []byte {
@@ -748,7 +815,7 @@ func (m *StreamMapper) chatChunkFrame(delta, finish, usage []byte) []byte {
 }
 
 // chatFrame 组装 chat 流式 chunk 帧（map 版，chat_mess.go 共用——非字节级
-// 方向仍走 map 组装）。
+// 方向仍走 map 组装）。usage 非 nil 时内联；最终 usage 帧走 chatUsageOnlyFrame。
 func (m *StreamMapper) chatFrame(delta map[string]any, finish, usage any) []byte {
 	c := map[string]any{
 		"id":      m.id,
@@ -759,6 +826,19 @@ func (m *StreamMapper) chatFrame(delta map[string]any, finish, usage any) []byte
 	}
 	if usage != nil {
 		c["usage"] = usage
+	}
+	return EncodeFrame("", c)
+}
+
+// chatUsageOnlyFrame include_usage 的单独帧：choices 为空，只含 usage。
+func (m *StreamMapper) chatUsageOnlyFrame(usage any) []byte {
+	c := map[string]any{
+		"id":      m.id,
+		"object":  "chat.completion.chunk",
+		"created": m.created,
+		"model":   m.model,
+		"choices": []any{},
+		"usage":   usage,
 	}
 	return EncodeFrame("", c)
 }

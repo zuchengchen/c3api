@@ -20,14 +20,17 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/is7qin/c3api/internal/billing"
+	"github.com/is7qin/c3api/internal/continuation"
 	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/protoconv"
 	"github.com/is7qin/c3api/internal/scheduler"
 	"github.com/is7qin/c3api/pkg/logx"
 )
 
+var convertRequest = protoconv.ConvertRequest
+
 // forwardRoute 一次转发的路由信息（格式 + 调用器 + 请求体）：默认 = 客户端
-// 格式直连（零转换）；协议转换（W5）命中时替换为模板协议路由（格式/调用器/
+// 格式直连（零转换）；协议转换命中时替换为模板协议路由（格式/调用器/
 // 已转换请求体）。failover 循环按 route 重选号（模板协议），日志仍按客户端
 // 协议记录（buildLog format 参数不变）。
 type forwardRoute struct {
@@ -43,30 +46,15 @@ type forwardRoute struct {
 // 协议无路由或无可用账号）由调用方负责。
 func convertedRoute(converts []domain.ProtocolConvert, client domain.RequestFormat) (domain.RequestFormat, domain.ProtocolConvert, bool) {
 	for _, pc := range converts {
-		switch pc {
-		case domain.ProtocolConvertChatToResp:
-			if client == domain.FormatOpenAIChat {
-				return domain.FormatOpenAIResponses, pc, true
-			}
-		case domain.ProtocolConvertMessToResp:
-			if client == domain.FormatAnthropic {
-				return domain.FormatOpenAIResponses, pc, true
-			}
-		case domain.ProtocolConvertRespToMess:
-			if client == domain.FormatOpenAIResponses {
-				return domain.FormatAnthropic, pc, true
-			}
-		case domain.ProtocolConvertChatToMess:
-			if client == domain.FormatOpenAIChat {
-				return domain.FormatAnthropic, pc, true
-			}
+		if c := pc.Client(); c != "" && c == client {
+			return pc.Target(), pc, true
 		}
 	}
 	return "", "", false
 }
 
 // newReqID 生成 32 位 hex 请求 ID（仅日志关联键，DB 无格式约束；math/rand/v2
-// 免 crypto/rand syscall——非安全用途，GC 削减 P6）。
+// 免 crypto/rand syscall——非安全用途，GC 削减）。
 func newReqID() string {
 	var b [16]byte
 	binary.LittleEndian.PutUint64(b[0:8], rand.Uint64())
@@ -76,9 +64,9 @@ func newReqID() string {
 
 // UpstreamCaller 一格式一实现：完成单次上游调用（含流式写出、客户端断开判定
 // 与 usage 记录）。记录职责全在 caller（finish/buildLog/recordStreamAbort/
-// MarkResult 直接可用——评审 I-1）；骨架只做 code 分支（429/5xx 转移、4xx
+// MarkResult 直接可用）；骨架只做 code 分支（429/5xx 转移、4xx
 // 透传记录）、handled 短路与耗尽 record。凭据值经 aiclient 格式方法传入
-// （头名 aiclient 内组装，Phase 1 正交延续——评审 M-2）。
+// （头名 aiclient 内组装，正交延续）。
 //
 // 语义：
 //   - handled == true → 请求已处理完毕（成功/客户端断开/流中止已记录；本地拒绝
@@ -136,27 +124,111 @@ func (p *Proxy) handleFormat(format domain.RequestFormat, w http.ResponseWriter,
 	defer p.auth.Release(rm.meta, level)
 	groupID := rm.meta.GroupID
 
+	reqModel, stream, body, ok := p.readAndParseFormatBody(format, w, r, rm, reqID, groupID, start)
+	if !ok {
+		return
+	}
+
+	// 硬续接（仅 Responses）：previous_response_id 把派生钉死在产出该响应的
+	// 账号上。普通请求（无续接键、其余全部格式）零 Redis。解析在计划就绪后
+	// 执行（route class 取计划规范身份，与 create 侧绑定键同源），失败一律
+	// fail-closed（missing/expired→410、Redis 不可用→503），零上游拨号。
+	contPrevID := ""
+	if format == domain.FormatOpenAIResponses {
+		contPrevID = gjson.GetBytes(body, "previous_response_id").String()
+	}
+
+	// 路由信息：格式 + 调用器 + 请求体。默认 = 客户端格式直连（零转换）；
+	// images 端点按请求路径选调用器（generations/edits 上游子路径不同）；
+	// 协议转换（只补差）命中时整体替换为模板协议路由。
+	route := forwardRoute{format: format, caller: p.callers[format], body: body}
+	if format == domain.FormatOpenAIImages {
+		route.caller = p.imagesCallerFor(r)
+	}
+
+	sel, plan, attempt, err := p.selectFormatPlan(format, groupID, reqID, reqModel, rm, route)
+	// converted route uses target identity when fallback
+	if err != nil && (errors.Is(err, scheduler.ErrFormatUnavailable) || errors.Is(err, scheduler.ErrNoAvailable) || errors.Is(err, scheduler.ErrAttemptsExhausted)) {
+		if tgt, conv, ok := convertedRoute(rm.meta.ProtocolConverts, format); ok {
+			// Target identity uses same request identity but target RouteClassID
+			targetIdentity := scheduler.AttemptPlanIdentity{RequestID: reqID, UserID: rm.meta.UserID, ApplyModelMapping: true, AffinityHash: rm.AffinityHash, HasAffinity: rm.HasAffinity}
+			if sel2, plan2, attempt2, err2 := p.selectWithPlan(groupID, tgt, reqModel, targetIdentity); err2 == nil {
+				sel2GuardActive := true
+				defer func() {
+					if sel2GuardActive {
+						if r := recover(); r != nil {
+							sel2.Release()
+							panic(r)
+						}
+					}
+				}()
+				cb, cerr := convertRequest(body, conv)
+				if cerr != nil {
+					sel2.Release()
+					sel2GuardActive = false
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "invalid request body: protocol conversion failed: " + cerr.Error()}})
+					return
+				}
+				sel2GuardActive = false
+				sel, plan, attempt = sel2, plan2, attempt2
+				err = nil
+				route = forwardRoute{format: tgt, caller: p.convCallers[conv], body: cb}
+			} else {
+				// Preserve target error (distinguish ErrNoAvailable vs AttemptsExhausted)
+				err = err2
+			}
+		}
+	}
+	// Plan-only contract: selection succeeded only with a compiled plan and a
+	// canonical reserved attempt; any absent/invalid compiled plan lands here
+	// as a typed error and fails closed.
+	if err != nil {
+		p.handleSelectError(w, err)
+		p.recordRejected(r.Context(), reqID, groupID, 0, reqModel, "", format, statusFor(err), domain.ErrNoAccount, 0, usageTuple{}, start, selectErrorMessage(err))
+		return
+	}
+	// 续接解析：计划规范 route class 下查绑定；missing/expired/Redis 不可用
+	// fail-closed（释放已占并发槽，零上游拨号）。
+	sel, attempt, contBinding, ok := p.resolveFormatContinuation(format, w, r, reqID, groupID, rm.meta.UserID, reqModel, contPrevID, start, sel, &plan, attempt)
+	if !ok {
+		return
+	}
+	defer leaseGuard(sel)
+
+	// failover 循环（共享骨架，见 pipeline.go）：precheck=true（chat/resp/
+	// anthropic/images 走缺价预检）；尾部推进走入口编译计划（选号时已按
+	// route.format 绑定路由，协议转换命中即目标路由）；记录仍按客户端
+	// format（buildLog 参数不变）。差异状态按值传入 attemptState（零分配
+	// ——attempt/sink 为 New 构造单例）。
+	p.failoverLoopWithPlan(w, r, format, reqID, groupID, start, reqModel, route.body, sel, plan, attempt,
+		attemptState{format: format, routeFormat: route.format, caller: route.caller, stream: stream, hardContinuation: contBinding != nil},
+		p.chatAttempt, p.httpSink, true)
+}
+
+// readAndParseFormatBody 读请求体并解析格式差异段（multipart 分支 / JSON 校验
+// + scanKeys 三键 + tier 策略）——handleFormat 的读请求阶段提取（只提函数：字节
+// 语义、错误码/文案、rm 原地补字段、返回体整体与现状逐字不变）。okParsed=false
+// 表示已写出错误响应（调用方直接 return）。
+func (p *Proxy) readAndParseFormatBody(format domain.RequestFormat, w http.ResponseWriter, r *http.Request, rm *reqMeta, reqID string, groupID int64, start time.Time) (reqModel string, stream bool, body []byte, okParsed bool) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, p.cfg.MaxBodySize))
 	if err != nil {
 		writeErr(w, errBody)
 		return
 	}
-	// images 端点专用 body 分支（评审 P1-2）：multipart 跳过 json.Valid 硬门
+	// images 端点专用 body 分支：multipart 跳过 json.Valid 硬门
 	// 与 gjson 顶层提取（下述 JSON 校验/stream 探测/body 重写对 multipart
 	// 全部失效——multipart 字节对 json.Valid 必然 false，撞门即误杀）；model
 	// 从 form 字段取；图片文件原样透传（不解析内容）；不做
 	// setModel/setStreamAndModel JSON 重写（form model 字段原样透传，spec
 	// §5.1 声明）。JSON 形态照常：model/stream 顶层提取 + service_tier 归一化。
-	var reqModel string
-	var stream bool
 	if format == domain.FormatOpenAIImages && isMultipartForm(r.Header.Get("Content-Type")) {
 		reqModel = imagesMultipartModel(body, r.Header.Get("Content-Type"))
 		// stream 恒 false：multipart 无流式形态（stream 探测仅 JSON 路径）
 	} else {
 		// SDK v1.x 参数里没有 Stream 字段（流式由 NewStreaming 在请求选项层注入
 		// "stream": true），故从原始请求体探测 stream 标志决定走流式还是非流式。
-		// model 一并在此提取（评审 I-2：不解析完整 params）；service_tier（Phase 5
-		// 计费）同次提取。GC 削减 P3：json.Valid 单遍校验（零分配）保留 400 语义 +
+		// model 一并在此提取（不解析完整 params）；service_tier（
+		// 计费）同次提取。GC 削减：json.Valid 单遍校验（零分配）保留 400 语义 +
 		// scanKeys 单遍顶层提取三键（spec 2026-08-16-single-pass-parse-design：
 		// 每 JSON 请求 4 遍全文档扫描 → 2 遍——gjson.ParseBytes 方案经证伪弃用）。
 		// 值判定与现状 gjson Type 校验语义精确等价：stream 非 bool/null、model/
@@ -168,9 +240,12 @@ func (p *Proxy) handleFormat(format domain.RequestFormat, w http.ResponseWriter,
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "invalid request body: invalid JSON"}})
 			return
 		}
-		var vals [3][]byte
-		scanKeys(body, streamModelTierKeys, vals[:])
+		var vals [6][]byte
+		scanKeys(body, requestAffinityKeys, vals[:])
 		streamRaw, modelRaw, tierRaw := vals[0], vals[1], vals[2]
+		affinityHash, hasAffinity := affinityIdentity(vals[3], vals[4], vals[5])
+		rm.AffinityHash = affinityHash
+		rm.HasAffinity = hasAffinity
 		switch {
 		case streamRaw == nil || bytes.Equal(streamRaw, falseBytes) || bytes.Equal(streamRaw, nullBytes):
 			stream = false
@@ -194,7 +269,7 @@ func (p *Proxy) handleFormat(format domain.RequestFormat, w http.ResponseWriter,
 		tier := billing.NormalizeTier(string(tierVal))
 		// service_tier 归一化 + 转发策略（计费启用才处理；auto/空/未知恒透传）：
 		// strip → 转发体删该字段；reject → 直接 400（记 ErrBilling，不转发）。
-		// 归一化 tier 补入已入 ctx 的 reqMeta（GC 削减 P6：免第二次 WithValue+
+		// 归一化 tier 补入已入 ctx 的 reqMeta（GC 削减 免第二次 WithValue+
 		// WithContext；非计费路径 hasTier=false → BillingTier 恒空）。
 		if p.bill != nil {
 			rm.tier = tier
@@ -214,60 +289,58 @@ func (p *Proxy) handleFormat(format domain.RequestFormat, w http.ResponseWriter,
 			}
 		}
 	}
+	return reqModel, stream, body, true
+}
 
-	// 路由信息：格式 + 调用器 + 请求体。默认 = 客户端格式直连（零转换）；
-	// images 端点按请求路径选调用器（generations/edits 上游子路径不同）；
-	// 协议转换（W5，只补差）命中时整体替换为模板协议路由。
-	route := forwardRoute{format: format, caller: p.callers[format], body: body}
+// selectFormatPlan 入口选号阶段（handleFormat 提取）：默认按客户端格式直连
+// （零转换）；images 端点按调用器选上游子路径（generations/edits，路由子路径
+// 不同）。返回 (sel, plan, attempt, err) 与 selectWithPlan(*) 逐字一致（只提
+// 函数，零语义变化）。
+func (p *Proxy) selectFormatPlan(format domain.RequestFormat, groupID int64, reqID, reqModel string, rm *reqMeta, route forwardRoute) (*scheduler.Selection, scheduler.AttemptPlan, scheduler.Attempt, error) {
+	identity := scheduler.AttemptPlanIdentity{RequestID: reqID, UserID: rm.meta.UserID, ApplyModelMapping: true, AffinityHash: rm.AffinityHash, HasAffinity: rm.HasAffinity}
 	if format == domain.FormatOpenAIImages {
-		route.caller = p.imagesCallerFor(r)
-	}
-
-	sel, err := p.sched.Select(groupID, format, reqModel)
-	if err != nil && (errors.Is(err, scheduler.ErrFormatUnavailable) || errors.Is(err, scheduler.ErrNoAvailable)) {
-		// 补差语义：模板已支持客户端协议 → 直接转发零转换；缺口 = 组内无客户
-		// 端协议路由（404）或路由存在但无可用账号（429——全忙/全禁用），组配置
-		// 了转换方向 → 客户端协议 → 转换 → 模板协议路由（配置方向即声明
-		// fallback 意图）。off（默认）→ 上面的 errors.Is 分支零开销（errors.Is
-		// 自身零分配）。ErrGroupNotFound（组不存在）仍不转换 → 404 直返。
-		if tgt, conv, ok := convertedRoute(rm.meta.ProtocolConverts, format); ok {
-			if sel2, err2 := p.sched.Select(groupID, tgt, reqModel); err2 == nil {
-				cb, cerr := protoconv.ConvertRequest(body, conv)
-				if cerr != nil {
-					// 本地拒绝：目标 Select 已占并发槽，必须释放（与 caller 本地
-					// 400 的 Release-only 语义一致），否则槽位永久泄漏。
-					p.sched.Release(sel2.AccountID)
-					writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "invalid request body: protocol conversion failed: " + cerr.Error()}})
-					return
-				}
-				sel = sel2
-				err = nil
-				route = forwardRoute{format: tgt, caller: p.convCallers[conv], body: cb}
-			} else {
-				err = err2
-			}
+		if ic, ok := route.caller.(*imagesCaller); ok {
+			rr := scheduler.RouteRefForOp(groupID, string(format), reqModel, ic.operationTag())
+			return p.selectWithPlanForRoute(rr, groupID, format, reqModel, identity)
 		}
 	}
-	if err != nil {
-		p.handleSelectError(w, err)
-		p.recordRejected(r.Context(), reqID, groupID, 0, reqModel, "", format, statusFor(err), domain.ErrNoAccount, 0, usageTuple{}, start, selectErrorMessage(err))
-		return
-	}
+	return p.selectWithPlan(groupID, format, reqModel, identity)
+}
 
-	// failover 循环（共享骨架，见 pipeline.go）：precheck=true（chat/resp/
-	// anthropic/images 走缺价预检）；尾部 Select 按 route.format（协议转换命中
-	// 时为模板协议路由）；记录仍按客户端 format（buildLog 参数不变）。差异
-	// 状态按值传入 attemptState（零分配——attempt/sink 为 New 构造单例）。
-	p.failoverLoop(w, r, format, route.format, reqID, groupID, start, reqModel, route.body, sel,
-		attemptState{format: format, routeFormat: route.format, caller: route.caller, stream: stream},
-		p.chatAttempt, p.httpSink, true)
+// resolveFormatContinuation 续接解析与钉选阶段（handleFormat 提取）：contPrevID
+// 为空 → 原样返回（零 Redis）。否则 contResolve 查绑定（失败 fail-closed：先释放
+// 已占并发槽，记录后写出）；再 contPin 推进计划到绑定账号（失败 fail-closed：
+// 记录后写出，绝不迁移到其他账号）。ok=false 表示已收尾写出，调用方直接 return。
+// 释放/记录时机与现状逐字一致（contPin 内部自行释放被跳过候选）。
+func (p *Proxy) resolveFormatContinuation(format domain.RequestFormat, w http.ResponseWriter, r *http.Request, reqID string, groupID, userID int64, reqModel, contPrevID string, start time.Time, sel *scheduler.Selection, plan *scheduler.AttemptPlan, attempt scheduler.Attempt) (*scheduler.Selection, scheduler.Attempt, *continuation.Binding, bool) {
+	if contPrevID == "" {
+		return sel, attempt, nil, true
+	}
+	// 续接解析：计划规范 route class 下查绑定；missing/expired/Redis 不可用
+	// fail-closed（释放已占并发槽，零上游拨号）。
+	b, ferr := p.contResolve(r.Context(), userID, groupID, contProtocolREST, contPrevID, attempt)
+	if ferr != nil {
+		sel.Release()
+		p.recordRejected(r.Context(), reqID, groupID, 0, reqModel, "", format, ferr.status, domain.Err4xx, 0, usageTuple{}, start, ferr.msg)
+		writeErr(w, ferr)
+		return sel, attempt, nil, false
+	}
+	// 续接钉选：计划推进到绑定账号（其余候选释放跳过）；绑定账号身份漂移或
+	// 不可派生 → fail-closed，绝不迁移到其他账号。
+	pinned, pinnedAttempt, ferr := p.contPin(plan, sel, attempt, b)
+	if ferr != nil {
+		p.recordRejected(r.Context(), reqID, groupID, b.AccountID, reqModel, "", format, ferr.status, domain.Err4xx, 0, usageTuple{}, start, ferr.msg)
+		writeErr(w, ferr)
+		return sel, attempt, nil, false
+	}
+	return pinned, pinnedAttempt, b, true
 }
 
 // chatAttempt handleFormat 的 attempt 实现（覆盖 chat/responses/anthropic/
 // images 四格式——共用同一循环骨架；无状态单例，per-request 差异经
 // attemptState 流入）。差异段：codex images 分流（按当轮 sel.CredentialType）、
 // credentialFor、caller.Call、Warn 文案（"upstream connection failure"——两版
-// 本保留不统一，循环不代发）与 SDK 校验错误识别（A-1 "streaming is required"
+// 本保留不统一，循环不代发）与 SDK 校验错误识别（"streaming is required"
 // 本地拒绝——chat 专属）。
 type chatAttempt struct{ p *Proxy }
 
@@ -275,19 +348,19 @@ func (a *chatAttempt) call(ctx context.Context, w http.ResponseWriter, r *http.R
 	// TODO(P22-I1): 当前 hdr 恒 nil（UpstreamCaller.Call 未回收 resp.Header），
 	// 仅 fallback 1 生效；待扩展 Header 透传后替换为真实透传
 	// （Global Constraints 豁免 fallback 保留）
-	// codex 分流落位（T2 §2，B 的 501 骨架）：images 端点 codex-oauth/
+	// codex 分流落位（§2，B 的 501 骨架）：images 端点 codex-oauth/
 	// codex-pat 模板选号命中 → codexImagesCaller（GenerateImage 非流式 /
-	// GenerateImageStream 流式 T3 已接——caller 内 stream 分支同签名直赋）。
+	// GenerateImageStream 流式 已接——caller 内 stream 分支同签名直赋）。
 	// 适配层未装配（SetCodex nil）→ 501 显式拒绝，不让凭据缺失路径误报
-	// 502/network。caller 每轮自 st.caller 起算 = 天然复位（评审 P1-1）：
+	// 502/network。caller 每轮自 st.caller 起算 = 天然复位：
 	// 混合类型组 failover 跨类型换账号（codex 失败 → api_key 尝试）时复用旧
 	// codexImagesCaller 会把健康 api_key 账号路由到 Ext=nil 空凭据路径
 	// （502 + 错误率污染 + 无谓失效上报 account 0）。
 	caller := st.caller
-	if st.routeFormat == domain.FormatOpenAIImages && isCodexCredentialType(sel.CredentialType) {
+	if st.routeFormat == domain.FormatOpenAIImages && sel.CredentialType.IsCodex() {
 		caller = a.p.codexImagesFor(r)
 	}
-	// 凭据每轮取（评审 I-3）：尾部 Select 后 Selection 变化，凭据随账号；
+	// 凭据每轮取：尾部 Select 后 Selection 变化，凭据随账号；
 	// 循环外取一次会把旧账号 key 发给新账号上游。codex 类型跳过单字符串
 	// credentialFor（注册表无 codex provider——单字符串契约表达不了复合
 	// 凭据；codexImagesCaller 按 sel.Ext 派生 AccountCredential 直供适配层）。
@@ -297,7 +370,7 @@ func (a *chatAttempt) call(ctx context.Context, w http.ResponseWriter, r *http.R
 		handled  bool
 		callErr  error
 	)
-	if isCodexCredentialType(sel.CredentialType) {
+	if sel.CredentialType.IsCodex() {
 		code, respBody, handled, callErr = caller.Call(ctx, w, r, reqID, groupID, start, sel, "", body, st.stream)
 	} else {
 		cred, err := a.p.credentialFor(ctx, sel)
@@ -310,7 +383,7 @@ func (a *chatAttempt) call(ctx context.Context, w http.ResponseWriter, r *http.R
 		code, respBody, handled, callErr = caller.Call(ctx, w, r, reqID, groupID, start, sel, cred, body, st.stream)
 	}
 	// code==0 && callErr != nil 的网络错误分类（Warn + 文本提取）在循环内完成；
-	// 本 attempt 只代发 Warn（文案 chat 版）与 SDK 校验错误识别（A-1 提前收尾）。
+	// 本 attempt 只代发 Warn（文案 chat 版）与 SDK 校验错误识别（提前收尾）。
 	// ctx.Err()==nil 判定与循环 499 分支同序（客户端断连不 Warn、不识别）。
 	if code == 0 && callErr != nil && ctx.Err() == nil {
 		sdkErr := callErr.Error()
@@ -323,7 +396,7 @@ func (a *chatAttempt) call(ctx context.Context, w http.ResponseWriter, r *http.R
 				logx.String("model", sel.Model),
 				logx.Error(callErr))
 		}
-		// SDK 校验错误识别（spec A-1，检测前置）：anthropic-sdk-go
+		// SDK 校验错误识别（spec，检测前置）：anthropic-sdk-go
 		// v1.62.0 client.go:316（CalculateNonStreamingTimeout）对
 		// max_tokens 大 + 非流式请求本地拒绝——无网络请求、无状态码
 		// （code=0），此前误归 network（err_logs 记 network + 502 无
@@ -336,7 +409,7 @@ func (a *chatAttempt) call(ctx context.Context, w http.ResponseWriter, r *http.R
 			l := logWithCtx(ctx, a.p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), st.format, http.StatusBadRequest, domain.Err4xx, usageTuple{}, start))
 			em := domain.TruncateErrMsg(sdkErr)
 			l.ErrorMessage = &em
-			a.p.finish(sel.AccountID, l)
+			a.p.finish(sel, l)
 			// message 用 SDK 原文不加前缀（"streaming is required..." 已
 			// 自明，避免措辞重复）；type 与 4xx 分支通用回退同款（可选）。
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{

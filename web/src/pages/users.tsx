@@ -5,10 +5,10 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
-import { Plus, Pencil, Ban, CircleCheck, UserCog, Filter, UsersRound, X, Coins } from 'lucide-react'
+import { Plus, Pencil, Ban, CircleCheck, UserCog, Filter, UsersRound, X, Coins, History } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { api } from '@/App'
-import { ApiUnauthorized } from '@/lib/api/client'
+import { ApiError, ApiUnauthorized } from '@/lib/api/client'
 import { ListToolbar } from '@/components/list-toolbar'
 import { Pagination } from '@/components/pagination'
 import { SortableHeader, type SortOrder } from '@/components/sortable-header'
@@ -27,7 +27,7 @@ import { Badge } from '@/components/ui/badge'
 import { toast } from '@/components/ui/toast'
 import { cn } from '@/lib/utils'
 import { formatDateTime, formatUSD } from '@/components/fmt'
-import type { TFunction } from 'i18next'
+import { formatGroupMultiplier as formatMultiplier } from '@/components/group-option'
 import type { components } from '@/lib/api/schema'
 
 type User = components['schemas']['User']
@@ -37,22 +37,31 @@ type UserRole = components['schemas']['UserRole']
 type UserStatus = components['schemas']['UserStatus']
 type GroupVisibility = components['schemas']['GroupVisibility']
 type UserGroupsBody = components['schemas']['UserGroupsBody']
+type BalanceLog = components['schemas']['BalanceLog']
 
-const ROLES: UserRole[] = ['platform_admin', 'user']
+const ROLES: UserRole[] = ['platform_admin', 'user', 'supplier']
 const STATUSES: UserStatus[] = ['active', 'disabled']
 
 // 余额（USD 浮点，已由 API 边界换算）→ $N.NN；空 → —。
 const formatBalance = (b?: number): string => (b == null ? '—' : `$${b.toFixed(2)}`)
 
-// 角色徽章：platform_admin 蓝点（管理面）/ user 灰点（普通用户，与 groups
-// VisibilityBadge 同风格）。
+// 余额变动额（有符号 USD）→ +$X / -$X；变更后余额 → $X（可合法为 0）。
+const formatLogAmount = (v: number): string => `${v < 0 ? '-' : '+'}$${Math.abs(v).toFixed(5)}`
+const formatLogBalance = (v: number): string => `$${v.toFixed(5)}`
+
+// 角色徽章：platform_admin 蓝点（管理面）/ supplier 绿点（供应商面）/
+// user 灰点（普通用户，与 groups VisibilityBadge 同风格）。
 function RoleBadge({ role }: { role?: UserRole }) {
   const { t } = useTranslation()
   const isAdmin = role === 'platform_admin'
+  const isSupplier = role === 'supplier'
+  const tone = isAdmin ? 'text-blue-700 dark:text-blue-400' : isSupplier ? 'text-emerald-700 dark:text-emerald-400' : 'text-muted-foreground'
+  const dot = isAdmin ? 'bg-blue-500' : isSupplier ? 'bg-emerald-500' : 'bg-muted-foreground/60'
+  const key = isAdmin ? 'users.role.platform_admin' : isSupplier ? 'users.role.supplier' : 'users.role.user'
   return (
-    <Badge variant="secondary" className={cn('gap-1.5', isAdmin ? 'text-blue-700 dark:text-blue-400' : 'text-muted-foreground')}>
-      <span className={cn('size-1.5 shrink-0 rounded-full', isAdmin ? 'bg-blue-500' : 'bg-muted-foreground/60')} />
-      {t(isAdmin ? 'users.role.platform_admin' : 'users.role.user')}
+    <Badge variant="secondary" className={cn('gap-1.5', tone)}>
+      <span className={cn('size-1.5 shrink-0 rounded-full', dot)} />
+      {t(key)}
     </Badge>
   )
 }
@@ -60,14 +69,6 @@ function RoleBadge({ role }: { role?: UserRole }) {
 // 分组管理行内专属倍率态：mult = 输入框文本（'' = 未填）；cleared = 用户显式点过
 // 「清除为未设置」（提交 null）；勾选留空且未清除 = 省略键（沿用当前值）。
 interface AssignRowMult { mult: string; cleared: boolean }
-
-// 组价格倍率（正常值，API 边界已换算）→ 展示：null = 未设置（—）；0 = 免费；
-// 其余 ×N（1 = ×1.0，1.5 = ×1.5）。
-const formatMultiplier = (m: number | null | undefined, t: TFunction): string => {
-  if (m == null) return '—'
-  if (m === 0) return t('groups.free')
-  return `×${m.toFixed(1)}`
-}
 
 // 组可见性小标：public 绿点 / private 灰点（与 RoleBadge 同风格）。
 function GroupVisibilityDot({ visibility }: { visibility?: GroupVisibility }) {
@@ -143,14 +144,15 @@ export default function Users() {
   // —— 列表：筛选/分页状态归 queryKey（排序白名单：id/email/role/status/
   // max_concurrency/created_at/updated_at——balance 不可排）——
   const [email, setEmail] = useState('')
+  const [role, setRole] = useState<'all' | UserRole>('all')
   const [activeSort, setActiveSort] = useState<string | null>(null) // null = 无主动排序（默认 id desc）
   const [order, setOrder] = useState<SortOrder>('desc')
   const [offset, setOffset] = useState(0)
   const [limit, setLimit] = useState(20)
 
   const { data, isLoading, isError, error } = useQuery({
-    queryKey: ['users', { limit, offset, email, sort: activeSort ?? 'id', order }],
-    queryFn: () => api.listUsers({ limit, offset, email: email || undefined, sort: activeSort ?? 'id', order }),
+    queryKey: ['users', { limit, offset, email, role, sort: activeSort ?? 'id', order }],
+    queryFn: () => api.listUsers({ limit, offset, email: email || undefined, role: role === 'all' ? undefined : role, sort: activeSort ?? 'id', order }),
   })
   const rows = data?.rows ?? []
 
@@ -158,6 +160,7 @@ export default function Users() {
   // 每页条数变化 → 重置 offset。
   const changeLimit = (l: number) => { setLimit(l); resetPage() }
   const changeEmail = (v: string) => { setEmail(v); resetPage() }
+  const changeRole = (v: string) => { setRole(v as 'all' | UserRole); resetPage() }
   // 列头三态：新列 → 降序；同列降序 → 升序；同列升序 → 取消（回默认 id desc）
   const onColumnToggle = (col: string) => {
     resetPage()
@@ -171,8 +174,16 @@ export default function Users() {
       setOrder('desc')
     }
   }
-  const hasFilters = email !== ''
-  const clearFilters = () => { setEmail(''); resetPage() }
+  const hasFilters = email !== '' || role !== 'all'
+  const clearFilters = () => { setEmail(''); setRole('all'); resetPage() }
+  // 角色筛选项（单一事实来源）：items（供 SelectValue 解析并显示标签）与下拉项共用，避免两处漂移
+  const roleOptions: { value: 'all' | UserRole; label: string }[] = [
+    { value: 'all', label: t('users.allRoles') },
+    { value: 'platform_admin', label: t('users.role.platform_admin') },
+    { value: 'user', label: t('users.role.user') },
+    { value: 'supplier', label: t('users.role.supplier') },
+  ]
+  const roleItems = Object.fromEntries(roleOptions.map((o) => [o.value, o.label]))
 
   // —— 创建/编辑 ——
   const [dialogOpen, setDialogOpen] = useState(false)
@@ -194,7 +205,7 @@ export default function Users() {
   const [tempUser, setTempUser] = useState<User | null>(null)
   const tempBalancesQ = useQuery({
     queryKey: ['admin', 'temp-balances', tempUser?.ID],
-    // page_size 取后端上限 1000 拉全量（额度行通常个位数——避免截断致合计少算，评审 I-1）
+    // page_size 取后端上限 1000 拉全量（额度行通常个位数——避免截断致合计少算）
     queryFn: () => api.getAdminTempBalances({ user_id: tempUser!.ID!, page_size: 1000 }),
     enabled: tempUser != null,
   })
@@ -203,6 +214,18 @@ export default function Users() {
   const tempActiveTotal = tempRows
     .filter((r) => r.amount_usd > 0 && (r.expires_at == null || new Date(r.expires_at) > new Date()))
     .reduce((s, r) => s + r.amount_usd, 0)
+
+  // —— 余额变动记录查看（行按钮 → 弹窗；limit/offset 分页）——
+  const [logUser, setLogUser] = useState<User | null>(null)
+  const [logOffset, setLogOffset] = useState(0)
+  const [logLimit, setLogLimit] = useState(20)
+  const openLog = (u: User) => { setLogUser(u); setLogOffset(0) }
+  const logQ = useQuery({
+    queryKey: ['admin', 'balance-logs', logUser?.ID, { limit: logLimit, offset: logOffset }],
+    queryFn: () => api.getUsersIdBalanceLogs(logUser!.ID!, { limit: logLimit, offset: logOffset }),
+    enabled: logUser != null,
+  })
+  const logRows: BalanceLog[] = logQ.data?.rows ?? []
 
   const save = useMutation({
     mutationFn: (f: UserForm) =>
@@ -344,6 +367,14 @@ export default function Users() {
   }
 
   const errMsg = (e: unknown) => (e instanceof ApiUnauthorized ? null : (e as Error)?.message)
+  // 用户表单（新建/编辑）：409 且为新建 = 邮箱已存在（编辑不改邮箱，其 409 是
+  // 罕见的并发 CAS 冲突，仍走服务端文案）。
+  const saveErrMsg = (): string | null => {
+    if (!save.isError) return null
+    if (save.error instanceof ApiUnauthorized) return null
+    if (!editing && save.error instanceof ApiError && save.error.status === 409) return t('users.emailExists')
+    return (save.error as Error)?.message ?? null
+  }
 
   return (
     <div className="space-y-6">
@@ -359,7 +390,19 @@ export default function Users() {
         name={email}
         onNameChange={changeEmail}
         placeholder={t('users.searchEmail')}
-      />
+      >
+        {/* 角色筛选（all = 不过滤） */}
+        <Select items={roleItems} value={role} onValueChange={changeRole}>
+          <SelectTrigger size="default" className="w-40 data-[size=default]:h-9" aria-label={t('users.filterRole')}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {roleOptions.map((o) => (
+              <SelectItem key={o.value} value={o.value} label={o.label}>{o.label}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </ListToolbar>
 
       {isError ? (
         <p className="text-sm text-destructive">{t('common.loadFailed', { message: (error as Error).message })}</p>
@@ -382,7 +425,7 @@ export default function Users() {
         </motion.div>
       ) : (
         <>
-          <ScrollArea data-od-id="table-scroll-users" className="rounded-[14px] border border-transparent bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] after:pointer-events-none after:absolute after:inset-0 after:z-20 after:rounded-[14px] after:border after:border-[rgba(19,45,83,0.26)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:after:border-[rgba(148,180,220,0.32)]" showHorizontal>
+          <ScrollArea data-od-id="table-scroll-users" className="rounded-[14px] border border-[rgba(19,45,83,0.26)] bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:border-[rgba(148,180,220,0.32)]" showHorizontal>
             <Table className="min-w-[900px]" containerClassName="overflow-x-visible border-0 shadow-none rounded-none bg-transparent backdrop-blur-none">
               <TableHeader>
                 <TableRow>
@@ -410,6 +453,7 @@ export default function Users() {
                     <TableCell className="text-xs text-muted-foreground whitespace-nowrap">{formatDateTime(u.CreatedAt)}</TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-1">
+                        <Button variant="ghost" size="icon-sm" title={t('users.balanceLogs.button')} data-od-id="users-balance-logs" onClick={() => openLog(u)}><History /></Button>
                         <Button variant="ghost" size="icon-sm" title={t('users.tempBalances.button')} data-od-id="users-temp-balances" onClick={() => setTempUser(u)}><Coins /></Button>
                         <Button variant="ghost" size="icon-sm" title={t('users.groups.button')} onClick={() => openGroups(u)}><UsersRound /></Button>
                         <Button
@@ -437,7 +481,7 @@ export default function Users() {
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>{editing ? t('users.editTitle', { id: editing.ID }) : t('users.newTitle')}</DialogTitle>
+            <DialogTitle>{editing ? t('users.editTitle', { id: editing.ID ?? 0 }) : t('users.newTitle')}</DialogTitle>
             <DialogDescription>{t('users.dialogDesc')}</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
@@ -465,7 +509,7 @@ export default function Users() {
                 <p className="text-xs text-muted-foreground">{t('users.passwordHint')}</p>
               </div>
             )}
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="space-y-1.5">
                 <Label>{t('users.roleLabel')}</Label>
                 <Select value={form.role} items={Object.fromEntries(ROLES.map(r => [r, t(`users.role.${r}`)]))} onValueChange={v => setForm(f => ({ ...f, role: v as UserRole }))}>
@@ -485,7 +529,7 @@ export default function Users() {
                 </Select>
               </div>
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="space-y-1.5">
                 <Label htmlFor="usr-max">{t('users.maxLabel')}</Label>
                 <Input id="usr-max" type="number" min={0} value={form.max_concurrency} onChange={e => setForm(f => ({ ...f, max_concurrency: e.target.value }))} />
@@ -496,8 +540,8 @@ export default function Users() {
                 <Input id="usr-balance" type="number" min={0} step={0.01} value={form.balance} onChange={e => setForm(f => ({ ...f, balance: e.target.value }))} />
               </div>
             </div>
-            {save.isError && errMsg(save.error) && (
-              <p className="text-sm text-destructive">{errMsg(save.error)}</p>
+            {save.isError && saveErrMsg() && (
+              <p className="text-sm text-destructive">{saveErrMsg()}</p>
             )}
           </div>
           <DialogFooter>
@@ -513,9 +557,9 @@ export default function Users() {
       <Dialog open={!!tempUser} onOpenChange={o => { if (!o) { setTempUser(null) } }}>
         <DialogContent className="sm:max-w-lg overflow-hidden">
           <DialogHeader>
-            <DialogTitle>{t('users.tempBalances.title', { name: tempUser?.Email })}</DialogTitle>
+            <DialogTitle>{t('users.tempBalances.title', { name: tempUser?.Email ?? '' })}</DialogTitle>
             <DialogDescription>{t('users.tempBalances.desc')}</DialogDescription>
-            {/* 空态不渲染合计（评审 M-1——对齐 profile 参考形态） */}
+            {/* 空态不渲染合计（对齐 profile 参考形态） */}
             {tempRows.length > 0 && (
               <p className="text-sm font-medium">{t('users.tempBalances.total', { amount: formatUSD(tempActiveTotal) })}</p>
             )}
@@ -557,11 +601,67 @@ export default function Users() {
         </DialogContent>
       </Dialog>
 
+      {/* —— 余额变动记录：分页查看（永久余额的非 usage 变动：注册默认/管理面创建/管理面调整/兑换码） —— */}
+      <Dialog open={!!logUser} onOpenChange={o => { if (!o) setLogUser(null) }}>
+        <DialogContent className="sm:max-w-2xl overflow-hidden">
+          <DialogHeader>
+            <DialogTitle>{t('users.balanceLogs.title', { name: logUser?.Email ?? '' })}</DialogTitle>
+            <DialogDescription>{t('users.balanceLogs.desc')}</DialogDescription>
+          </DialogHeader>
+          {logQ.isLoading ? (
+            <div className="space-y-1.5">
+              {Array.from({ length: 3 }).map((_, i) => <Skeleton key={i} className="h-9" />)}
+            </div>
+          ) : logQ.isError ? (
+            <p className="text-sm text-destructive">{t('common.loadFailed', { message: (logQ.error as Error).message })}</p>
+          ) : logRows.length === 0 ? (
+            <p className="py-6 text-center text-sm text-muted-foreground">{t('users.balanceLogs.empty')}</p>
+          ) : (
+            <ScrollArea className="max-h-96 rounded-md border">
+              <Table containerClassName="overflow-x-visible border-0 shadow-none rounded-none bg-transparent backdrop-blur-none">
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>{t('users.balanceLogs.col.time')}</TableHead>
+                    <TableHead>{t('users.balanceLogs.col.source')}</TableHead>
+                    <TableHead className="text-right">{t('users.balanceLogs.col.amount')}</TableHead>
+                    <TableHead className="text-right">{t('users.balanceLogs.col.balanceAfter')}</TableHead>
+                    <TableHead className="text-right">{t('users.balanceLogs.col.operator')}</TableHead>
+                    <TableHead>{t('users.balanceLogs.col.note')}</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {logRows.map(r => (
+                    <TableRow key={r.ID}>
+                      <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{formatDateTime(r.CreatedAt)}</TableCell>
+                      <TableCell className="whitespace-nowrap text-xs">{t(`users.balanceLogs.source.${r.Source}`)}</TableCell>
+                      <TableCell className={cn('text-right tabular-nums', r.Amount < 0 ? 'text-destructive' : 'text-emerald-600 dark:text-emerald-400')}>
+                        {formatLogAmount(r.Amount)}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">{formatLogBalance(r.BalanceAfter)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{r.OperatorID === 0 ? '—' : r.OperatorID}</TableCell>
+                      <TableCell className="max-w-40 truncate text-xs text-muted-foreground" title={r.Note ?? undefined}>{r.Note ?? '—'}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </ScrollArea>
+          )}
+          <Pagination
+            total={logQ.data?.total ?? 0}
+            limit={logLimit}
+            offset={logOffset}
+            onOffsetChange={setLogOffset}
+            onLimitChange={l => { setLogLimit(l); setLogOffset(0) }}
+            pageSizes={[10, 20, 50, 100]}
+          />
+        </DialogContent>
+      </Dialog>
+
       {/* —— 分组管理：勾选 = 授予，未勾选 = 撤销（完整列表替换）+ 专属倍率三态 —— */}
       <Dialog open={!!groupsTarget} onOpenChange={o => { if (!o && !saveUserGroups.isPending && !clearUserGroups.isPending) { setGroupsTarget(null); setClearGroupsOpen(false) } }}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>{t('users.groups.title', { name: groupsTarget?.Email })}</DialogTitle>
+            <DialogTitle>{t('users.groups.title', { name: groupsTarget?.Email ?? '' })}</DialogTitle>
             <DialogDescription>{t('users.groups.desc')}</DialogDescription>
             <p className="text-sm font-medium">{t('users.groups.count', { count: grantedCount })}</p>
             {groupsEchoLoading && <p className="text-xs text-muted-foreground">{t('users.groups.echoLoading')}</p>}
@@ -646,7 +746,7 @@ export default function Users() {
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
             <DialogTitle>{t('users.groups.clearAll')}</DialogTitle>
-            <DialogDescription>{t('users.groups.clearAllDesc', { name: groupsTarget?.Email })}</DialogDescription>
+            <DialogDescription>{t('users.groups.clearAllDesc', { name: groupsTarget?.Email ?? '' })}</DialogDescription>
           </DialogHeader>
           {clearUserGroups.isError && errMsg(clearUserGroups.error) && (
             <p className="text-sm text-destructive">{errMsg(clearUserGroups.error)}</p>

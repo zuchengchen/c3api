@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: github.com/is7qin/c3api Admin API
   version: 1.0.0
-  description: '管理端 API（模板/账号/分组/规则/日志/统计）。认证：Authorization: Bearer <admin_token>。'
+  description: '管理端 API（模板/账号/分组/规则/日志/统计）。认证：platform_admin 身份的 JWT 或其管理 API key（Authorization: Bearer <jwt|mk-...>）。'
 servers:
   - url: /api/admin
 tags:
@@ -17,6 +17,11 @@ tags:
   - name: redemptions
   - name: pricing
   - name: ops
+  - name: routing
+  - name: admin-supplier
+  # 供应商面（/api/user/supplier/*）：业务端点（§6.1/§6.2）+ 账号/分组/模板子集
+  # （§2.5）。tag 即边界——只有本 tag 的 op 进 supplier 包（codegen 原生 default-deny）。
+  - name: supplier
 paths:
   /templates:
     post:
@@ -41,11 +46,11 @@ paths:
       tags: [templates]
       summary: 模板列表（分页/筛选/排序）
       parameters:
-        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 200, description: 每页条数（上限 200，超限裁剪到 200） } }
-        - { name: offset, in: query, schema: { type: integer, default: 0 } }
-        - { name: name, in: query, schema: { type: string } }
-        - { name: sort, in: query, schema: { type: string } }
-        - { name: order, in: query, schema: { type: string, enum: [asc, desc] } }
+        - $ref: '#/components/parameters/ListLimit'
+        - $ref: '#/components/parameters/ListOffset'
+        - $ref: '#/components/parameters/ListName'
+        - $ref: '#/components/parameters/ListSort'
+        - $ref: '#/components/parameters/ListOrder'
       responses:
         '200':
           description: 模板列表
@@ -186,13 +191,13 @@ paths:
       tags: [accounts]
       summary: 账号列表（分页/筛选/排序，含运行时视图）
       parameters:
-        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 200, description: 每页条数（上限 200，超限裁剪到 200） } }
-        - { name: offset, in: query, schema: { type: integer, default: 0 } }
-        - { name: name, in: query, schema: { type: string } }
-        - { name: sort, in: query, schema: { type: string } }
-        - { name: order, in: query, schema: { type: string, enum: [asc, desc] } }
-        - { name: status, in: query, schema: { type: string, description: "多值逗号分隔：active,unhealthy,429,disabled" } }
-        - { name: template_id, in: query, schema: { type: integer, format: int64 } }
+        - $ref: '#/components/parameters/ListLimit'
+        - $ref: '#/components/parameters/ListOffset'
+        - $ref: '#/components/parameters/ListName'
+        - $ref: '#/components/parameters/ListSort'
+        - $ref: '#/components/parameters/ListOrder'
+        - $ref: '#/components/parameters/AccountTemplateId'
+        - $ref: '#/components/parameters/AccountEnabled'
       responses:
         '200':
           description: 账号视图列表
@@ -205,11 +210,12 @@ paths:
     get:
       operationId: GetAccountsUsage
       tags: [accounts]
-      summary: 账号用量聚合（统一 usage API——批量 ≤100 条；from/to 缺省 = 当天）
+      summary: 账号用量聚合（统一 usage API——批量 ≤100 条；窗口 from/to 或 window 恰择一）
       parameters:
         - { name: account_ids, in: query, required: true, schema: { type: string, description: "逗号分隔账号 id（1-100 条；重复 id 自动去重——响应 item 唯一；空/非数字/超限 → 400）" } }
-        - { name: from, in: query, schema: { type: string, format: date-time, description: "RFC3339 起始（含）；缺省 = timezone 时区当日零点；显式值为绝对时刻，不受时区改写" } }
-        - { name: to, in: query, schema: { type: string, format: date-time, description: "RFC3339 结束（不含）；缺省 = now；from > to → 400" } }
+        - $ref: '#/components/parameters/StatsFrom'
+        - $ref: '#/components/parameters/StatsTo'
+        - $ref: '#/components/parameters/StatsWindow'
         - $ref: '#/components/parameters/StatsTimezone'
       responses:
         '200':
@@ -252,25 +258,7 @@ paths:
           description: 更新成功
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/BatchUpdateResponse' }
-        default:
-          $ref: '#/components/responses/Error'
-  /accounts/batch-reset-cooldown:
-    post:
-      operationId: PostAccountsBatchResetCooldown
-      tags: [accounts]
-      summary: 批量重置账号冷却（事务，全成或全败；status→active + cooldown_until=now）
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/BatchResetCooldownBody' }
-      responses:
-        '200':
-          description: 重置成功
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/BatchResetCooldownResponse' }
+              schema: { $ref: '#/components/schemas/AccountBatchUpdateResponse' }
         default:
           $ref: '#/components/responses/Error'
   /accounts/batch-import-codex-oauth:
@@ -323,20 +311,31 @@ paths:
               schema: { $ref: '#/components/schemas/Account' }
         default:
           $ref: '#/components/responses/Error'
-    put:
-      operationId: PutAccountsId
+    patch:
+      operationId: PatchAccountsId
       tags: [accounts]
+      summary: 部分更新账号（三态：缺省=不变；可空标量 null=清空、""=400；不可空标量 null=400；有值=落值）
+      description: >-
+        账号写面唯一更新入口（一个端点覆盖倍率 + 缓存域 + 启停 + 普通字段 + 身份字段全部组合，一次调用）。
+        前置条件 If-Match 可选：缺席 = 不做检查；命中 = 生效；陈旧 → 412；语法非法（W/、多值、*、非整数）→ 400。
+      parameters:
+        - { name: If-Match, in: header, required: false, schema: { type: string, description: "可选乐观锁前置条件：\"<lifecycle_revision>\"（可带引号）。不支持 W/、多值与 *（→ 400）；陈旧 → 412" } }
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/AccountCreate' }
+            schema: { $ref: '#/components/schemas/AccountConfigPatch' }
       responses:
         '200':
-          description: 更新后账号
+          description: 更新后账号（含新 lifecycle_revision）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Account' }
+        '412':
+          description: If-Match 陈旧（当前 lifecycle_revision 与前置条件不符）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
         default:
           $ref: '#/components/responses/Error'
     delete:
@@ -363,6 +362,34 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AccountGroupsResponse' }
+        default:
+          $ref: '#/components/responses/Error'
+  # ---- intelligent-routing 生命周期 fenced 端点（CAS expected_revision；
+  # 0 行命中 = revision 过期 → 409；账号缺 id → 404；成功回显新代际 Account）----
+  /accounts/{id}/recover:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+    post:
+      operationId: PostAccountsIdRecover
+      tags: [accounts]
+      summary: 失效恢复（fenced）：清 failed_at/last_error/failure_source + revision CAS +1 → 新代际置 PROBING 待探针
+      description: |
+        运行时失效（rule 判死/SDK fatal）后管理员确认恢复的唯一入口：CAS
+        expected_revision 命中才清失效三字段并 +1，随后对新 revision 写通配
+        PROBING（探针环接管：READY 前不吃正常流量）。expected_revision 过期 →
+        409（前端须重读账号后重试）；本端点不启用被禁用的账号（enabled 独立，
+        经 PATCH /accounts/{id} 修改）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountRecoverBody' }
+      responses:
+        '200':
+          description: 恢复后的账号（含新 LifecycleRevision）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
         default:
           $ref: '#/components/responses/Error'
   /accounts/{id}/ext:
@@ -420,11 +447,11 @@ paths:
       tags: [groups]
       summary: 分组列表（分页/筛选/排序）
       parameters:
-        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 200, description: 每页条数（上限 200，超限裁剪到 200） } }
-        - { name: offset, in: query, schema: { type: integer, default: 0 } }
-        - { name: name, in: query, schema: { type: string } }
-        - { name: sort, in: query, schema: { type: string } }
-        - { name: order, in: query, schema: { type: string, enum: [asc, desc] } }
+        - $ref: '#/components/parameters/ListLimit'
+        - $ref: '#/components/parameters/ListOffset'
+        - $ref: '#/components/parameters/ListName'
+        - $ref: '#/components/parameters/ListSort'
+        - $ref: '#/components/parameters/ListOrder'
       responses:
         '200':
           description: 分组列表
@@ -521,6 +548,8 @@ paths:
         - { name: email, in: query, schema: { type: string } }
         - { name: sort, in: query, schema: { type: string } }
         - { name: order, in: query, schema: { type: string, enum: [asc, desc] } }
+        - { name: role, in: query, schema: { type: string, enum: [platform_admin, user, supplier], description: "按角色精确过滤（空 = 不过滤）；未知非空值 → 200 空列表（宽松，不报错）。当 supplier_surface=true 时不生效" } }
+        - { name: supplier_surface, in: query, schema: { type: boolean, description: "true = 仅供应商面可达角色（supplier/platform_admin；单一事实源 domain.SupplierSurfaceRoles）；缺省/false = 不过滤，此时按 role 过滤" } }
       responses:
         '200':
           description: 用户列表
@@ -596,6 +625,24 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/UserGroupsResponse' }
+        default:
+          $ref: '#/components/responses/Error'
+  /users/{id}/balance-logs:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+    get:
+      operationId: GetUsersIdBalanceLogs
+      tags: [users]
+      summary: 某用户的余额变动记录（platform_admin 专属；永久余额的非 usage 变动：注册默认/管理面创建/管理面调整/兑换码；分页）
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 200, description: 每页条数（上限 200，超限裁剪到 200） } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: 余额变动记录列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BalanceLogListResponse' }
         default:
           $ref: '#/components/responses/Error'
   /temp-balances:
@@ -757,7 +804,7 @@ paths:
               schema: { $ref: '#/components/schemas/MailTemplate' }
         default:
           $ref: '#/components/responses/Error'
-  # --- 兑换码（tag: redemptions；Phase 5 计费前基础设施——资源发放的通用载体） ---
+  # --- 兑换码（tag: redemptions；计费前基础设施——资源发放的通用载体） ---
   # 注意 chi 路径顺序：/redemption-codes/batch-deactivate 必须先于
   # /redemption-codes/{id}/... 注册（生成器按 spec 顺序注册，防 "batch-deactivate"
   # 被 {id} 捕获，对齐 /templates/batch-delete 先例）。
@@ -1315,14 +1362,19 @@ paths:
       tags: [user]
       summary: 我的用量统计（强制 user_id = 当前用户）
       parameters:
-        - { name: from, in: query, required: true, schema: { type: string, format: date-time } }
-        - { name: to, in: query, required: true, schema: { type: string, format: date-time } }
+        - { name: from, in: query, schema: { type: string, format: date-time, description: "绝对窗口下界（含，RFC3339）。窗口两形态**恰择一**（from+to，或 window 单独）：与 window 同给 / 只给一端 / 都不给 → 400 `reason=window_ambiguous`。给出 from/to 时不做时区改写；服务端按判定把两端向后取整到整点（生效窗口见响应头 X-Stats-Effective-From/To）" } }
+        - { name: to, in: query, schema: { type: string, format: date-time, description: "绝对窗口上界（不含，RFC3339）。与 from 同生共死：只给一端 → 400 `reason=window_ambiguous`；from 不早于 to → 400 `reason=window_invalid`" } }
+        - $ref: '#/components/parameters/StatsWindow'
         - { name: granularity, in: query, schema: { type: string, enum: [hour, day], default: day } }
         - { name: model, in: query, schema: { type: string } }
         - $ref: '#/components/parameters/StatsTimezone'
       responses:
         '200':
-          description: 统计趋势点数组
+          description: 统计趋势点数组（生效窗口与实际存储见响应头 X-Stats-*——裸数组体不能加字段）
+          headers:
+            X-Stats-Effective-From: { $ref: '#/components/headers/StatsEffectiveFrom' }
+            X-Stats-Effective-To: { $ref: '#/components/headers/StatsEffectiveTo' }
+            X-Stats-Storage: { $ref: '#/components/headers/StatsStorage' }
           content:
             application/json:
               schema:
@@ -1336,8 +1388,9 @@ paths:
       tags: [user]
       summary: 我的 TTFT 聚合（强制 user_id = 当前用户）
       parameters:
-        - { name: from, in: query, required: true, schema: { type: string, format: date-time } }
-        - { name: to, in: query, required: true, schema: { type: string, format: date-time } }
+        - { name: from, in: query, schema: { type: string, format: date-time, description: "绝对窗口下界（含，RFC3339）。窗口两形态**恰择一**（from+to，或 window 单独）：与 window 同给 / 只给一端 / 都不给 → 400 `reason=window_ambiguous`。给出 from/to 时不做时区改写；服务端按判定把两端向后取整到整点（生效窗口见响应头 X-Stats-Effective-From/To）" } }
+        - { name: to, in: query, schema: { type: string, format: date-time, description: "绝对窗口上界（不含，RFC3339）。与 from 同生共死：只给一端 → 400 `reason=window_ambiguous`；from 不早于 to → 400 `reason=window_invalid`" } }
+        - $ref: '#/components/parameters/StatsWindow'
         - { name: model, in: query, schema: { type: string } }
         - $ref: '#/components/parameters/StatsTimezone'
       responses:
@@ -1346,6 +1399,26 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/StatTTFTSummary' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/stats/capabilities:
+    get:
+      operationId: GetUserStatsCapabilities
+      tags: [user]
+      summary: 统计能力（本部署能查多久——与 /api/admin/stats/capabilities 同一投影）
+      description: |
+        用户面变体（与 `/stats/ttft` ↔ `/api/user/stats/ttft` 同一惯例）：同一份
+        服务端投影（KIND 矩阵 × 保留期），**不是第二份数据**。存在的理由 = 用户台
+        同样需要按部署上限裁剪选择器与 TTFT 窗口，而 `/api/admin/*` 只接受
+        platform_admin 凭据——普通用户拿不到。内容全为 per-deployment 常量，无
+        任何账号/租户数据；这些数字本就随 400 机读字段
+        （`limit_seconds`/`retention_days`）逐请求可见。
+      responses:
+        '200':
+          description: 能力投影（kinds 键 = 读形状标识）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatsCapabilities' }
         default:
           $ref: '#/components/responses/Error'
   /api/user/redemptions:
@@ -1531,17 +1604,22 @@ paths:
     get:
       operationId: GetStatsTrend
       tags: [stats]
-      summary: 趋势聚合（cube/原始行——按 timezone 路由）
+      summary: 趋势聚合（cube/原始行——按请求时区判定）
       parameters:
-        - { name: from, in: query, required: true, schema: { type: string, format: date-time } }
-        - { name: to, in: query, required: true, schema: { type: string, format: date-time } }
+        - { name: from, in: query, schema: { type: string, format: date-time, description: "绝对窗口下界（含，RFC3339）。窗口两形态**恰择一**（from+to，或 window 单独）：与 window 同给 / 只给一端 / 都不给 → 400 `reason=window_ambiguous`。给出 from/to 时不做时区改写；服务端按判定把两端向后取整到整点（生效窗口见响应头 X-Stats-Effective-From/To）" } }
+        - { name: to, in: query, schema: { type: string, format: date-time, description: "绝对窗口上界（不含，RFC3339）。与 from 同生共死：只给一端 → 400 `reason=window_ambiguous`；from 不早于 to → 400 `reason=window_invalid`" } }
+        - $ref: '#/components/parameters/StatsWindow'
         - { name: granularity, in: query, schema: { type: string, enum: [hour, day], default: day } }
         - { name: group_id, in: query, schema: { type: integer, format: int64 } }
         - { name: model, in: query, schema: { type: string } }
         - $ref: '#/components/parameters/StatsTimezone'
       responses:
         '200':
-          description: 统计趋势点数组
+          description: 统计趋势点数组（生效窗口与实际存储见响应头 X-Stats-*——裸数组体不能加字段）
+          headers:
+            X-Stats-Effective-From: { $ref: '#/components/headers/StatsEffectiveFrom' }
+            X-Stats-Effective-To: { $ref: '#/components/headers/StatsEffectiveTo' }
+            X-Stats-Storage: { $ref: '#/components/headers/StatsStorage' }
           content:
             application/json:
               schema:
@@ -1579,14 +1657,19 @@ paths:
       parameters:
         - { name: entity, in: query, required: true, schema: { type: string, enum: [account, user, key] } }
         - { name: id, in: query, required: true, schema: { type: integer, format: int64 } }
-        - { name: from, in: query, required: true, schema: { type: string, format: date-time } }
-        - { name: to, in: query, required: true, schema: { type: string, format: date-time } }
+        - { name: from, in: query, schema: { type: string, format: date-time, description: "绝对窗口下界（含，RFC3339）。窗口两形态**恰择一**（from+to，或 window 单独）：与 window 同给 / 只给一端 / 都不给 → 400 `reason=window_ambiguous`。给出 from/to 时不做时区改写；服务端按判定把两端向后取整到整点（生效窗口见响应头 X-Stats-Effective-From/To）" } }
+        - { name: to, in: query, schema: { type: string, format: date-time, description: "绝对窗口上界（不含，RFC3339）。与 from 同生共死：只给一端 → 400 `reason=window_ambiguous`；from 不早于 to → 400 `reason=window_invalid`" } }
+        - $ref: '#/components/parameters/StatsWindow'
         - { name: granularity, in: query, required: true, schema: { type: string, enum: [hour, day] } }
         - { name: model, in: query, schema: { type: string } }
         - $ref: '#/components/parameters/StatsTimezone'
       responses:
         '200':
-          description: 实体趋势点数组
+          description: 实体趋势点数组（生效窗口与实际存储见响应头 X-Stats-*）
+          headers:
+            X-Stats-Effective-From: { $ref: '#/components/headers/StatsEffectiveFrom' }
+            X-Stats-Effective-To: { $ref: '#/components/headers/StatsEffectiveTo' }
+            X-Stats-Storage: { $ref: '#/components/headers/StatsStorage' }
           content:
             application/json:
               schema:
@@ -1600,8 +1683,9 @@ paths:
       tags: [stats]
       summary: TTFT 聚合（sketch 或 exact）
       parameters:
-        - { name: from, in: query, required: true, schema: { type: string, format: date-time } }
-        - { name: to, in: query, required: true, schema: { type: string, format: date-time } }
+        - { name: from, in: query, schema: { type: string, format: date-time, description: "绝对窗口下界（含，RFC3339）。窗口两形态**恰择一**（from+to，或 window 单独）：与 window 同给 / 只给一端 / 都不给 → 400 `reason=window_ambiguous`。给出 from/to 时不做时区改写；服务端按判定把两端向后取整到整点（生效窗口见响应头 X-Stats-Effective-From/To）" } }
+        - { name: to, in: query, schema: { type: string, format: date-time, description: "绝对窗口上界（不含，RFC3339）。与 from 同生共死：只给一端 → 400 `reason=window_ambiguous`；from 不早于 to → 400 `reason=window_invalid`" } }
+        - $ref: '#/components/parameters/StatsWindow'
         - { name: entity, in: query, schema: { type: string, enum: [account, user, key] } }
         - { name: id, in: query, schema: { type: integer, format: int64 } }
         - { name: model, in: query, schema: { type: string } }
@@ -1612,6 +1696,137 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/StatTTFTSummary' }
+        default:
+          $ref: '#/components/responses/Error'
+  /stats/capabilities:
+    get:
+      operationId: GetStatsCapabilities
+      tags: [stats]
+      summary: 统计能力（本部署能查多久——per-deployment 常量）
+      description: |
+        无参数、只读，可按部署缓存。返回本部署的统计查询能力：每个读形状
+        （kind）的候选存储、成本上限秒数（cost_cap_seconds）与覆盖天数
+        （coverage_days）。**零硬编码**——它是服务端 KIND 矩阵与保留期配置的
+        机械投影，故与真实判定不会漂移。
+
+        语义：`cost_cap_seconds = 0` 表示无上限（keyset 分页读路径）；
+        `coverage_days = 0` 表示该表未启用分区保留（覆盖守卫关闭，即无覆盖
+        下限）。成本上限是**保留期无关的纯常量**（扫 10 天日志的成本与保留了
+        多少天日志无关），覆盖天数取自实际要读的表（读多表取最保守者），故两者
+        互相独立：保留期调短只动 coverage_days，不动 cost_cap_seconds。
+
+        本端点只报告**按部署恒定**的事实，**不报告"这个时区能否用 cube"**：
+        后者是逐请求判定（依赖窗口位置），由 400 响应的机读字段
+        （reason/storage/limit_seconds/effective_from/effective_to/retention_days）
+        与 200 响应的 X-Stats-* 回显头承担——不把逐请求事实伪装成部署常量。
+      responses:
+        '200':
+          description: 能力投影（kinds 键 = 读形状标识）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatsCapabilities' }
+        default:
+          $ref: '#/components/responses/Error'
+  # ---- intelligent-routing 观测面：单分片事实表聚合 + 当前发布计划投影，
+  # 数据源钉死 routing_flow_fact（flow/frontier）与 routing_quality_fact（质量窗）
+  # 两张事实表及 scheduler 当前视图——绝不查 raw logs、
+  # 绝不按历史 generation 查询（plan/flow/frontier 一律对齐当前发布计划目录）。
+  /routing/flow:
+    get:
+      operationId: GetRoutingFlow
+      tags: [routing]
+      summary: 路由 flow 聚合（完整链边；按 terminal_at 归属窗口）
+      description: |
+        结构 RouteClass → (ordinal, lane) → Account → Outcome；retry 边指向
+        下一 ordinal，terminal 边即该链 Final。守恒：完整链才入 rollup，故
+        first_dispatch_chains（ordinal=1）恒等于 terminal_chains。三个丢失
+        计数是独立观测口径（本进程 quality 观测面），不得混为上游失败：
+        incomplete_chain_dropped = 本进程已观察 cleanup 缺 terminal；
+        flow_overflow_dropped_chains = 故障预算淘汰链；
+        process_crash_loss_unobservable 恒 true（硬崩缺口不可量化）。
+        窗口跨度上限 90 天（精确，超限 400）。
+        lanes 只是完整边集的**一页**（offset/limit 切片，仍按 (ordinal,lane)
+        分组）；守恒计数与 total_edges/stale_generation_present 恒在**完整边集**上聚合，不受分页影响。
+        旧代际信号是**精确布尔** stale_generation_present（窗口内存在
+        min_generation != plan_generation 的边行），不再是链次占比：合并层一行
+        聚合多代际的链，链次加权谓词只能给出上界（"当前代际"是移动靶，无法预存）。
+        sankey 是给图形用的有界边集：每 (ordinal,lane) 层按 chain_count 保留
+        top-N 账号（accounts），其余折叠进「其他」节点——层内 chain_count 求和
+        守恒，故图形不会因折叠而失真。分页与折叠是两件独立的事：表格翻页不
+        改变 sankey，sankey 也不随翻页变化。
+      parameters:
+        - { name: route, in: query, required: true, schema: { type: string, description: 64-hex 路由类 ID（须在当前发布计划目录内；非法 hex → 400，未知 → 404） } }
+        - { name: from, in: query, required: true, schema: { type: string, format: date-time } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date-time } }
+        - { name: offset, in: query, schema: { type: integer, default: 0, minimum: 0, description: 边表分页偏移（缺省/≤0 → 0） } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, minimum: 0, maximum: 200, description: 边表每页条数（缺省/≤0 → 20；>200 钳到 200，不报错） } }
+        - { name: accounts, in: query, schema: { type: integer, default: 20, minimum: 0, maximum: 200, description: 桑基每层保留账号数（缺省/≤0 → 20；>200 钳到 200）——其余账号折叠为 account_id=0 的「其他」节点，层内 chain_count 求和守恒 } }
+      responses:
+        '200':
+          description: flow 聚合（lanes 边分组 + 守恒计数 + 丢失三口径）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoutingFlowResponse' }
+        default:
+          $ref: '#/components/responses/Error'
+  /routing/frontier:
+    get:
+      operationId: GetRoutingFrontier
+      tags: [routing]
+      summary: 质量-成本前沿（rollup 质量 × 当前计划候选目录连接）
+      description: |
+        候选按窗口聚合：Wilson95 成功区间 + TTFT 区间 + 输入侧单位采购价
+        （与 compiler 同数学核，毫分/1M 输入侧 token）。Pareto 支配只在 known 且 cost_known 候选间
+        扫描；unknown/成本不可知/样本不足者如实呈现但不上前沿。输出确定性
+        排序（前沿 → success_lcb 降序 → 成本升序 → 指纹升序）**先排序再切片**，
+        故 offset/limit 分页不改变前沿判定；total_candidates 为排序后总条数。
+        窗口跨度上限 90 天（精确，超限 400）。
+      parameters:
+        - { name: route, in: query, required: true, schema: { type: string, description: 64-hex 路由类 ID（非法 hex → 400，未知 → 404） } }
+        - { name: from, in: query, required: true, schema: { type: string, format: date-time } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date-time } }
+        - { name: offset, in: query, schema: { type: integer, default: 0, minimum: 0, description: 候选分页偏移（缺省/≤0 → 0） } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, minimum: 0, maximum: 200, description: 候选每页条数（缺省/≤0 → 20；>200 钳到 200，不报错） } }
+      responses:
+        '200':
+          description: 前沿候选列表（已排序 + 钳制；空为 []）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoutingFrontierResponse' }
+        default:
+          $ref: '#/components/responses/Error'
+  /routing/plan:
+    get:
+      operationId: GetRoutingPlan
+      tags: [routing]
+      summary: 当前发布路由计划解释（只读投影，无历史 generation 参数）
+      description: |
+        当前发布 RoutingView 的防御性投影：generation + 全身份确定性路由序
+        （与发布字节守卫同序）+ primary/explore/degraded 候选发布序（序是
+        语义，不重排）+ explore 权重/累积表 + 候选静态身份。空视图 =
+        generation 0 空计划（routes 为 []），不是错误。
+        search/offset/limit 作用于**路由**列表（先过滤后切片）；route 给定则
+        只返回该条路由（供单路由取候选页）。candidates_offset/candidates_limit
+        作用于**每个返回路由**的候选目录；candidates_limit=0 = 不返回候选，
+        供路由选择器取轻量列表（避免 limit × candidates_limit 的无谓放大）。
+        observed_from/observed_to 成对给出时，routes 只保留半开窗口 [from,to)
+        内 routing_flow_fact 有记录的路由（窗口 ≤ 90d 且不早于观测保留 cutoff，
+        否则 400；只给一端 → 400）；route 给定时绕过窗口过滤，只按目录返回该条。
+      parameters:
+        - { name: search, in: query, schema: { type: string, description: 路由标签模糊匹配（model/format/operation_tag/group_id 子串，大小写不敏感）；空 = 不过滤 } }
+        - { name: route, in: query, schema: { type: string, description: 64-hex 路由类 ID；给定则只返回该路由（非法 hex → 400，未知 → 404） } }
+        - { name: observed_from, in: query, schema: { type: string, format: date-time, description: 观测窗口起点（RFC3339）；与 observed_to 成对给出，单独给出 → 400；给出时 routes 只保留窗口内 routing_flow_fact 有记录的路由 } }
+        - { name: observed_to, in: query, schema: { type: string, format: date-time, description: 观测窗口终点（RFC3339；起点（含）到终点（不含）的半开区间）；与 observed_from 成对给出 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0, minimum: 0, description: 路由分页偏移（缺省/≤0 → 0；在 search 过滤后的列表上切片） } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, minimum: 0, maximum: 200, description: 路由每页条数（缺省/≤0 → 20；>200 钳到 200，不报错） } }
+        - { name: candidates_offset, in: query, schema: { type: integer, default: 0, minimum: 0, description: 候选分页偏移（每个返回路由各自切片） } }
+        - { name: candidates_limit, in: query, schema: { type: integer, default: 20, minimum: 0, maximum: 200, description: 候选每页条数（0 = 不返回候选；>200 钳到 200） } }
+      responses:
+        '200':
+          description: 当前发布计划快照（routes 为过滤 + 切片后的一页）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoutingPlanResponse' }
         default:
           $ref: '#/components/responses/Error'
   # 管理端总览（spec 2026-08-14，用户裁决）：聚合面与实时面拆两个端点——
@@ -1680,21 +1895,732 @@ paths:
               schema: { $ref: '#/components/schemas/WorkersResponse' }
         default:
           $ref: '#/components/responses/Error'
+  /api/user/supplier/overview:
+    get:
+      operationId: GetSupplierOverview
+      tags: [supplier]
+      summary: 供应商收益概览（可提领/冻结/累计/生效分成率与冻结小时/最晚解冻时刻/桶行数）
+      responses:
+        '200':
+          description: 供应商收益概览
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierOverview' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/supplier/earnings:
+    get:
+      operationId: GetSupplierEarnings
+      tags: [supplier]
+      summary: 区间收益明细（分页；走报表索引 ②，窗口 = 保留期）
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 200 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: 收益明细列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierEarningList' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/supplier/chunks:
+    get:
+      operationId: GetSupplierChunks
+      tags: [supplier]
+      summary: 冻结中明细（未解冻桶）
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 200 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: 冻结桶列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierChunkList' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/supplier/settlements:
+    get:
+      operationId: GetSupplierSettlements
+      tags: [supplier]
+      summary: 我的结算单（分页）
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 200 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: 结算单列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierSettlementList' }
+        default:
+          $ref: '#/components/responses/Error'
+    post:
+      operationId: PostSupplierSettlement
+      tags: [supplier]
+      summary: 申请结算（条件扣 available + 期间链 + request_key 幂等）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApplySettlementBody' }
+      responses:
+        '200':
+          description: 创建的结算单
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierSettlement' }
+        default:
+          $ref: '#/components/responses/Error'
+  # ---- 供应商面账号/分组/模板子集（spec 2026-10-09 §2.5/§6.1；tag supplier）----
+  #
+  # 与既有 /api/admin 路径**同 schema、同参数**（一律 $ref 复用，零平行字段清单）：
+  # 运行时由 supplier 包生成的 wrapper 解析参数后**转发**到管理面 wrapper（同一批
+  # AdminAPI handler；字段层零差异化）。**tag 即边界**——只有本 tag 的 op 进
+  # supplier 包，default-deny 由「未登记 ⇒ 未注册 ⇒ 404」结构性保证（无手写允许清单）。
+  # 组写面/assignments、模板写面、users/settings/pricing/rules/ops/mail 等**不登记**。
+  /api/user/supplier/accounts:
+    get:
+      operationId: GetSupplierAccounts
+      tags: [supplier]
+      summary: 账号列表（分页/筛选/排序，含运行时视图；作用域 = JWT 归属）
+      parameters:
+        - $ref: '#/components/parameters/ListLimit'
+        - $ref: '#/components/parameters/ListOffset'
+        - $ref: '#/components/parameters/ListName'
+        - $ref: '#/components/parameters/ListSort'
+        - $ref: '#/components/parameters/ListOrder'
+        - $ref: '#/components/parameters/AccountTemplateId'
+        - $ref: '#/components/parameters/AccountEnabled'
+      responses:
+        '200':
+          description: 账号视图列表（仅本人归属）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountListResponse' }
+        default:
+          $ref: '#/components/responses/Error'
+    post:
+      operationId: PostSupplierAccounts
+      tags: [supplier]
+      summary: 创建账号（归属恒为 JWT 本人；携带他人 supplier_user_id ⇒ 400）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountCreate' }
+      responses:
+        '200':
+          description: 创建后的账号
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/supplier/accounts/usage:
+    get:
+      operationId: GetSupplierAccountsUsage
+      tags: [supplier]
+      summary: 账号用量聚合（统一 usage API——批量 ≤100 条；窗口 from/to 或 window 恰择一）
+      parameters:
+        - { name: account_ids, in: query, required: true, schema: { type: string, description: "逗号分隔账号 id（1-100 条；重复 id 自动去重——响应 item 唯一；空/非数字/超限 → 400；任一 id 越域 → 404）" } }
+        - $ref: '#/components/parameters/StatsFrom'
+        - $ref: '#/components/parameters/StatsTo'
+        - $ref: '#/components/parameters/StatsWindow'
+        - $ref: '#/components/parameters/StatsTimezone'
+      responses:
+        '200':
+          description: 账号 usage items（恒 = account_ids 去重后全量——无记录账号 gateway 全 0）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountsUsageResponse' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/supplier/accounts/batch-update:
+    post:
+      operationId: PostSupplierAccountsBatchUpdate
+      tags: [supplier]
+      summary: 批量更新账号（fields 为任意字段子集；字段层与管理面零差异化）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BatchUpdateAccountsBody' }
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountBatchUpdateResponse' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/supplier/accounts/batch-delete:
+    post:
+      operationId: PostSupplierAccountsBatchDelete
+      tags: [supplier]
+      summary: 批量删除账号（事务，全成或全败；任一 id 越域 ⇒ 整事务失败）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BatchDeleteBody' }
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BatchDeleteResponse' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/supplier/accounts/batch-import-codex-oauth:
+    post:
+      operationId: PostSupplierAccountsBatchImportCodexOauth
+      tags: [supplier]
+      summary: 批量导入 codex-oauth 凭据（幂等组合键 codex_email + codex_account_id；行级失败不毁整批）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CodexOAuthImportBody' }
+      responses:
+        '200':
+          description: 导入结果（imported 新建 / updated 键存在更新凭据 / failed 行级 index+error——有失败行也 200）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportResult' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/supplier/accounts/batch-import-codex-pat:
+    post:
+      operationId: PostSupplierAccountsBatchImportCodexPat
+      tags: [supplier]
+      summary: 批量导入 codex-pat 凭据（幂等组合键 codex_email + codex_account_id；行级失败不毁整批）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CodexPATImportBody' }
+      responses:
+        '200':
+          description: 导入结果（imported 新建 / updated 键存在更新凭据 / failed 行级 index+error——有失败行也 200）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportResult' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/supplier/accounts/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+    get:
+      operationId: GetSupplierAccountsId
+      tags: [supplier]
+      summary: 账号（越域 id ⇒ 404，不泄漏存在性）
+      responses:
+        '200':
+          description: 账号
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        default:
+          $ref: '#/components/responses/Error'
+    patch:
+      operationId: PatchSupplierAccountsId
+      tags: [supplier]
+      summary: 部分更新账号（三态语义与管理面一致：缺省=不变；可空标量 null=清空、""=400；不可空标量 null=400；有值=落值）
+      description: >-
+        复用管理面账号写面唯一更新入口（同一 AccountConfigPatch/validateAccountPatch/
+        accountFieldSpecs——**无供应商专属字段清单**）。前置条件 If-Match 可选：缺席 =
+        不做检查；命中 = 生效；陈旧 → 412；语法非法 → 400。
+      parameters:
+        - { name: If-Match, in: header, required: false, schema: { type: string, description: "可选乐观锁前置条件：\"<lifecycle_revision>\"（可带引号）。不支持 W/、多值与 *（→ 400）；陈旧 → 412" } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountConfigPatch' }
+      responses:
+        '200':
+          description: 更新后账号（含新 lifecycle_revision）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        '412':
+          description: If-Match 陈旧（当前 lifecycle_revision 与前置条件不符）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        default:
+          $ref: '#/components/responses/Error'
+    delete:
+      operationId: DeleteSupplierAccountsId
+      tags: [supplier]
+      summary: 删除账号（越域 id ⇒ 404）
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletedResponse' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/supplier/accounts/{id}/ext:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+    get:
+      operationId: GetSupplierAccountsIdExt
+      tags: [supplier]
+      summary: 读取账号类型化鉴权扩展（仅 codex-oauth/codex-pat 账号有 ext 行）
+      responses:
+        '200':
+          description: 账号 ext 配置
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountExt' }
+        default:
+          $ref: '#/components/responses/Error'
+    put:
+      operationId: PutSupplierAccountsIdExt
+      tags: [supplier]
+      summary: 幂等写入账号类型化鉴权扩展（Create/Update 合一；全列更新含 NULL 清空）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountExt' }
+      responses:
+        '200':
+          description: 写入后的 ext 配置
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountExt' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/supplier/accounts/{id}/groups:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+    get:
+      operationId: GetSupplierAccountsIdGroups
+      tags: [supplier]
+      summary: 读取账号的全部分组 id（编辑回显；不随账号列表返回）
+      responses:
+        '200':
+          description: 分组 id 列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountGroupsResponse' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/supplier/accounts/{id}/recover:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+    post:
+      operationId: PostSupplierAccountsIdRecover
+      tags: [supplier]
+      summary: 失效恢复（fenced）：清 failed_at/last_error/failure_source + revision CAS +1 → 新代际置 PROBING 待探针
+      description: |
+        复用管理面恢复入口：CAS expected_revision 命中才清失效三字段并 +1，随后对新
+        revision 写通配 PROBING（探针环接管）。expected_revision 过期 → 409；本端点
+        不启用被禁用的账号（enabled 独立，经 PATCH /api/user/supplier/accounts/{id} 修改）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountRecoverBody' }
+      responses:
+        '200':
+          description: 恢复后的账号（含新 LifecycleRevision）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        default:
+          $ref: '#/components/responses/Error'
+  # groups GET 只读候选列表（账号页「选择分组」依赖）；组写面/assignments **不登记**。
+  /api/user/supplier/groups:
+    get:
+      operationId: GetSupplierGroups
+      tags: [supplier]
+      summary: 分组候选列表（分页/筛选/排序；只读——组写面不在供应商面）
+      parameters:
+        - $ref: '#/components/parameters/ListLimit'
+        - $ref: '#/components/parameters/ListOffset'
+        - $ref: '#/components/parameters/ListName'
+        - $ref: '#/components/parameters/ListSort'
+        - $ref: '#/components/parameters/ListOrder'
+      responses:
+        '200':
+          description: 分组列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupListResponse' }
+        default:
+          $ref: '#/components/responses/Error'
+  # templates GET 只读（提交账号需选模板）；模板写面 **不登记**。
+  /api/user/supplier/templates:
+    get:
+      operationId: GetSupplierTemplates
+      tags: [supplier]
+      summary: 模板列表（分页/筛选/排序；只读——模板写面不在供应商面）
+      parameters:
+        - $ref: '#/components/parameters/ListLimit'
+        - $ref: '#/components/parameters/ListOffset'
+        - $ref: '#/components/parameters/ListName'
+        - $ref: '#/components/parameters/ListSort'
+        - $ref: '#/components/parameters/ListOrder'
+      responses:
+        '200':
+          description: 模板列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TemplateListResponse' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/supplier/templates/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+    get:
+      operationId: GetSupplierTemplatesId
+      tags: [supplier]
+      summary: 模板（只读）
+      responses:
+        '200':
+          description: 模板
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Template' }
+        default:
+          $ref: '#/components/responses/Error'
+  # ---- 管理面结算审批（spec 2026-10-09 §6.3；tag admin-supplier）----
+  # 资金命令（approve/reject/claim/paid/confirm-failed/admin-request）一律要求具名
+  # 操作者（I5）：platform_admin JWT 或管理 key 注入 uid + token_version；身份缺失
+  # ⇒ 403；写事务内复核 status/role/token_version。
+  /supplier/settlements:
+    get:
+      operationId: GetAdminSupplierSettlements
+      tags: [admin-supplier]
+      summary: 结算单列表（按 status / kind 过滤；pending 是工作台）
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [pending, approved, paying, paid, rejected] } }
+        - { name: kind, in: query, schema: { type: string, enum: [supplier_request, admin_request] } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 200 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: 结算单列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierSettlementList' }
+        default:
+          $ref: '#/components/responses/Error'
+  /supplier/settlements/{id}/approve:
+    post:
+      operationId: PostAdminSupplierSettlementsIdApprove
+      tags: [admin-supplier]
+      summary: pending → approved（CAS）
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer, format: int64 } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SettlementTransitionBody' }
+      responses:
+        '200':
+          description: 更新后的结算单
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierSettlement' }
+        default:
+          $ref: '#/components/responses/Error'
+  /supplier/settlements/{id}/reject:
+    post:
+      operationId: PostAdminSupplierSettlementsIdReject
+      tags: [admin-supplier]
+      summary: pending|approved → rejected（退还 available；paying 不可 reject）
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer, format: int64 } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SettlementRejectBody' }
+      responses:
+        '200':
+          description: 更新后的结算单
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierSettlement' }
+        default:
+          $ref: '#/components/responses/Error'
+  /supplier/settlements/{id}/claim:
+    post:
+      operationId: PostAdminSupplierSettlementsIdClaim
+      tags: [admin-supplier]
+      summary: approved → paying（认领 CAS；付款风控门 + 固定收款快照 + payment_key）
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer, format: int64 } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SettlementClaimBody' }
+      responses:
+        '200':
+          description: 更新后的结算单
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierSettlement' }
+        default:
+          $ref: '#/components/responses/Error'
+  /supplier/settlements/{id}/confirm-failed:
+    post:
+      operationId: PostAdminSupplierSettlementsIdConfirmFailed
+      tags: [admin-supplier]
+      summary: paying → approved（仅接受「确定未支付」的核验结果；留证）
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer, format: int64 } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SettlementConfirmFailedBody' }
+      responses:
+        '200':
+          description: 更新后的结算单
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierSettlement' }
+        default:
+          $ref: '#/components/responses/Error'
+  /supplier/settlements/{id}/paid:
+    post:
+      operationId: PostAdminSupplierSettlementsIdPaid
+      tags: [admin-supplier]
+      summary: 仅 paying → paid（lifetime_paid 累加；不重做风控门）
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer, format: int64 } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SettlementPaidBody' }
+      responses:
+        '200':
+          description: 更新后的结算单
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierSettlement' }
+        default:
+          $ref: '#/components/responses/Error'
+  /supplier/settlements/admin-request:
+    post:
+      operationId: PostAdminSupplierSettlementsAdminRequest
+      tags: [admin-supplier]
+      summary: 代申请（kind=admin_request；复用同一通道，目标须已有余额行）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminRequestSettlementBody' }
+      responses:
+        '200':
+          description: 创建的结算单
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierSettlement' }
+        default:
+          $ref: '#/components/responses/Error'
+  /supplier/balances:
+    get:
+      operationId: GetAdminSupplierBalances
+      tags: [admin-supplier]
+      summary: 余额列表（含最晚 available_at / bucket_rows）
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 200 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: 余额列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierBalanceList' }
+        default:
+          $ref: '#/components/responses/Error'
+  /supplier/balances/{uid}:
+    patch:
+      operationId: PatchAdminSupplierBalancesUid
+      tags: [admin-supplier]
+      summary: 仅 share_bp / freeze_hours（不接受金额）
+      parameters: [{ name: uid, in: path, required: true, schema: { type: integer, format: int64 } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SupplierBalancePatchBody' }
+      responses:
+        '200':
+          description: 更新后的余额行
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierBalance' }
+        default:
+          $ref: '#/components/responses/Error'
+  # ---- 管理 API key（mk-，spec 2026-10-09）----
+  # user 面：owner = JWT/管理 key 的 owner 身份；可作用于 /api/user/*。
+  /api/user/management-keys:
+    get:
+      operationId: GetUserManagementKeys
+      tags: [user]
+      summary: 我的管理 key 列表（软删过滤；含明文 mk-，与客户端 key 一致）
+      responses:
+        '200':
+          description: 管理 key 列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ManagementKeyListResponse' }
+        default:
+          $ref: '#/components/responses/Error'
+    post:
+      operationId: PostUserManagementKeys
+      tags: [user]
+      summary: 创建管理 key（以自身身份鉴权管理面；返回明文 mk-）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ManagementKeyCreate' }
+      responses:
+        '200':
+          description: 创建后的管理 key（含明文）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ManagementKey' }
+        default:
+          $ref: '#/components/responses/Error'
+  /api/user/management-keys/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+    put:
+      operationId: PutUserManagementKeysId
+      tags: [user]
+      summary: 更新管理 key（name/status；仅本人；disabled 即时 401 可再启用）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ManagementKeyUpdate' }
+      responses:
+        '200':
+          description: 更新后的管理 key
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ManagementKey' }
+        default:
+          $ref: '#/components/responses/Error'
+    delete:
+      operationId: DeleteUserManagementKeysId
+      tags: [user]
+      summary: 删除管理 key（仅本人；软删 + 本实例快照即时移除）
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletedResponse' }
+        default:
+          $ref: '#/components/responses/Error'
 components:
   parameters:
+    # ---- 列表分页/筛选/排序（管理面与供应商面**共用一份**，两处 $ref）----
+    ListLimit:
+      name: limit
+      in: query
+      required: false
+      description: 每页条数（上限 200，超限裁剪到 200）
+      schema: { type: integer, default: 20, maximum: 200 }
+    ListOffset:
+      name: offset
+      in: query
+      required: false
+      schema: { type: integer, default: 0 }
+    ListName:
+      name: name
+      in: query
+      required: false
+      schema: { type: string }
+    ListSort:
+      name: sort
+      in: query
+      required: false
+      schema: { type: string }
+    ListOrder:
+      name: order
+      in: query
+      required: false
+      schema: { type: string, enum: [asc, desc] }
+    AccountTemplateId:
+      name: template_id
+      in: query
+      required: false
+      schema: { type: integer, format: int64 }
+    AccountEnabled:
+      name: enabled
+      in: query
+      required: false
+      description: "管理面启停过滤：true = 仅启用，false = 仅禁用；缺省 = 不过滤（与运行时失效 failed_at 无关）"
+      schema: { type: boolean }
+    # ---- 绝对窗口两端（usage/统计共用）----
+    StatsFrom:
+      name: from
+      in: query
+      required: false
+      description: "绝对窗口下界（含，RFC3339）。窗口两形态**恰择一**（from+to，或 window 单独）：与 window 同给 / 只给一端 / 都不给 → 400 `reason=window_ambiguous`。给出 from/to 时不做时区改写；服务端按判定把两端向后取整到整点（生效窗口见响应头 X-Stats-Effective-From/To）"
+      schema: { type: string, format: date-time }
+    StatsTo:
+      name: to
+      in: query
+      required: false
+      description: "绝对窗口上界（不含，RFC3339）。与 from 同生共死：只给一端 → 400 `reason=window_ambiguous`；from 不早于 to → 400 `reason=window_invalid`"
+      schema: { type: string, format: date-time }
+    StatsWindow:
+      name: window
+      in: query
+      required: false
+      description: |
+        相对窗口（时长串，Go `time.ParseDuration` 形态，如 `24h`/`168h`/`2160h`）。
+        给出它时**必须**省略 `from`/`to`（同时给出 → 400 `reason=window_ambiguous`）。
+        服务端自持时钟：`to` = 当前时刻向上取整到 UTC 整点、`from` = `to` − `window`
+        ⇒ 两端恒整点，命中卷积表的精确分支（零对齐位移、零桶丢失），这就是 UI 预设
+        走这条形态的理由。
+
+        **只收时长，不收日历天**：`d` 不是 `time.ParseDuration` 的单位，`7d` → 400
+        （`reason=window_invalid`）。理由：`24h` 与"一个日历天"在 DST 切换日不相等，
+        而本 API 的唯一对齐基准是固定 1h 网格；另立 `AddDate` 日历语义会引入第二套
+        窗口长度语义。预设即网格整倍数：24h / 168h / 720h / 2160h。
+      schema: { type: string }
     StatsTimezone:
       name: timezone
       in: query
       required: false
       description: |
         IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-        仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-        其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-        等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-        客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-        （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-        窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+        仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+        绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+        但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+        「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+
+        窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+        卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+        取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+        分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+        8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+        截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
       schema: { type: string }
+  headers:
+    StatsEffectiveFrom:
+      description: 本次读取真正使用的窗口下界（RFC3339，UTC）
+      schema: { type: string, format: date-time }
+    StatsEffectiveTo:
+      description: 本次读取真正使用的窗口上界（RFC3339，UTC，半开区间）
+      schema: { type: string, format: date-time }
+    StatsStorage:
+      description: 本次读取实际使用的存储（cube = 预聚合卷积表；raw = 原始明细行）
+      schema: { type: string, enum: [cube, raw] }
   responses:
     Error:
       description: 错误响应
@@ -1702,11 +2628,260 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
   schemas:
+    SupplierOverview:
+      type: object
+      required: [available, frozen_amount, lifetime_credited, lifetime_paid, share_bp, freeze_hours, bucket_rows]
+      properties:
+        available: { type: integer, format: int64, description: 可提领（结算申请条件扣） }
+        frozen_amount: { type: integer, format: int64, description: Σ 未解冻桶 amount }
+        lifetime_credited: { type: integer, format: int64, description: 累计已入账（只增，永久） }
+        lifetime_paid: { type: integer, format: int64, description: 累计已付（只增，永久） }
+        share_bp: { type: integer, description: 生效分成率（bp；10000 = 100%） }
+        freeze_hours: { type: integer, description: 生效冻结小时（0 = 不冻结） }
+        latest_available_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 在途桶最晚解冻时刻（无桶 = null；运维可见性 §2.4）
+        bucket_rows: { type: integer, format: int64, description: 未解冻桶行数 }
+    SupplierChunk:
+      type: object
+      required: [available_at, amount]
+      properties:
+        available_at: { type: string, format: date-time }
+        amount: { type: integer, format: int64 }
+    SupplierChunkList:
+      type: object
+      required: [items, total]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/SupplierChunk' } }
+        total: { type: integer, format: int64 }
+    SupplierEarning:
+      type: object
+      required: [created_at, cost, earn_millis]
+      properties:
+        created_at: { type: string, format: date-time }
+        cost: { type: integer, format: int64, description: 计价额（毫分） }
+        earn_millis: { type: integer, format: int64, description: 收益额（毫分） }
+        model: { type: string }
+    SupplierEarningList:
+      type: object
+      required: [items, total]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/SupplierEarning' } }
+        total: { type: integer, format: int64 }
+    SupplierSettlement:
+      type: object
+      required: [id, supplier_user_id, kind, amount_millis, period_start, period_end, status, revision, request_key, requested_at, requested_operator]
+      properties:
+        id: { type: integer, format: int64 }
+        supplier_user_id: { type: integer, format: int64 }
+        kind: { type: string, enum: [supplier_request, admin_request] }
+        amount_millis: { type: integer, format: int64 }
+        period_start: { type: string, format: date-time }
+        period_end: { type: string, format: date-time }
+        status: { type: string, enum: [pending, approved, paying, paid, rejected] }
+        revision: { type: integer, format: int64 }
+        request_key: { type: string }
+        requested_at: { type: string, format: date-time }
+        requested_operator: { type: integer, format: int64 }
+        reviewed_at: { type: string, format: date-time, nullable: true }
+        reviewer_user_id: { type: integer, format: int64, nullable: true }
+        payout_operator_user_id: { type: integer, format: int64, nullable: true }
+        payout_started_at: { type: string, format: date-time, nullable: true }
+        external_ref: { type: string, nullable: true }
+        paid_at: { type: string, format: date-time, nullable: true }
+        paid_operator_user_id: { type: integer, format: int64, nullable: true }
+        payout_failure_reason: { type: string, nullable: true }
+        payout_failed_at: { type: string, format: date-time, nullable: true }
+        payment_key: { type: string, nullable: true, description: 首次 claim 生成、全局唯一、永久固定的付款键（重试/恢复复用不换键） }
+        payee_snapshot: { type: string, nullable: true, description: 固定收款目标快照（结构化 JSON） }
+        risk_review: { type: string, nullable: true, description: 风险核对记录（结构化 JSON） }
+        note: { type: string, nullable: true }
+        reject_reason: { type: string, nullable: true }
+    SupplierSettlementList:
+      type: object
+      required: [items, total]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/SupplierSettlement' } }
+        total: { type: integer, format: int64 }
+    ApplySettlementBody:
+      type: object
+      required: [amount_millis, request_key]
+      properties:
+        amount_millis: { type: integer, format: int64, description: 申请金额（> 0；受 available 条件扣约束） }
+        request_key: { type: string, description: 业务幂等键（客户端生成、重试复用；作用域 = 操作者 × key） }
+        note: { type: string }
+    # ---- 管理面结算审批请求/响应（spec 2026-10-09 §6.3/§6.5）----
+    SettlementTransitionBody:
+      type: object
+      required: [expected_revision]
+      description: 状态迁移 CAS 令牌（陈旧 ⇒ 409；缺席 ⇒ 400）
+      properties:
+        expected_revision: { type: integer, format: int64, x-go-name: SettlementRev }
+    SettlementRejectBody:
+      type: object
+      required: [expected_revision]
+      properties:
+        expected_revision: { type: integer, format: int64, x-go-name: SettlementRev }
+        reason: { type: string, nullable: true }
+    SettlementClaimBody:
+      type: object
+      required: [expected_revision, amount_millis, payee_snapshot, risk_evidence]
+      description: 认领付款；金额必须等于单据金额 + 结构化收款目标快照固定 + 风险核对证据（服务端派生 operator_id/decided_at/expires_at）
+      properties:
+        expected_revision: { type: integer, format: int64, x-go-name: SettlementRev }
+        amount_millis: { type: integer, format: int64, description: 认领金额，必须 == 单据 amount_millis（不符 ⇒ 400） }
+        payee_snapshot: { $ref: '#/components/schemas/SettlementPayeeSnapshot' }
+        risk_evidence: { $ref: '#/components/schemas/SettlementRiskEvidence' }
+    SettlementPayeeSnapshot:
+      type: object
+      required: [payee_name, account, unit]
+      description: 收款目标快照（结构化；副作用前固定、重试复用、不一致拒绝）
+      properties:
+        payee_name: { type: string, description: 收款人/开户名 }
+        account: { type: string, description: 收款账号 }
+        unit: { type: string, description: 金额单位/币种 }
+    SettlementRiskEvidence:
+      type: object
+      required: [reference, summary, approved_revision]
+      description: 风险核对证据（结构化；reference/摘要非空 + 绑定 approved revision；服务端派生 operator_id/decided_at/scope/decision/expires_at）
+      properties:
+        reference: { type: string, description: 证据 reference（非空） }
+        summary: { type: string, description: 核对摘要（非空） }
+        approved_revision: { type: integer, format: int64, description: 必须 == expected_revision（锁内当前 approved revision） }
+    SettlementConfirmFailedBody:
+      type: object
+      required: [expected_revision, reason, confirmed_not_paid, evidence, old_execution_stopped]
+      description: paying→approved；仅接受结构化「确定未支付」+「旧执行已停止」核验（未知 ⇒ 失败闭合保留 paying）
+      properties:
+        expected_revision: { type: integer, format: int64, x-go-name: SettlementRev }
+        reason: { type: string, description: 确定未支付的原因（网络失败不算） }
+        confirmed_not_paid: { type: boolean, description: 渠道/人工已核验「确定未支付」 }
+        evidence: { type: string, description: 核验证据 reference（非空） }
+        old_execution_stopped: { type: boolean, description: 已确认旧外部执行已停止（回收/等待/具名确认） }
+    SettlementPaidBody:
+      type: object
+      required: [expected_revision, external_ref]
+      description: 仅 paying→paid；必须提供非空银行/渠道回单号（未核验不得确认）
+      properties:
+        expected_revision: { type: integer, format: int64, x-go-name: SettlementRev }
+        external_ref: { type: string, description: 银行/渠道回单号（非空） }
+    AdminRequestSettlementBody:
+      type: object
+      required: [supplier_user_id, amount_millis, request_key]
+      properties:
+        supplier_user_id: { type: integer, format: int64, description: 目标供应商（须已有余额行，否则 404） }
+        amount_millis: { type: integer, format: int64, description: 金额（> 0） }
+        request_key: { type: string, description: 业务幂等键 }
+        note: { type: string }
+    SupplierBalance:
+      type: object
+      required: [supplier_user_id, available, lifetime_credited, lifetime_paid, bucket_rows]
+      properties:
+        supplier_user_id: { type: integer, format: int64 }
+        available: { type: integer, format: int64 }
+        lifetime_credited: { type: integer, format: int64 }
+        lifetime_paid: { type: integer, format: int64 }
+        share_bp: { type: integer, nullable: true }
+        freeze_hours: { type: integer, nullable: true }
+        latest_available_at: { type: string, format: date-time, nullable: true }
+        bucket_rows: { type: integer, format: int64 }
+    SupplierBalanceList:
+      type: object
+      required: [items, total]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/SupplierBalance' } }
+        total: { type: integer, format: int64 }
+    SupplierBalancePatchBody:
+      type: object
+      description: PATCH 逐供应商配置（仅 share_bp/freeze_hours；缺席 = 不变；null = 清空回继承）
+      properties:
+        share_bp:
+          x-omitempty: true
+          type: integer
+          nullable: true
+          x-go-type: nullable.Nullable[int]
+          x-go-type-import: { path: github.com/oapi-codegen/nullable }
+          x-go-type-skip-optional-pointer: true
+        freeze_hours:
+          x-omitempty: true
+          type: integer
+          nullable: true
+          x-go-type: nullable.Nullable[int]
+          x-go-type-import: { path: github.com/oapi-codegen/nullable }
+          x-go-type-skip-optional-pointer: true
     ErrorResponse:
       type: object
       required: [error]
       properties:
         error: { type: string }
+        reason:
+          type: string
+          enum: [offset, dst, span_below_grid, raw_horizon, cube_horizon, window_too_long, window_invalid, window_ambiguous]
+          description: |
+            统计窗口被拒的机读原因（仅统计端点可能携带）。取值词表取自规划层原因与
+            拒绝原因的**全量映射表**（唯一来源），本版实际会发出的有五个：
+            raw_horizon/cube_horizon = 起点早于所要读表的保留截止；
+            window_too_long = 请求跨度超过该形状的成本上限；window_invalid =
+            必填/倒序/`window` 时长串不可解析等参数本身非法；window_ambiguous =
+            `from`/`to`/`window` 三者的"恰择一"未被满足（两态都给、只给一端、
+            或两态都不给）。offset/dst/span_below_grid 是"该窗口无法用卷积表精确
+            表达、已降级到原始行"的派生原因（只用于降级告警日志，不作为拒绝原因
+            发出）。
+        storage:
+          type: string
+          enum: [cube, raw]
+          description: 判定所依据的实际存储（`window_invalid`/`window_ambiguous` 不携带）
+        limit_seconds:
+          type: integer
+          format: int64
+          description: 成本上限秒数（`window_too_long` 携带；0 = 无上限）
+        effective_from:
+          type: string
+          format: date-time
+          description: 判定后的生效窗口下界（`window_invalid`/`window_ambiguous` 不携带）
+        effective_to:
+          type: string
+          format: date-time
+          description: 判定后的生效窗口上界（`window_invalid`/`window_ambiguous` 不携带）
+        retention_days:
+          type: integer
+          description: 覆盖判定所依据的最保守保留天数（`*_horizon` 携带）
+    StatsCapabilities:
+      type: object
+      required: [bucket_grid_seconds, kinds]
+      properties:
+        bucket_grid_seconds:
+          type: integer
+          description: 卷积表桶网格单位（秒；恒 3600 = 1 小时）
+        kinds:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/StatsKindCapability' }
+          description: 键 = 读形状标识（trend/entity_trend/summary/days/top/ttft_sketch/ttft_exact/usage_agg/usage_list/errlog_list）
+    StatsKindCapability:
+      type: object
+      required: [grouping, storages, cost_cap_seconds, coverage_days]
+      properties:
+        grouping:
+          type: string
+          description: |
+            读形状的分组模式：`zoned` = 按请求时区分组（桶界随时区变）；`none` =
+            数值与请求时区无关。刻意不写 enum：enum 会为一个取值是 `none` 的字段
+            生成名为 `None` 的常量，与既有 `ErrorType` 枚举的 `None` 撞名，触发
+            oapi-codegen 把该枚举九个常量全部改名（无关生成的额外改动）。
+        storages:
+          type: array
+          items: { type: string, enum: [cube, raw] }
+          description: 候选存储（按偏好序）
+        cost_cap_seconds:
+          type: object
+          additionalProperties: { type: integer, format: int64 }
+          description: 每候选存储的最大跨度秒数（保留期无关的纯常量；0 = 无上限）
+        coverage_days:
+          type: object
+          additionalProperties: { type: integer }
+          description: 每候选存储实际读表的保留天数（读多表取最保守者；0 = 该表未启用分区保留，覆盖守卫关闭）
     DeletedResponse:
       type: object
       required: [deleted]
@@ -1715,9 +2890,6 @@ components:
     RequestFormat:
       type: string
       enum: [openai-chat, openai-responses, openai-responses-ws, openai-images, openai-search, anthropic]
-    AccountStatus:
-      type: string
-      enum: [active, unhealthy, "429", disabled]
     ErrorType:
       type: string
       enum: [none, "429", "4xx", "5xx", network, auth, no_account, abort, billing]
@@ -1726,10 +2898,11 @@ components:
       required: [name, supported_formats]
       properties:
         name: { type: string }
-        # base_url 凭据类型条件（Phase 4）：codex-oauth/codex-pat 非空禁用（须空，SDK 默认端点）；
-        # api_key/responses-special 为裸根覆盖（不含 /v1，service 校验），空 = 默认/路由失败（管理面不拦截）。
+        # base_url 凭据类型条件：codex-oauth/codex-pat 非空禁用（须空，SDK 默认端点）；
+        # api_key/responses-special 可带协议前缀（如 /zen），但路径不得以 /v1 结尾
+        # （service 校验：网关按格式再拼 /v1）。空 = 默认/路由失败（管理面不拦截）。
         # Shared shape retained; only description is conditional.
-        base_url: { type: string, description: "credential-type conditional: codex-oauth/codex-pat must be empty (non-empty forbidden, SDK default endpoint); api_key/responses-special optional bare root without /v1 (non-empty overrides, empty uses default or fails to route)" }
+        base_url: { type: string, description: "credential-type conditional: codex-oauth/codex-pat must be empty (non-empty forbidden, SDK default endpoint); api_key/responses-special may include a protocol prefix such as /zen but must not end in /v1 (the gateway appends /v1; non-empty overrides, empty uses default or fails to route)" }
         # credential_type 模板级：一个模板 = 一种号池；缺省 = api_key。
         # 生态三类型（responses-special/codex-oauth/codex-pat）只支持 resp / resp-ws /
         # openai-images / openai-search 格式（service 校验）；类型化配置走 /templates/{id}/ext。
@@ -1762,7 +2935,7 @@ components:
       properties:
         ID: { type: integer, format: int64 }
         Name: { type: string }
-        BaseURL: { type: string, description: "credential-type conditional: codex-oauth/codex-pat always empty (non-empty forbidden); api_key/responses-special bare root override (non-empty) or empty (default/route failure)" }
+        BaseURL: { type: string, description: "credential-type conditional: codex-oauth/codex-pat always empty (non-empty forbidden); api_key/responses-special may include a protocol prefix such as /zen but must not end in /v1 (non-empty override, or empty for default/route failure)" }
         CredentialType: { type: string, enum: [api_key, responses-special, codex-oauth, codex-pat], description: 模板号池类型；生态三类型只支持 resp / resp-ws / images / search 格式 }
         SupportedFormats:
           type: array
@@ -1782,26 +2955,10 @@ components:
         UpdatedAt: { type: string, format: date-time }
         DeletedAt: { type: string, format: date-time, nullable: true, description: 软删除时间戳；null = 存活（列表过滤已删；GET 单个可查已删项） }
     AccountCreate:
-      type: object
-      required: [name, template_id, upstream_key]
-      properties:
-        name: { type: string }
-        template_id: { type: integer, format: int64 }
-        # 账号级 base_url 覆盖（路由属性，位于 upstream_key 前——用户裁决
-        # 2026-08-14；Phase 4 条件：归属模板为 codex-oauth/codex-pat 时非空禁用，须空/null/缺省 = 继承模板/SDK 默认；
-        # api_key/responses-special 时非空优先于模板 base_url）。
-        base_url: { type: string, nullable: true, description: "credential-type conditional: if template is codex-oauth/codex-pat must be empty/null (non-empty forbidden, inherits SDK default); if api_key/responses-special non-empty overrides template base_url, null/empty inherits template" }
-        # upstream_key：api_key/responses-special 模板必填（静态透传上游 key）；
-        # codex-oauth/codex-pat 模板可选（凭据走 account_ext——创建后经
-        # /accounts/{id}/ext 配置；service 按模板类型校验）。
-        upstream_key: { type: string }
-        status: { $ref: '#/components/schemas/AccountStatus' }
-        weight: { type: integer }
-        max_concurrency: { type: integer }
-        # 创建时可选：null/缺省 = 无分组；提供 = 替换语义（空数组 = 无分组）
-        group_ids:
-          type: array
-          items: { type: integer, format: int64 }
+      description: 创建体 = 唯一字段模型 + 创建必填（name/template_id）；upstream_key 依模板凭据类型条件必填（service 校验）。
+      allOf:
+        - $ref: '#/components/schemas/AccountConfigPatch'
+      required: [name, template_id]
     Account:
       type: object
       properties:
@@ -1809,15 +2966,23 @@ components:
         Name: { type: string }
         TemplateID: { type: integer, format: int64 }
         Template: { $ref: '#/components/schemas/Template' }
-        # 账号级 baseURL 覆盖（Phase 4 条件：codex 模板非空禁用，须 null = 继承/SDK 默认；非 Codex 非空优先于模板）
+        # 账号级 baseURL 覆盖（条件：codex 模板非空禁用，须 null = 继承/SDK 默认；非 Codex 非空优先于模板）
         BaseURL: { type: string, nullable: true, description: "credential-type conditional: if template is codex-oauth/codex-pat must be null (non-empty forbidden); if api_key/responses-special non-empty overrides template" }
         UpstreamKey: { type: string }
-        Status: { $ref: '#/components/schemas/AccountStatus' }
-        CooldownUntil: { type: string, format: date-time, nullable: true }
-        Weight: { type: integer }
         MaxConcurrency: { type: integer }
         LastError: { type: string, nullable: true }
         LastUsedAt: { type: string, format: date-time, nullable: true }
+        # ---- intelligent-routing 生命周期契约（只读回显；写面 = PATCH /accounts/{id}）----
+        Enabled: { type: boolean, description: "管理面启停（写面 PATCH /accounts/{id} 的 enabled 字段；与运行时失效语义分离）" }
+        FailedAt: { type: string, format: date-time, nullable: true, description: "运行时失效时刻（rule 判死/SDK fatal；null = 未失效；恢复唯一入口 POST /accounts/{id}/recover）" }
+        FailureSource: { type: string, nullable: true, description: "失效来源（rule/sdk 等；随 recover 清除）" }
+        LifecycleRevision: { type: integer, format: int64, description: "配置代际 C（客户端 CAS 令牌 + DB 变更水位）：每次写面落库无条件 +1；PATCH 以 If-Match 作前置条件（陈旧 → 412），recover 以 body expected_revision（陈旧 → 409）" }
+        IdentityRevision: { type: integer, format: int64, description: "身份代际 K：仅身份类字段（template_id/base_url/upstream_key 及可轮换凭据）按值变更时 +1；SDK 自动 token 刷新不推进" }
+        UpstreamCostMultiplier: { type: number, format: double, description: "采购成本倍率（正常值，1 = ×1，0 = 免费，上限 10 = ×10；API 边界与 basis points 换算——存储 25000 ↔ 显示 2.5；写面 PATCH /accounts/{id} 的 upstream_cost_multiplier 字段）" }
+        CacheDomain: { type: string, nullable: true, description: "共享缓存域（null = 账号私有域；软亲和一致性哈希的域标识；写面 PATCH /accounts/{id} 的 cache_domain 字段）" }
+        # 归属（spec 2026-10-09 §2.5）：只读回显当前归属（管理面列表可展示/清空入口依赖它）；
+        # null = 平台自有；写面走 PATCH /accounts/{id} 的 supplier_user_id 字段。
+        supplier_user_id: { type: integer, format: int64, nullable: true, description: "供应商归属（null = 平台自有；非空 = 归属该 supplier uid；只读回显，写面 PATCH /accounts/{id} 的 supplier_user_id）" }
         CreatedAt: { type: string, format: date-time }
         UpdatedAt: { type: string, format: date-time }
         DeletedAt: { type: string, format: date-time, nullable: true, description: 软删除时间戳；null = 存活（列表过滤已删；GET 单个可查已删项） }
@@ -1829,6 +2994,11 @@ components:
             concurrency: { type: integer, format: int64 }
             err_rate: { type: number, format: double }
             err_count: { type: integer }
+    AccountRecoverBody:
+      type: object
+      required: [expected_revision]
+      properties:
+        expected_revision: { type: integer, format: int64, description: "CAS 期望代际（= 读到的 LifecycleRevision）；过期 → 409" }
     CodexUsageSnapshot:
       type: object
       description: 账号 codex 额度快照（sdkbridge；每块可选——上游没返回就不出字段；金额为字符串不解析保精度）
@@ -1910,11 +3080,12 @@ components:
         # account_id 只读（响应）；请求体忽略——路径 {id} 为准。
         account_id: { type: integer, format: int64 }
         credential_type: { type: string, enum: [codex-oauth, codex-pat], description: "类型-列组约束（service 校验）：oauth 只允许 codex_oauth_* 列组；pat 只允许 codex_pat_key" }
-        # 身份四元组对象（与存储 codex_identity jsonb 同形——映射层零展开/收拢；
-        # 首次写入缺省 → service 自动生成（UUIDv4/v7 形状）并持久化，账号存在
-        # 期间稳定；显式提供 → 采用；恒等 thread_id == session_id、window_id =
-        # {thread_id}:0。请求语义：null 与空串同 = 未提供——沿用存量/自动生成
-        # （identity 无清空路径）。响应语义：nil 身份 → 字段省略（不输出 null）。
+        # 持久身份对象（与存储 codex_identity jsonb 同形——映射层零展开/收拢；
+        # 仅 installation_id：首次写入缺省 → service 自动生成（UUIDv4 形状）并
+        # 持久化，账号存在期间稳定；显式提供 → 采用。会话级 session/thread/window
+        # 已退役为运行时槽状态，不再持久化。请求语义：null 与空串同 = 未提供——
+        # 沿用存量/自动生成（identity 无清空路径）。响应语义：nil 身份 → 字段省略
+        # （不输出 null）。
         codex_identity: { $ref: '#/components/schemas/CodexIdentity' }
         # 凭据列组（按 credential_type 约束）。请求语义：null/缺省 = NULL 清空
         # 落库；空串 = 字面空值写入（两者区分）。响应语义：nil → null。
@@ -1923,17 +3094,14 @@ components:
         codex_oauth_expires_at: { type: string, format: date-time, nullable: true, description: "凭据：oauth 访问令牌过期时间" }
         codex_pat_key: { type: string, nullable: true, description: "凭据：pat" }
         # 管理标识（非请求面）
-        codex_email: { type: string, nullable: true, description: "管理标识：codex 账号登录邮箱（导入时由人工/上游提供，非自动生成——NewCodexIdentity 只生成身份四元组；可空）" }
-        # 上游账号/空间标识（Task B 批量导入必填；本 task 仅 schema 声明——写入面 Task B）
-        codex_account_id: { type: string, nullable: true, description: "上游账号/空间标识（Task B 导入必填；本 task 仅声明）" }
+        codex_email: { type: string, nullable: true, description: "管理标识：codex 账号登录邮箱（导入时由人工/上游提供，非自动生成——NewCodexIdentity 只生成 installation_id；可空）" }
+        # 上游账号/空间标识（可留空——导入/保存时自动识别：OAuth token claims 离线解析 / PAT whoami）
+        codex_account_id: { type: string, nullable: true, description: "上游账号/空间标识；可留空——导入/单账号保存时自动识别（OAuth token claims 离线解析 / PAT whoami 查询）；识别失败：导入行拒绝、单账号保存留空且下次保存重试" }
     CodexIdentity:
       type: object
-      description: "codex 账号身份四元组（account_ext.codex_identity jsonb 契约形态；对象字段请求语义：null 与空串同 = 未提供）"
+      description: "codex 账号持久身份（account_ext.codex_identity jsonb 契约形态；对象字段请求语义：null 与空串同 = 未提供）。仅 installation_id——会话级 session/thread/window 已退役为运行时槽状态，不再持久化/暴露。"
       properties:
         installation_id: { type: string, description: "身份：账号级唯一（UUIDv4；响应恒有——首次写入自动生成；空/缺省 → service 自动生成）" }
-        session_id: { type: string, nullable: true, description: "身份：会话级（UUIDv7；恒等 == thread_id；service 自动生成/沿用；响应 nil → null）" }
-        thread_id: { type: string, nullable: true, description: "身份：会话级（UUIDv7；恒等 == session_id；响应 nil → null）" }
-        window_id: { type: string, nullable: true, description: "身份：会话级派生 {thread_id}:0（导入时生成后恒定不变——恒 0，无透传无解析；上游不校验 n；响应 nil → null）" }
     CodexOAuthImportItem:
       type: object
       required: [codex_email, codex_account_id, codex_oauth_token, codex_oauth_refresh_token]
@@ -1947,7 +3115,6 @@ components:
         # 归 failed 不整批 400）；nil = 过期未知 → 401 自愈。
         codex_oauth_expires_at: { type: string, description: "凭据：oauth 访问令牌过期时间（可选；RFC3339 格式——解析失败 → 行级 failed）" }
         max_concurrency: { type: integer, description: "可选；缺省 25（导入面裁决——非账号表默认 8）；<1 → 归 25" }
-        weight: { type: integer, description: "可选；缺省 100；负值 → 行级 failed" }
     CodexPATImportItem:
       type: object
       required: [codex_email, codex_account_id, codex_pat_key]
@@ -1957,7 +3124,6 @@ components:
         codex_account_id: { type: string, description: "组合幂等键②：上游账号/空间标识（必填）" }
         codex_pat_key: { type: string, description: "凭据：pat（必填非空）" }
         max_concurrency: { type: integer, description: "可选；缺省 25（导入面裁决）；<1 → 归 25" }
-        weight: { type: integer, description: "可选；缺省 100；负值 → 行级 failed" }
     CodexOAuthImportBody:
       type: object
       required: [items, template_id]
@@ -1970,6 +3136,14 @@ components:
           items: { $ref: '#/components/schemas/CodexOAuthImportItem' }
         template_id: { type: integer, format: int64, description: "必填：codex 账号归属模板（credential_type 必须 == 端点类型 codex-oauth）" }
         group_id: { type: integer, format: int64, nullable: true, description: "可选：新建账号归组（缺省不归组；不存在 → 行级 failed——FK 违反归行级不整批 400）" }
+        # 账号配置面（body 级——作用于本次**新建**账号；已存在行的凭据更新不改配置，
+        # 与 max_concurrency 同款"仅创建生效"语义）。缺省 = 创建默认。
+        enabled: { type: boolean, description: "可选：新建账号的管理面启停（缺省 true = 启用；仅新建行生效）" }
+        cache_domain: { type: string, description: "可选：新建账号的共享缓存域（缺省/空串 = 账号私有域；非空须为合法小写域名 ≤253——非法 → 400 整批拒绝）" }
+        upstream_cost_multiplier: { type: number, format: double, minimum: 0, maximum: 10, description: "可选：新建账号的采购成本倍率（缺省 ×1；0–10，0 = 免费；越界 → 400 整批拒绝）" }
+        # 归属（spec §2.5）：供应商面导入体出现该字段（含 null）⇒ 400；供应商面
+        # 归属恒写 JWT 本人。管理面（导入端点仅 /api/admin）保留字段以便 400 显式拒绝。
+        supplier_user_id: { type: integer, format: int64, nullable: true, description: "保留：供应商面出现 ⇒ 400（归属恒为 JWT 本人；导入不分配归属）" }
     CodexPATImportBody:
       type: object
       required: [items, template_id]
@@ -1982,6 +3156,12 @@ components:
           items: { $ref: '#/components/schemas/CodexPATImportItem' }
         template_id: { type: integer, format: int64, description: "必填：codex 账号归属模板（credential_type 必须 == 端点类型 codex-pat）" }
         group_id: { type: integer, format: int64, nullable: true, description: "可选：新建账号归组（不存在 → 行级 failed）" }
+        # 账号配置面（body 级——作用于本次**新建**账号；已存在行的凭据更新不改配置，
+        # 与 max_concurrency 同款"仅创建生效"语义）。缺省 = 创建默认。
+        enabled: { type: boolean, description: "可选：新建账号的管理面启停（缺省 true = 启用；仅新建行生效）" }
+        cache_domain: { type: string, description: "可选：新建账号的共享缓存域（缺省/空串 = 账号私有域；非空须为合法小写域名 ≤253——非法 → 400 整批拒绝）" }
+        upstream_cost_multiplier: { type: number, format: double, minimum: 0, maximum: 10, description: "可选：新建账号的采购成本倍率（缺省 ×1；0–10，0 = 免费；越界 → 400 整批拒绝）" }
+        supplier_user_id: { type: integer, format: int64, nullable: true, description: "保留：供应商面出现 ⇒ 400（归属恒为 JWT 本人；导入不分配归属）" }
     ImportFailedItem:
       type: object
       required: [index, error]
@@ -2029,7 +3209,7 @@ components:
     GroupProtocolConvert:
       type: string
       enum: [chat_to_resp, mess_to_resp, resp_to_mess, chat_to_mess]
-      description: 分组级协议转换方向（只补差，W5 网关 internal/protoconv 消费）：chat_to_resp = 客户端 chat → 模板 resp；mess_to_resp = anthropic messages → resp；resp_to_mess = resp → anthropic messages；chat_to_mess = chat → anthropic messages。off 不在枚举内——不转换 = 空数组（见 protocol_convert 字段说明）
+      description: 分组级协议转换方向（只补差，网关 internal/protoconv 消费）：chat_to_resp = 客户端 chat → 模板 resp；mess_to_resp = anthropic messages → resp；resp_to_mess = resp → anthropic messages；chat_to_mess = chat → anthropic messages。off 不在枚举内——不转换 = 空数组（见 protocol_convert 字段说明）
     GroupAssignmentsBody:
       type: object
       required: [user_ids]
@@ -2101,6 +3281,7 @@ components:
         ID: { type: integer, format: int64 }
         UserID: { type: integer, format: int64 }
         GroupID: { type: integer, format: int64 }
+        GroupName: { type: string, description: 归属分组名（只读投影；组非存活/未加载 → 空串，前端回退 `#<GroupID>`） }
         Name: { type: string }
         key: { type: string, description: key 明文（长期可查看/复制；DB 泄露即暴露——自托管权衡，用户裁决） }
         Status: { $ref: '#/components/schemas/KeyStatus' }
@@ -2125,6 +3306,7 @@ components:
         status: { $ref: '#/components/schemas/KeyStatus' }
         max_concurrency: { type: integer }
         quota: { type: integer, format: int64, description: "累计最终计费金额上限（毫分，1 USD = 100,000 毫分）；0 = 不限" }
+        group_id: { type: integer, format: int64, description: "切换归属分组（可选；缺省 = 不改组。可选性同创建——public 或已授予 private；缺失/软删 → 404，未授予 → 400，<=0 → 400）" }
     KeyListResponse:
       type: object
       required: [total, rows]
@@ -2139,6 +3321,7 @@ components:
         ID: { type: integer, format: int64 }
         UserID: { type: integer, format: int64 }
         GroupID: { type: integer, format: int64 }
+        GroupName: { type: string, description: 归属分组名（只读投影；组非存活/未加载 → 空串） }
         Name: { type: string }
         Status: { $ref: '#/components/schemas/KeyStatus' }
         MaxConcurrency: { type: integer }
@@ -2155,9 +3338,39 @@ components:
         rows:
           type: array
           items: { $ref: '#/components/schemas/AdminKey' }
+    ManagementKeyStatus:
+      type: string
+      enum: [active, disabled]
+    ManagementKey:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64, description: owner 用户 id }
+        name: { type: string, description: 备注/标识（非唯一） }
+        key_raw: { type: string, description: "管理 key 明文（前缀 mk-；长期可查看/复制——自托管权衡）" }
+        status: { $ref: '#/components/schemas/ManagementKeyStatus' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ManagementKeyCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, description: 备注/标识（非唯一，非空） }
+    ManagementKeyUpdate:
+      type: object
+      properties:
+        name: { type: string }
+        status: { $ref: '#/components/schemas/ManagementKeyStatus' }
+    ManagementKeyListResponse:
+      type: object
+      required: [rows]
+      properties:
+        rows:
+          type: array
+          items: { $ref: '#/components/schemas/ManagementKey' }
     UserRole:
       type: string
-      enum: [platform_admin, user]
+      enum: [platform_admin, user, supplier]
     UserStatus:
       type: string
       enum: [active, disabled]
@@ -2301,6 +3514,7 @@ components:
       required: [name]
       properties:
         name: { type: string }
+        description: { type: string, nullable: true, description: 分组描述（可选）。POST：缺省/null = 空；PUT：缺省/null = 保持原值，显式空串 = 清空 }
         visibility: { $ref: '#/components/schemas/GroupVisibility' }
         price_multiplier: { type: number, format: double, minimum: 0, maximum: 10, nullable: true, description: 价格倍率（正常值，1 = ×1，0 = 免费，上限 10 = ×10；API 边界与万分数换算——存储 15000 ↔ 显示 1.5）。缺省/null = 不设置（×1）；显式 0 = 免费组；PUT 显式写（含 0） }
         protocol_convert:
@@ -2336,11 +3550,17 @@ components:
           additionalProperties: true
           description: |
             动作集（指针即意图：键缺省/null = 该维度透传不改）。全空对象 {} 合法 =
-            纯透传规则：命中后状态/冷却/权重零改动、响应码与文案双透传上游原样返回、
+            纯透传规则：命中后零惩罚、响应码与文案双透传上游原样返回、
             不计惩罚（不投递状态事件）。可用键：
-            - status：命中后账号目标状态，active/unhealthy/429/disabled 之一
-            - cooldown：冷却时长，Go time.ParseDuration 可解析且 > 0（如 "30s"、"5h"）
-            - weight：调度权重 ∈ [0,100]
+            - throttle：typed 限流动作（与 fail_account 互斥；
+              response_code/custom_message 塑形可并存）——
+              {scope: account|account_route, mode: retry_after|open, duration_ms?, use_reset}；
+              scope=account 作用该账号全部 RouteClass，account_route 作用单 RouteClass
+              （匹配时事件须携带账号+路由定位）；mode=retry_after 要求 use_reset=true
+              （上游 Reset 头优先，duration_ms 可选为回退）；mode=open 要求 use_reset=false
+              且 duration_ms > 0（固定摘除窗口）
+            - fail_account：true = 命中即判死（终态失效：failed_at + failure_source=rule，CAS fenced，
+              恢复唯一入口 /accounts/{id}/recover）；与 throttle 互斥
             - response_code：缺省/null = 透传上游状态码；设置 = 覆写为指定码（400-599）
             - custom_message：缺省/null = 透传上游错误文案；设置 = 覆写为固定文案（禁止空串）
             错误响应面无任何规则命中时默认归一为 502 "upstream rejected request"
@@ -2377,11 +3597,17 @@ components:
             动作集（指针即意图：键缺省/null = 该维度透传不改）。PUT 部分更新语义：
             键缺省（null/省略）= 保持原值；显式提供时整体替换该对象（显式 {} = 清空），
             并对合并后的完整 when/then 重新校验。全空对象 {} 合法 = 纯透传规则：
-            命中后状态/冷却/权重零改动、响应码与文案双透传上游原样返回、不计惩罚
+            命中后零惩罚、响应码与文案双透传上游原样返回、不计惩罚
             （不投递状态事件）。可用键：
-            - status：命中后账号目标状态，active/unhealthy/429/disabled 之一
-            - cooldown：冷却时长，Go time.ParseDuration 可解析且 > 0（如 "30s"、"5h"）
-            - weight：调度权重 ∈ [0,100]
+            - throttle：typed 限流动作（与 fail_account 互斥；
+              response_code/custom_message 塑形可并存）——
+              {scope: account|account_route, mode: retry_after|open, duration_ms?, use_reset}；
+              scope=account 作用该账号全部 RouteClass，account_route 作用单 RouteClass
+              （匹配时事件须携带账号+路由定位）；mode=retry_after 要求 use_reset=true
+              （上游 Reset 头优先，duration_ms 可选为回退）；mode=open 要求 use_reset=false
+              且 duration_ms > 0（固定摘除窗口）
+            - fail_account：true = 命中即判死（终态失效：failed_at + failure_source=rule，CAS fenced，
+              恢复唯一入口 /accounts/{id}/recover）；与 throttle 互斥
             - response_code：缺省/null = 透传上游状态码；设置 = 覆写为指定码（400-599）
             - custom_message：缺省/null = 透传上游错误文案；设置 = 覆写为固定文案（禁止空串）
             错误响应面无任何规则命中时默认归一为 502 "upstream rejected request"
@@ -2401,7 +3627,7 @@ components:
         Then:
           type: object
           additionalProperties: true
-          description: 动作集（只读回显；字段集与语义同 RuleCreate.then——status/cooldown/weight/response_code/custom_message；全空 {} = 纯透传规则：命中后码/文双透、零惩罚）
+          description: 动作集（只读回显；字段集与语义同 RuleCreate.then——throttle/fail_account/response_code/custom_message；全空 {} = 纯透传规则：命中后码/文双透、零惩罚）
         CreatedAt: { type: string, format: date-time }
         UpdatedAt: { type: string, format: date-time }
         DeletedAt: { type: string, format: date-time, nullable: true, description: 软删除时间戳；null = 存活（列表/规则引擎重载过滤已删；GET 单个可查已删项） }
@@ -2418,6 +3644,7 @@ components:
       properties:
         ID: { type: integer, format: int64 }
         Name: { type: string }
+        Description: { type: string, description: 分组描述（空串 = 无描述） }
         Visibility: { $ref: '#/components/schemas/GroupVisibility' }
         PriceMultiplier: { type: number, format: double, description: 价格倍率（正常值，1 = ×1，0 = 免费，上限 10 = ×10；API 边界与万分数换算——存储 15000 ↔ 显示 1.5） }
         ProtocolConvert:
@@ -2458,7 +3685,7 @@ components:
       type: object
       properties:
         name: { type: string }
-        base_url: { type: string, description: "credential-type conditional: codex-oauth/codex-pat must be empty (non-empty forbidden); api_key/responses-special optional bare root override" }
+        base_url: { type: string, description: "credential-type conditional: codex-oauth/codex-pat must be empty (non-empty forbidden); api_key/responses-special optional override, protocol prefix allowed, must not end in /v1" }
         supported_formats:
           type: array
           minItems: 1
@@ -2474,21 +3701,98 @@ components:
         model_mapping:
           type: object
           additionalProperties: { $ref: '#/components/schemas/ModelMappingEntry' }
-    AccountPatch:
+    AccountConfigPatch:
       type: object
+      minProperties: 1
+      description: >-
+        账号写面唯一字段模型（创建 / PATCH / 批量共用）。三态：字段缺席 = 不变（永不清空）；
+        可空标量 null = 清空；集合 null = 不变、[] = 清空；不可空标量 null = 400；
+        可空标量 "" = 400（空串哨兵已取消——清空只有一个拼法 null）。
       properties:
-        name: { type: string }
-        template_id: { type: integer, format: int64 }
-        # 批量三态定死（评审 C1）+ Phase 4 条件：codex 模板目标非空禁用（须空/null/不变，SDK 默认）；非 Codex 三态：空串=清空/null/缺省=不变/非空=落值
-        base_url: { type: string, nullable: true, description: "credential-type conditional batch: if any effective target is codex-oauth/codex-pat must be empty/null (non-empty forbidden); otherwise batch tristate: empty string=clear to inherit, null/omitted=unchanged, non-empty=override" }
-        upstream_key: { type: string }
-        status: { type: string, enum: [active, unhealthy, "429", disabled] }
-        weight: { type: integer }
-        max_concurrency: { type: integer }
-        # 替换语义：null/缺省 = 不变；[] = 清空；提供列表 = 替换账号全部分组
+        # x-go-type 三态载体：*T 无法区分 null 与缺席（二者同为 nil），故所有标量统一用
+        # nullable.Nullable[T]（一种包装类型，一处实现；语义按字段类分派）。
+        # x-go-type-skip-optional-pointer 必需——否则生成 *nullable.Nullable[T]。
+        # x-omitempty: true 令两种投影的 json tag 一致（缺席即省略），
+        # 使两种必需性投影在 Go 中同构可转换（编译期断言在 handler 侧）。
+        name:
+          type: string
+          x-omitempty: true
+          x-go-type: nullable.Nullable[string]
+          x-go-type-import: { path: github.com/oapi-codegen/nullable }
+          x-go-type-skip-optional-pointer: true
+        template_id:
+          type: integer
+          format: int64
+          x-omitempty: true
+          x-go-type: nullable.Nullable[int64]
+          x-go-type-import: { path: github.com/oapi-codegen/nullable }
+          x-go-type-skip-optional-pointer: true
+        # 身份（可空标量）：缺席 = 不变；null = 清空；非空 = 落值；"" = 400。base_url
+        # 语义随模板凭据类型（codex-oauth/codex-pat 非空禁用，须 null = 继承 SDK 默认；
+        # api_key/responses-special 非空优先于模板 base_url，可带协议前缀但不得以 /v1 结尾）。
+        base_url:
+          x-omitempty: true
+          type: string
+          nullable: true
+          x-go-type: nullable.Nullable[string]
+          x-go-type-import: { path: github.com/oapi-codegen/nullable }
+          x-go-type-skip-optional-pointer: true
+        # upstream_key：api_key/responses-special 模板必填（静态透传上游 key）；
+        # codex-oauth/codex-pat 模板可选（凭据走 account_ext）。
+        upstream_key:
+          x-omitempty: true
+          type: string
+          x-go-type: nullable.Nullable[string]
+          x-go-type-import: { path: github.com/oapi-codegen/nullable }
+          x-go-type-skip-optional-pointer: true
+        max_concurrency:
+          x-omitempty: true
+          type: integer
+          x-go-type: nullable.Nullable[int]
+          x-go-type-import: { path: github.com/oapi-codegen/nullable }
+          x-go-type-skip-optional-pointer: true
+        # 集合：缺席 = 不变、null = 不变、[] = 清空、非空 = 替换。*[]int64 已能表达
+        # （null 与缺席同义 = 不变），无需三态载体。
         group_ids:
           type: array
           items: { type: integer, format: int64 }
+        # 不可空标量：缺省 = 不变；null = 400；true/false = 落值。
+        enabled:
+          x-omitempty: true
+          type: boolean
+          x-go-type: nullable.Nullable[bool]
+          x-go-type-import: { path: github.com/oapi-codegen/nullable }
+          x-go-type-skip-optional-pointer: true
+        # 可空标量：缺省 = 不变；null = 清空（回账号私有域）；非空 = 共享域（≤253）；"" = 400。
+        cache_domain:
+          x-omitempty: true
+          type: string
+          nullable: true
+          x-go-type: nullable.Nullable[string]
+          x-go-type-import: { path: github.com/oapi-codegen/nullable }
+          x-go-type-skip-optional-pointer: true
+        # 不可空标量（×0–×10，API 边界与 basis points 换算）：缺省 = 不变；null = 400。
+        upstream_cost_multiplier:
+          x-omitempty: true
+          type: number
+          format: double
+          minimum: 0
+          maximum: 10
+          x-go-type: nullable.Nullable[float64]
+          x-go-type-import: { path: github.com/oapi-codegen/nullable }
+          x-go-type-skip-optional-pointer: true
+        # 归属（spec 2026-10-09 §2.5 行层作用域锚点；唯一字段级例外）：缺席 = 不变；
+        # null = 清空（回平台自有）；正整数 = 分配给该供应商（值域校验：目标须为供应商面
+        # 可达且 active 的用户，写入事务内锁 users 行串行化）。供应商面请求体出现该字段
+        # （含 null）⇒ 400——供应商面归属恒为 JWT 本人、不可改。
+        supplier_user_id:
+          x-omitempty: true
+          type: integer
+          format: int64
+          nullable: true
+          x-go-type: nullable.Nullable[int64]
+          x-go-type-import: { path: github.com/oapi-codegen/nullable }
+          x-go-type-skip-optional-pointer: true
     GroupPatch:
       type: object
       properties:
@@ -2503,7 +3807,23 @@ components:
           items: { type: integer, format: int64 }
           minItems: 1
           maxItems: 100
-        fields: { $ref: '#/components/schemas/AccountPatch' }
+        fields: { $ref: '#/components/schemas/AccountConfigPatch' }
+    AccountBatchUpdateResponse:
+      type: object
+      required: [updated, items]
+      description: 账号批量更新响应（独立 schema——不与 templates/groups 共用的 BatchUpdateResponse 合并）
+      properties:
+        updated: { type: integer }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AccountRevision' }
+    AccountRevision:
+      type: object
+      required: [account_id, lifecycle_revision]
+      description: 单账号更新后的配置代际（C = 客户端 CAS 令牌；与路由观测面的 identity_revision 不同）
+      properties:
+        account_id: { type: integer, format: int64 }
+        lifecycle_revision: { type: integer, format: int64 }
     BatchUpdateGroupsBody:
       type: object
       required: [ids, fields]
@@ -2524,21 +3844,7 @@ components:
       required: [updated]
       properties:
         updated: { type: integer }
-    BatchResetCooldownBody:
-      type: object
-      required: [ids]
-      properties:
-        ids:
-          type: array
-          items: { type: integer, format: int64 }
-          minItems: 1
-          maxItems: 100
-    BatchResetCooldownResponse:
-      type: object
-      required: [reset]
-      properties:
-        reset: { type: integer }
-    # --- 兑换码（Phase 5 计费前基础设施：资源发放的通用载体） ---
+    # --- 兑换码（计费前基础设施：资源发放的通用载体） ---
     RedemptionType:
       type: string
       enum: [balance, concurrency, temp_balance]
@@ -2559,7 +3865,7 @@ components:
         MaxUses: { type: integer, description: 1 = 单次码；>1 = 多人码 }
         UsedCount: { type: integer, description: 已兑换次数 }
         Status: { $ref: '#/components/schemas/RedemptionStatus' }
-        CreatedBy: { type: integer, format: int64, description: 0 = 系统（静态 admin token）；>0 = platform_admin 用户 id }
+        CreatedBy: { type: integer, format: int64, description: platform_admin 用户 id（adminAuth 鉴权路径恒注入 owner id）；0 = 系统/无归属 }
         CreatedAt: { type: string, format: date-time }
         UpdatedAt: { type: string, format: date-time }
     RedemptionUse:
@@ -2645,6 +3951,32 @@ components:
         rows:
           type: array
           items: { $ref: '#/components/schemas/AdminTempBalanceRow' }
+    # --- 余额变动记录（/api/admin/users/{id}/balance-logs） ---
+    # 永久余额的非 usage 变动留痕（注册默认/管理面创建/管理面调整/兑换码）；
+    # Amount/BalanceAfter = 毫分 /1e5 → USD（API 边界换算，内部存储恒毫分）。
+    BalanceLogSource:
+      type: string
+      enum: [signup_default, admin_create, admin_adjust, redemption]
+    BalanceLog:
+      type: object
+      required: [ID, UserID, Amount, BalanceAfter, Source, OperatorID, CreatedAt]
+      properties:
+        ID: { type: integer, format: int64 }
+        UserID: { type: integer, format: int64 }
+        Amount: { type: number, format: double, description: "变动额 USD（有符号：正=增加/负=减少；1 USD = 100,000 毫分）" }
+        BalanceAfter: { type: number, format: double, description: "变更后余额 USD（毫分快照 /1e5）" }
+        Source: { $ref: '#/components/schemas/BalanceLogSource' }
+        OperatorID: { type: integer, format: int64, description: "0 = 系统/用户自助；>0 = platform_admin 用户 id" }
+        Note: { type: string, nullable: true, description: "附加说明（兑换→兑换码文本；其余可空）" }
+        CreatedAt: { type: string, format: date-time }
+    BalanceLogListResponse:
+      type: object
+      required: [total, rows]
+      properties:
+        total: { type: integer, format: int64 }
+        rows:
+          type: array
+          items: { $ref: '#/components/schemas/BalanceLog' }
     GenerateRequest:
       type: object
       required: [type, value]
@@ -2685,7 +4017,7 @@ components:
       required: [deactivated]
       properties:
         deactivated: { type: integer, description: 新失效数（已 disabled no-op 不计） }
-    # --- litellm 模型价格（Phase 5 计费价格来源） ---
+    # --- litellm 模型价格（计费价格来源） ---
     Provider:
       type: string
       description: 主流厂商枚举（litellm_provider 实际字符串，服务前端下拉框）。**litellm_provider 动态**——litellm 更新会加新厂商，此 enum 为主流集合；新厂商出现时扩 enum（DB 筛选不受限——自由字符串等值）
@@ -3008,6 +4340,197 @@ components:
         P99MS: { type: integer, format: int64 }
         MaxMS: { type: integer, format: int64 }
         Source: { type: string, enum: [exact, sketch] }
+    # ---- intelligent-routing 观测契约：lower snake_case，全字段
+    # required（值恒在，仅 previous_account_id 可 null）；空集合恒为 []。
+    # ---- 桑基图专用边集：每 (ordinal,lane) 层 top-N 账号 + 「其他」折叠。
+    # 折叠只合并账号，层内 chain_count 求和不变——守恒不破，图形不因折叠失真。
+    RoutingFlowGraph:
+      type: object
+      description: 桑基图边集（已按 (ordinal,lane,account,outcome,is_terminal) 聚合）
+      required: [edges, account_limit, folded_accounts, folded]
+      properties:
+        edges:
+          type: array
+          items: { $ref: '#/components/schemas/RoutingFlowGraphEdge' }
+        account_limit: { type: integer, description: 每层保留的账号数 N（实际生效值） }
+        folded_accounts: { type: integer, format: int64, description: 各 (ordinal,lane) 层被折叠账号数之和（同一账号在两层被折叠计两次；0 = 未发生折叠） }
+        folded: { type: boolean, description: folded_accounts > 0 的冗余布尔，便于消费方直读 }
+    RoutingFlowGraphEdge:
+      type: object
+      description: 一条桑基边；account_id=0 且 folded=true 表示「其他」聚合节点
+      required: [ordinal, lane, account_id, folded, outcome, is_terminal, chain_count, transition_reasons, previous_outcomes, previous_accounts]
+      properties:
+        ordinal: { type: integer, description: 链内第几次尝试（1 = 首发） }
+        lane: { type: string, description: 通道（primary/explore/degraded） }
+        account_id: { type: integer, format: int64, description: 本跳账号；0 = 「其他」聚合节点 }
+        folded: { type: boolean, description: true = 该边是折叠后的「其他」聚合（account_id 恒 0） }
+        outcome: { type: string, description: 本边结局（success/429/4xx/5xx/network…） }
+        is_terminal: { type: boolean, description: true = 该链 Final }
+        chain_count: { type: integer, format: int64, description: 同身份链数（SUM） }
+        transition_reasons: { type: array, items: { type: string }, description: 到达链的 transition_reason 去重集（升序） }
+        previous_outcomes: { type: array, items: { type: string }, description: 到达链的 previous_outcome 去重集（升序） }
+        previous_accounts: { type: array, items: { type: integer, format: int64 }, description: 到达链的 previous_account_id 去重集（升序）；折叠节点为空 }
+    RoutingFlowEdge:
+      type: object
+      description: 一条聚合边（合并层行；最早代际为同边多代折叠的最小值）
+      required: [ordinal, lane, account_id, previous_account_id, previous_outcome, transition_reason, outcome, is_terminal, min_generation, chain_count]
+      properties:
+        ordinal: { type: integer, description: 链内第几次尝试（1 = 首发） }
+        lane: { type: string, description: 通道（primary/explore/degraded） }
+        account_id: { type: integer, format: int64 }
+        previous_account_id: { type: integer, format: int64, nullable: true, description: 前驱账号（首发边 null） }
+        previous_outcome: { type: string, description: 前驱结局（首发边空串） }
+        transition_reason: { type: string, description: 迁移原因（failover 等；首发边空串） }
+        outcome: { type: string, description: 本边结局（success/429/4xx/5xx/network…） }
+        is_terminal: { type: boolean, description: true = 该链 Final }
+        min_generation: { type: integer, format: int64, description: 本边链最早计划代际（同边多代折叠的最小值） }
+        chain_count: { type: integer, format: int64, description: 同身份链数（SUM） }
+    RoutingFlowLane:
+      type: object
+      description: (ordinal, lane) 分组；组间按 (ordinal, lane) 全序，组内保持仓储确定性行序
+      required: [ordinal, lane, edges]
+      properties:
+        ordinal: { type: integer }
+        lane: { type: string }
+        edges:
+          type: array
+          items: { $ref: '#/components/schemas/RoutingFlowEdge' }
+    RoutingFlowResponse:
+      type: object
+      required: [route_class_id, plan_generation, lanes, total_edges, stale_generation_present, sankey, first_dispatch_chains, terminal_chains, incomplete_chain_dropped, flow_overflow_dropped_chains, process_crash_loss_unobservable]
+      properties:
+        route_class_id: { type: string }
+        plan_generation: { type: integer, format: int64, description: 当前发布计划 generation（边行各自 generation 不混入） }
+        lanes:
+          type: array
+          items: { $ref: '#/components/schemas/RoutingFlowLane' }
+          description: 边表的当前页（offset/limit 切片后仍按 (ordinal,lane) 分组，组内保持仓储确定性行序）
+        total_edges: { type: integer, format: int64, description: 窗口内完整边行数（行单位，驱动前端翻页器；不受 offset/limit 影响） }
+        stale_generation_present: { type: boolean, description: 完整边集内是否存在 min_generation != plan_generation 的边行（行级谓词，精确——无高估无低估；不受 offset/limit 影响）。精确性前提：generation 随发布单调不减，故存量行恒有 min_generation ≤ plan_generation；未来代际竞态不在目标场景内） }
+        sankey: { $ref: '#/components/schemas/RoutingFlowGraph' }
+        first_dispatch_chains: { type: integer, format: int64, description: Attempt1 = ordinal=1 链数和（守恒左端；完整边集聚合，不受分页影响） }
+        terminal_chains: { type: integer, format: int64, description: 保留 terminal 链数和（守恒右端，恒等于 first_dispatch_chains；完整边集聚合） }
+        incomplete_chain_dropped: { type: integer, format: int64, description: 本进程已观察 cleanup 缺 terminal 的链（非上游失败） }
+        flow_overflow_dropped_chains: { type: integer, format: int64, description: 故障预算淘汰链（容量/入队拒绝；非上游失败） }
+        process_crash_loss_unobservable: { type: boolean, description: 硬崩丢失不可量化标记，恒 true }
+    RoutingFrontierCandidate:
+      type: object
+      required: [candidate_fingerprint, known, account_id, template_id, identity_revision, quality_class_id, mapped_model, attempts, successes, success_lcb, success_ucb, ttft_lcb, ttft_ucb, ttft_known, input_unit_cost, cost_known, insufficient, on_frontier]
+      properties:
+        candidate_fingerprint: { type: string }
+        known: { type: boolean, description: 指纹在当前发布计划该路由候选目录内；false = 只呈现观测事实 }
+        account_id: { type: integer, format: int64, description: unknown 候选为 0 }
+        template_id: { type: integer, format: int64 }
+        identity_revision: { type: integer, format: int64, description: "候选内容代际 K（identity_revision）——非客户端 CAS 令牌 C（lifecycle_revision）；C 只围栏管理员写入" }
+        quality_class_id: { type: string }
+        mapped_model: { type: string }
+        attempts: { type: integer, format: int64 }
+        successes: { type: integer, format: int64 }
+        success_lcb: { type: number, format: double, description: Wilson95 下界 }
+        success_ucb: { type: number, format: double, description: Wilson95 上界 }
+        ttft_lcb: { type: number, format: double, description: TTFT 对数区间下界（ttft_known=false 时无意义） }
+        ttft_ucb: { type: number, format: double }
+        ttft_known: { type: boolean, description: 样本量足以给出区间 }
+        input_unit_cost: { type: integer, format: int64, description: "输入侧单位采购价（毫分/1M 输入侧 token，1 USD = 100,000 毫分，与 compiler 同式；cost_known=false 时无意义）" }
+        cost_known: { type: boolean, description: known + 有成功样本 + 价格可解析 }
+        insufficient: { type: boolean, description: 样本 <30（与 explore 同门槛） }
+        on_frontier: { type: boolean, description: Pareto 非支配（仅 known 且 cost_known 间扫描） }
+    RoutingFrontierResponse:
+      type: object
+      required: [route_class_id, plan_generation, candidates, total_candidates]
+      properties:
+        route_class_id: { type: string }
+        plan_generation: { type: integer, format: int64 }
+        candidates:
+          type: array
+          items: { $ref: '#/components/schemas/RoutingFrontierCandidate' }
+          description: 排序后的一页候选
+        total_candidates: { type: integer, format: int64, description: 排序后候选总条数（分页用；不受 offset/limit 影响） }
+    RoutingPlanRef:
+      type: object
+      description: 路由全身份（group+format+model+operation+route class）
+      required: [group_id, format, model, operation_tag, route_class_id]
+      properties:
+        group_id: { type: integer, format: int64 }
+        format: { type: string }
+        model: { type: string }
+        operation_tag: { type: string }
+        route_class_id: { type: string }
+    RoutingPlanExplore:
+      type: object
+      description: explore 决策表（发布序 + 权重 + 累积轮盘；序是语义不重排）
+      required: [ids, weights, cumulative, total, fallback]
+      properties:
+        ids:
+          type: array
+          items: { type: integer, format: int64 }
+        weights:
+          type: object
+          additionalProperties: { type: integer }
+          description: account_id（十进制字符串键）→ 权重
+        cumulative:
+          type: array
+          items: { type: integer, format: int64 }
+        total: { type: integer, format: int64 }
+        fallback:
+          type: array
+          items: { type: integer, format: int64 }
+    RoutingPlanCandidate:
+      type: object
+      description: 候选静态身份（缺叶子引用时 identity-only，其余字段零值）
+      required: [account_id, template_id, identity_revision, upstream_cost_multiplier_bp, fingerprint, identity_fingerprint, mapped_model, quality_class_id]
+      properties:
+        account_id: { type: integer, format: int64 }
+        template_id: { type: integer, format: int64 }
+        identity_revision: { type: integer, format: int64, description: "候选内容代际 K（identity_revision）——与编译器事实、wire 同源；非客户端 CAS 令牌 C" }
+        upstream_cost_multiplier_bp: { type: integer, description: 采购倍率 basis points（10000 = ×1） }
+        fingerprint: { type: string, description: 真实候选指纹 hex（不可导出 = 空串） }
+        identity_fingerprint: { type: string, description: rollup join 身份指纹 hex（compiler 合成规则同源） }
+        mapped_model: { type: string }
+        quality_class_id: { type: string }
+    RoutingPlanRoute:
+      type: object
+      required: [ref, primary, explore, degraded, candidates, candidates_total, incident]
+      properties:
+        ref: { $ref: '#/components/schemas/RoutingPlanRef' }
+        primary:
+          type: array
+          items: { type: integer, format: int64 }
+          description: primary 候选发布序
+        explore: { $ref: '#/components/schemas/RoutingPlanExplore' }
+        degraded:
+          type: array
+          items: { type: integer, format: int64 }
+          description: degraded 候选发布序
+        candidates:
+          type: array
+          items: { $ref: '#/components/schemas/RoutingPlanCandidate' }
+          description: 通道账号并集（升序 AccountID）的当前页；candidates_limit=0 时为空数组
+        candidates_total: { type: integer, format: int64, description: 该路由候选总数（分页用；不受 candidates_offset/candidates_limit 影响） }
+        incident: { $ref: '#/components/schemas/RoutingPlanIncident' }
+    RoutingPlanIncident:
+      type: object
+      description: 路由 expose-only 事故标记（detect+surface：不改通道、不节流、不探针；零值 = 无事故）
+      required: [active, kind, comparable, degraded, domains, evaluated_minute]
+      properties:
+        active: { type: boolean }
+        kind: { type: string, description: '"domain"|"model"|"both"（inactive 时为空串）' }
+        comparable: { type: integer, description: 可比候选数（current/baseline attempts≥30 且 TTFT≥30） }
+        degraded: { type: integer, description: 退化候选数（Wilson 成功区间不重叠） }
+        domains: { type: integer, description: 可比去重 failure-domain 数 }
+        evaluated_minute: { type: integer, format: int64, description: 证据分钟 M（unix 秒；窗口边界可由 M 推导） }
+    RoutingPlanResponse:
+      type: object
+      description: 当前发布计划快照（无历史 generation 查询面；空视图 = generation 0 + routes []）
+      required: [generation, routes, total_routes, plan_total_routes]
+      properties:
+        generation: { type: integer, format: int64 }
+        plan_total_routes: { type: integer, format: int64, description: 未过滤的当前计划路由总数（区分「空计划」与「窗口内无流量」） }
+        total_routes: { type: integer, format: int64, description: 过滤后（search ∩ observed 窗口；route 给定时恒为 1）的路由总数（分页用） }
+        routes:
+          type: array
+          items: { $ref: '#/components/schemas/RoutingPlanRoute' }
+          description: 全身份确定性路由序（与发布字节守卫同序）
     # 运维观测（/admin/ops/workers）：WorkerStatus/SnapshotState/WorkersResponse
     # 类型由本契约生成（ops tag → handler/api.gen.go + 前端 schema.d.ts），
     # handler/ops.go 唯一实现；字段清单见 WorkerStatus.stats.description。
@@ -3016,7 +4539,7 @@ components:
       required: [name, stats]
       properties:
         name: { type: string }
-        # stats 为异构动态观测字段（16 个 worker 各形态不同，原子读计数器 +
+        # stats 为异构动态观测字段（20 个 worker 各形态不同，原子读计数器 +
         # channel 长度快照）——契约层面声明为自由 schema（任意对象），后端
         # 直出原类型（any），不做 struct→map 转换。
         #
@@ -3027,13 +4550,30 @@ components:
         #   invalidate（去抖器）: dirty bool（有待执行重载）, dirty_kinds string
         #     （脏位名逗号分隔；空 = 组级定向）, dirty_groups int（组级定向账号数）,
         #     window_ms int（去抖窗口）
-        #   scheduler: pending_writebacks int（待回写 DB 状态队列积压）,
-        #     writeback_cap int（队列容量；满 → 丢弃 DB 回写）
-        #   rule-engine: queued int（事件队列积压）, queue_cap int（容量/丢弃阈值）,
-        #     dropped int64（队列满丢弃累计）, drop_warn_threshold int64（丢弃告警阈值）
-        #   usage: pending_logs int64（未落库明细条数）, pending_waterline int64
+        #   scheduler: compile_pending int（编译道待触发信号；cap 1 trailing-edge 合并）,
+        #     compile_cap int（信号通道容量）, last_compile_ok_unix_ms int64
+        #     （最近一次成功编译时刻；0 = 从未）, last_compile_err_unix_ms
+        #     int64（最近一次失败编译时刻；0 = 从未；失败保留旧视图是契约）,
+        #     decision_generation uint64（当前发布 DecisionView 世代；0 = 未发布）,
+        #     decision_routes int（已发布路由数；0 = 编译道未发布）,
+        #     active_incidents int（最近一次成功 fire 时带活跃标记的路由数）,
+        #     last_incident_eval_unix_ms int64（最近一次评估事故的 fire 时刻；
+        #     0 = 从未）, skipped_compiles uint64（编译输入与上次成功编译完全
+        #     相同而跳过的空转 fire 累计——M-advance 复查路径，非回退非重编译）
+        #   rule-engine: queued int（准入队列积压）, queue_cap int（准入容量）,
+        #     drop_warn_threshold int64（丢弃告警阈值）, admission_dropped int64
+        #     （准入满丢弃——Enqueue full）, matched_actions int64（命中计数）,
+        #     persist_queued int（持久化队列积压）, persist_cap int（持久化容量）,
+        #     persist_dropped int64（持久化满丢弃）, persist_failures int64
+        #     （持久化执行失败）
+         #   quality-flow-owner: running bool, queued int（提交队列深度）,
+         #     queue_cap int（固定容量）, accepted int64, processed int64,
+         #     overflowed int64, edge_rows_accepted int64, edge_rows_dropped int64,
+         #     pending_minutes int, pending_bytes int64, last_merge_duration_ms int64,
+         #     residual_submissions int64, residual_rows int64, close_unix_ms int64
+         #   usage: pending_logs int64（未落库明细条数）, pending_waterline int64
         #     （水线）, warned bool（水线告警边沿）
-        #   billing（游标消费者，F2 ledger-cursor）: lag_ms int64（游标积压时滞
+        #   billing（游标消费者，ledger-cursor）: lag_ms int64（游标积压时滞
         #     毫秒 = 最近周期探测的 now − 最老 unbilled 行 created_at；0 = 游标空/
         #     未探测）, unbilled_rows int64（当前未扣费账本行数）, quarantined_rows
         #     int64（累计隔离行数——用户缺失组）, last_cycle_unix_ms
@@ -3046,12 +4586,46 @@ components:
         #     exempt_queue_cap int（豁免队列容量）, dropped_reject int64（拒绝行丢弃累计）,
         #     dropped_exempt int64（双轨行丢弃累计）, inserted int64（成功落盘累计）,
         #     warned_reject bool, warned_exempt bool（丢弃告警边沿）
+        #   cont-bind（REST 续接异步绑定 worker）: queued int（有界队列积压）,
+        #     queue_cap int（队列容量）, bound int64（created/refreshed 成功落库累计）,
+        #     dropped int64（队列满/已关闭丢弃累计）, failed int64（批量失败/逐条
+        #     I/O 错误累计）, conflicts int64（CAS conflict 累计——保留旧绑定，非
+        #     必然 410）, unattributed int64（可归属拒绝累计：缺 dispatch/reqMeta/指纹）
         #   pricing-sync: running bool, last_sync_unix_ms int64（最近 fetch 尝试时刻）
         #   retention: last_patrol_unix_ms int64（最近巡检完成时刻）,
         #     last_dropped_log_partitions int64, last_dropped_errlog_partitions int64,
         #     last_dropped_stats_partitions int64（最近成功轮 DROP 分区数；失败轮保留上轮）,
-        #     log_retention_days int, errlog_retention_days int, stats_retention_days int
-        #   notify: running bool
+        #     last_dropped_entity_stats_partitions int64（usage_entity_stats
+        #     DROP 分区数；与 stats 同 StatsRetentionDays，失败轮保留上轮值）,
+        #     last_dropped_routing_quality_partitions int64（routing_quality_fact
+        #     最近成功轮 DROP 分区数；失败轮保留上轮值；0 也可能=无过期分区）,
+        #     last_dropped_routing_flow_partitions int64（routing_flow_fact 同上口径）,
+        #     oldest_partition_unix_ms int64（路由两张事实表最老分区下界；0 = 无分区。
+        #     早于观测保留 cutoff ⇒ Warn——保留 worker 停摆时分区会静默无界增长的兜底观测）,
+        #     partition_count int64（路由两张事实表分区总数）,
+        #     quality_partition_count int64（routing_quality_fact 分区数：一表 DROP
+        #     失败时聚合只显漂移，此值定位故障表）,
+        #     quality_oldest_partition_unix_ms int64（routing_quality_fact 最老分区下界）,
+        #     flow_partition_count int64（routing_flow_fact 分区数）,
+        #     flow_oldest_partition_unix_ms int64（routing_flow_fact 最老分区下界）,
+        #     snapshot_state_rows int64（routing_flow_snapshot_state 当前总行数；
+        #     普通表无分区可 DROP，DELETE 失败即无界增长）,
+        #     undated_partition_count int64（名解析失败的分区数；既不计数也不 DROP）,
+        #     partition_stats_stale bool（true = 统计查询失败，当前值为上轮过期值）,
+        #     last_blocked_log_partitions int64（最近一轮 usage_logs 分区退休屏障
+        #     挡下的分区数——§3.11），
+        #     blocked_alert object（持久 blocked 告警：partitions[]（name /
+        #     uncredited_earn_rows / unbilled_rows / oldest_uncredited_unix_ms /
+        #     recon_source_keys / recon_mismatch / recon_open_keys）/
+        #     first_blocked_unix_ms / oldest_uncredited_unix_ms；nil = 无阻断。
+        #     跨巡检轮保留，解除轮清空——绝不默默清债）,
+        #     disk_free_bytes int64（数据盘可用空间；探针未装配 = 0）,
+        #     disk_eta_seconds int64（预计磁盘耗尽秒数；-1 = unknown）,
+        #     capacity_blocked bool（可用空间低于下限 ⇒ 停供应商新流量）,
+        #     disk_observed_unix_ms int64（最近一次磁盘采样时刻）,
+        #     log_retention_days int, errlog_retention_days int, stats_retention_days int,
+        #     routing_observation_retention_days int（oldest 的 cutoff 解释口径）
+        #   notify: running bool, ready bool（LISTEN + FullRefresh 已完成——不漏增量的启动屏障）
         #   auth-sync: running bool, last_reload_unix_ms int64（最近成功 Reload 时刻）,
         #     failures int64（Reload 失败累计）, last_failure_unix_ms int64（最近失败时刻）
         #   email: queued int（auth 队列深度）, queue_cap int（auth 队列容量 256）, warning_queued int（余额预警队列深度）, warning_queue_cap int（预警队列容量 256）, sent_total int64（成功投递累计）, failed_total int64（失败累计）, retry_total int64（重试累计）, dropped_total int64（队列满丢弃累计）, last_error string（最近一次投递失败的安全分类；空=无，脱敏不含原始错误明细）
@@ -3068,6 +4642,41 @@ components:
         #     users+keys；nil 视图=0）
         #   account-conc-sync（账号并发视图，spec conc-share-borrow-account）:
         #     键集同 conc-sync，tracked_entries = 账号条目数
+        #   quality-sync（intelligent-routing 路由质量实时同步 lane）:
+        #     pending_quality int（recorder 待落 PG 的质量行数，跨分钟桶求和）,
+        #     pending_flow int（待落 PG 的流量分钟桶数）, pending_bytes int64
+        #     （pending 保守字节账面）, lag_ms int64（最老 pending 分钟时滞毫秒；
+        #     0 = pending 空）, dropped_quality int64 / dropped_flow int64
+        #     （refill 容量拒收/溢出丢弃累计）, poison_dropped int64（毒行二分
+        #     隔离累计）, batch_quality int64（上轮 PG 写入质量行数）, batch_flow
+        #     int64（上轮 PG 写入流量分钟数）, freshness_ms int64（距最近一次
+        #     Redis 发布成功毫秒）, last_redis_ms int64 / last_pg_ms int64（上轮
+        #     Redis/PG 面耗时毫秒）, last_redis_attempt_ms int64（最近一次 Redis
+         #     发布尝试时刻；0 = 从未）, last_redis_error string（最近一次 Redis
+         #     失败文本；空 = 无）, redis_errors int64（Redis 发布失败累计）
+         #     residual_quality int64 / residual_flow int64（关闭截止时仍在途、
+         #     已转为可观测残余的质量/流量批次数）
+        #   runtime-health（健康投影 lane，intelligent-routing）: records int
+        #     （当前视图条目数）, open/retry_after/probing/ready int（按态分桶）,
+        #     generation int64（已同步全局健康世代）, last_sync_ok_unix_ms int64
+        #     （最近成功 Sync 时刻；0 = 从未）, sync_errors int64（Sync 失败累计
+        #     ——视图冻结的可见痕迹）, last_tick_ok bool（最近 tick 成败）
+        #   supplier-credit（记账链，spec 2026-10-09 §7.2）: lag_head int64（头行
+        #     快速 lag，行数；高频）, lag_full int64（完整 backlog 行数；降频）,
+        #     lag_earn int64（完整 backlog Σ earn，millis；降频）,
+        #     lag_observed_unix_ms int64（最近一次成功刷新 lag 的时刻；0 = 从未）,
+        #     lag_stale bool（true = 最近一轮刷新失败，呈现的是上轮旧值——不得当新鲜）
+        #   supplier-thaw（解冻链，spec 2026-10-09 §7.2/G7）: deleted_total int64
+        #     （累计删除桶行数）, cycles int64（周期数）, bucket_rows int64（冻结桶
+        #     总行数）, bucket_lag_seconds int64（最老未解冻桶 available_at 距今秒数；
+        #     全部未来/空 = 0）, overdue_rows int64（已到期桶行数）, overdue_amount
+        #     int64（已到期桶金额 millis）, thaw_rate_per_sec number（滚动 5min 成功
+        #     删除行/s）, recovery_eta_seconds int64（到期桶数/速率，秒；-1 = unknown）,
+        #     bucket_stale bool（true = 桶观测查询失败，呈现上轮旧值）
+        #   supplier-view（财务视图装载，spec 2026-10-09 §4.4/A13④）: attempts int64
+        #     （装载尝试累计）, success int64（成功装载累计）, snapshot object
+        #     （三态：loaded bool / revision int64 / last_success_unix_ms int64
+        #     （0 = 从未）/ stale_age_ms int64（-1 = 从未成功））
         stats:
           description: 各 worker 异构观测字段；完整字段清单见本 schema 上方 yaml 注释（与各 worker Stats() 实现同步维护）
     SnapshotState:
@@ -3162,7 +4771,7 @@ components:
     OverviewAlerts:
       type: object
       required: [billing_lag_ms, billing_unbilled_rows, billing_quarantined_rows]
-      description: 告警面（billing 游标消费者 lag 族观测，F2 ledger-cursor；注入面读取，未装配 = 全零）
+      description: 告警面（billing 游标消费者 lag 族观测，ledger-cursor；注入面读取，未装配 = 全零）
       properties:
         billing_lag_ms: { type: integer, format: int64, description: 游标积压时滞（毫秒）= 最近周期探测的 now − 最老 unbilled 行 created_at；0 = 游标空/未探测 }
         billing_unbilled_rows: { type: integer, format: int64, description: 当前未扣费账本行数（部分索引 WHERE NOT billed） }

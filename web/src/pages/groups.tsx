@@ -19,6 +19,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -26,6 +27,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Badge } from '@/components/ui/badge'
 import { toast } from '@/components/ui/toast'
 import { formatDateTime } from '@/components/fmt'
+import { formatGroupMultiplier as formatMultiplier } from '@/components/group-option'
 import { cn } from '@/lib/utils'
 import type { TFunction } from 'i18next'
 import type { components } from '@/lib/api/schema'
@@ -35,7 +37,7 @@ type GroupVisibility = components['schemas']['GroupVisibility']
 type GroupProtocolConvert = components['schemas']['GroupProtocolConvert']
 type GroupAssignmentsBody = components['schemas']['GroupAssignmentsBody']
 
-// 协议转换方向（W5 网关 internal/protoconv 消费）：4 方向可多选，全不勾 = off =
+// 协议转换方向（网关 internal/protoconv 消费）：4 方向可多选，全不勾 = off =
 // 不转换（off 不进数组，空勾选表达）
 const PROTOCOL_CONVERTS: GroupProtocolConvert[] = ['chat_to_resp', 'mess_to_resp', 'resp_to_mess', 'chat_to_mess']
 
@@ -64,14 +66,6 @@ function ProtocolConvertCheckboxes({ value, onChange }: {
 // 授予弹窗行内专属倍率态：mult = 输入框文本（'' = 未填）；cleared = 用户显式点过
 // 「清除为未设置」（提交 null）；勾选留空且未清除 = 省略键（沿用当前值）。
 interface AssignRowMult { mult: string; cleared: boolean }
-
-// 价格倍率（正常值，API 边界已换算）→ 展示：null = 未设置（—）；0 = 免费；
-// 其余 ×N（1 = ×1.0，1.5 = ×1.5）。
-const formatMultiplier = (m: number | null | undefined, t: TFunction): string => {
-  if (m == null) return '—'
-  if (m === 0) return t('groups.free')
-  return `×${m.toFixed(1)}`
-}
 
 // 倍率输入归一（创建/编辑共用）：空 = undefined（省略键）；非数字/越界抛错；
 // 正常值返回数字（0 = 免费组，1 = ×1，上限 10）。
@@ -390,11 +384,13 @@ export default function Groups() {
   //     倍率留空 = 省略键，后端按 ×1）——
   const [createOpen, setCreateOpen] = useState(false)
   const [createName, setCreateName] = useState('')
+  const [createDescription, setCreateDescription] = useState('')
   const [createVisibility, setCreateVisibility] = useState<GroupVisibility>('public')
   const [createProtocols, setCreateProtocols] = useState<GroupProtocolConvert[]>([])
   const [createMultiplier, setCreateMultiplier] = useState('')
   const openCreate = () => {
     setCreateName('')
+    setCreateDescription('')
     setCreateVisibility('public')
     setCreateProtocols([])
     setCreateMultiplier('')
@@ -404,6 +400,7 @@ export default function Groups() {
     mutationFn: (n: string) => {
       const body: components['schemas']['GroupCreate'] = {
         name: n,
+        description: createDescription.trim(), // 空串 = 无描述（恒发）
         visibility: createVisibility,
         protocol_convert: createProtocols, // 空数组 = off = 不转换
       }
@@ -423,6 +420,8 @@ export default function Groups() {
   const [editName, setEditName] = useState('')
   const [editVisibility, setEditVisibility] = useState<GroupVisibility>('public')
   const [editProtocols, setEditProtocols] = useState<GroupProtocolConvert[]>([])
+  // 描述：编辑弹窗预填当前值；PUT 恒发（空串 = 清空）
+  const [editDescription, setEditDescription] = useState('')
   // 倍率用字符串态：空 = 不修改（PUT 省略键，后端保持原值）
   const [editMultiplier, setEditMultiplier] = useState('')
   // —— 删除 ——
@@ -430,7 +429,7 @@ export default function Groups() {
 
   const rename = useMutation({
     mutationFn: () => {
-      const body: components['schemas']['GroupCreate'] = { name: editName.trim(), visibility: editVisibility, protocol_convert: editProtocols }
+      const body: components['schemas']['GroupCreate'] = { name: editName.trim(), description: editDescription.trim(), visibility: editVisibility, protocol_convert: editProtocols }
       const m = normalizeMultiplierInput(editMultiplier, t('groups.multiplierInvalid'))
       if (m !== undefined) body.price_multiplier = m // 正常值直接提交；输入为空则省略键（后端保持原值）
       return api.updateGroup(editTarget!.ID!, body)
@@ -500,7 +499,7 @@ export default function Groups() {
         </motion.div>
       ) : (
         <>
-          <ScrollArea data-od-id="table-scroll-groups" className="rounded-[14px] border border-transparent bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] after:pointer-events-none after:absolute after:inset-0 after:z-20 after:rounded-[14px] after:border after:border-[rgba(19,45,83,0.26)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:after:border-[rgba(148,180,220,0.32)]" showHorizontal>
+          <ScrollArea data-od-id="table-scroll-groups" className="rounded-[14px] border border-[rgba(19,45,83,0.26)] bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:border-[rgba(148,180,220,0.32)]" showHorizontal>
             <Table className="min-w-[980px]" containerClassName="overflow-x-visible border-0 shadow-none rounded-none bg-transparent backdrop-blur-none">
               <TableHeader>
                 <TableRow>
@@ -513,6 +512,7 @@ export default function Groups() {
                   </TableHead>
                   <SortableHeader field="id" label="ID" active={activeSort === 'id'} order={order} onToggle={onColumnToggle} />
                   <SortableHeader field="name" label={t('groups.table.name')} active={activeSort === 'name'} order={order} onToggle={onColumnToggle} />
+                  <TableHead>{t('groups.table.description')}</TableHead>
                   <TableHead>{t('groups.table.visibility')}</TableHead>
                   <TableHead>{t('groups.table.priceMultiplier')}</TableHead>
                   <TableHead>{t('groups.table.protocolConvert')}</TableHead>
@@ -528,6 +528,7 @@ export default function Groups() {
                     </TableCell>
                     <TableCell className="tabular-nums">{g.ID}</TableCell>
                     <TableCell className="max-w-36 truncate" title={g.Name}>{g.Name}</TableCell>
+                    <TableCell className="max-w-48 whitespace-pre-line break-words line-clamp-2" title={g.Description}>{g.Description || '—'}</TableCell>
                     <TableCell><VisibilityBadge visibility={g.Visibility} /></TableCell>
                     <TableCell className="tabular-nums">{formatMultiplier(g.PriceMultiplier, t)}</TableCell>
                     <TableCell>
@@ -545,7 +546,7 @@ export default function Groups() {
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-1">
                         <Button variant="ghost" size="icon-sm" title={t('groups.assignButton')} onClick={() => openAssign(g)}><UserPlus /></Button>
-                        <Button variant="ghost" size="icon-sm" title={t('common.edit')} onClick={() => { setEditTarget(g); setEditName(g.Name ?? ''); setEditVisibility(g.Visibility ?? 'public'); setEditProtocols(g.ProtocolConvert ?? []); setEditMultiplier(g.PriceMultiplier != null ? String(g.PriceMultiplier) : '') }}><Pencil /></Button>
+                        <Button variant="ghost" size="icon-sm" title={t('common.edit')} onClick={() => { setEditTarget(g); setEditName(g.Name ?? ''); setEditDescription(g.Description ?? ''); setEditVisibility(g.Visibility ?? 'public'); setEditProtocols(g.ProtocolConvert ?? []); setEditMultiplier(g.PriceMultiplier != null ? String(g.PriceMultiplier) : '') }}><Pencil /></Button>
                         <Button variant="ghost" size="icon-sm" className="text-destructive" title={t('common.delete')} onClick={() => setDeleting(g)}><Trash2 /></Button>
                       </div>
                     </TableCell>
@@ -574,6 +575,15 @@ export default function Groups() {
                 placeholder={t('groups.namePlaceholder')}
                 onChange={e => setCreateName(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Enter' && createName.trim() && !create.isPending) create.mutate(createName.trim()) }}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="grp-description">{t('groups.descriptionLabel')}</Label>
+              <Textarea
+                id="grp-description"
+                value={createDescription}
+                placeholder={t('groups.descriptionPlaceholder')}
+                onChange={e => setCreateDescription(e.target.value)}
               />
             </div>
             <div className="space-y-1.5">
@@ -627,12 +637,21 @@ export default function Groups() {
       <Dialog open={!!editTarget} onOpenChange={o => { if (!o && !rename.isPending) setEditTarget(null) }}>
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
-            <DialogTitle>{t('groups.editTitle', { id: editTarget?.ID })}</DialogTitle>
+            <DialogTitle>{t('groups.editTitle', { id: editTarget?.ID ?? 0 })}</DialogTitle>
           </DialogHeader>
           <div className="space-y-3">
             <div className="space-y-1.5">
               <Label htmlFor="grp-edit-name">{t('groups.nameLabel')}</Label>
               <Input id="grp-edit-name" value={editName} onChange={e => setEditName(e.target.value)} />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="grp-edit-description">{t('groups.descriptionLabel')}</Label>
+              <Textarea
+                id="grp-edit-description"
+                value={editDescription}
+                placeholder={t('groups.descriptionPlaceholder')}
+                onChange={e => setEditDescription(e.target.value)}
+              />
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="grp-edit-visibility">{t('groups.visibilityLabel')}</Label>
@@ -686,7 +705,7 @@ export default function Groups() {
           <DialogHeader>
             <DialogTitle>{t('groups.deleteTitle')}</DialogTitle>
             <DialogDescription>
-              {t('groups.deleteDesc', { name: deleting?.Name })}
+              {t('groups.deleteDesc', { name: deleting?.Name ?? '' })}
             </DialogDescription>
           </DialogHeader>
           {remove.isError && errMsg(remove.error) && (
@@ -739,7 +758,7 @@ export default function Groups() {
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             {/* public：公开组无「授予」概念，弹窗 = 专属倍率管理；private：授予权限语义 */}
-            <DialogTitle>{t(assignIsPublic ? 'groups.assignPublicTitle' : 'groups.assignTitle', { name: assignTarget?.Name })}</DialogTitle>
+            <DialogTitle>{t(assignIsPublic ? 'groups.assignPublicTitle' : 'groups.assignTitle', { name: assignTarget?.Name ?? '' })}</DialogTitle>
             <DialogDescription>{t(assignIsPublic ? 'groups.assignPublicDesc' : 'groups.assignDesc')}</DialogDescription>
             <p className="text-xs text-muted-foreground">{t('groups.assignMultiplierHint')}</p>
             {assignPrefilled && assignChecked.length > 0 && (

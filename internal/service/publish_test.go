@@ -16,12 +16,12 @@ import (
 	"github.com/is7qin/c3api/internal/repository"
 )
 
-// pubRecorder 记录 Publish 收到的 Change 的测试假件（#14 T2 发布点断言：
+// pubRecorder 记录 Publish 收到的 Change 的测试假件（发布点断言：
 // 各变更路径发布对应 Change，一次操作一条 NOTIFY）。
 type pubRecorder struct {
 	mu        sync.Mutex
 	calls     []notify.Change
-	cancelled bool // 最近一次 Publish 收到的 ctx 已取消（评审 I-2 断言）
+	cancelled bool // 最近一次 Publish 收到的 ctx 已取消（断言）
 }
 
 func (r *pubRecorder) Publish(ctx context.Context, ch notify.Change) error {
@@ -63,25 +63,6 @@ func (r *pubRecorder) countKeys() int {
 	return n
 }
 
-// recLocalDispatcher 本地分发器假件（#36 本地即时重算断言）：记录 Apply 收到
-// 的 Change（实现 notify.Dispatcher——与生产 dispatcher 同接口）。
-type recLocalDispatcher struct {
-	mu      sync.Mutex
-	applied []notify.Change
-}
-
-func (r *recLocalDispatcher) Apply(ctx context.Context, ch notify.Change) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.applied = append(r.applied, ch)
-}
-func (r *recLocalDispatcher) FullRefresh(ctx context.Context) error { return nil }
-func (r *recLocalDispatcher) changes() []notify.Change {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]notify.Change(nil), r.applied...)
-}
-
 // newPubSvc 构造带 pubRecorder 的 Service（settings 快照加载默认值——
 // RegisterUser 读 signup_enabled）。
 func newPubSvc() (*Service, *fakeStore, *pubRecorder) {
@@ -92,14 +73,14 @@ func newPubSvc() (*Service, *fakeStore, *pubRecorder) {
 	return svc, fs, pr
 }
 
-// TestPublishMatrix #14 T2 发布点矩阵：inv.* 调用点并排发布 + 三现状缺口。
+// TestPublishMatrix 发布点矩阵：inv.* 调用点并排发布 + 三现状缺口。
 func TestPublishMatrix(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("key CRUD 缺口 → Keys:true，一次操作一条", func(t *testing.T) {
 		svc, fs, pr := newPubSvc()
 		u := seedUser(t, fs, "k@example.com", 0, 0)
-		g, err := svc.CreateGroup(ctx, "g", domain.GroupVisibilityPublic, nil, nil)
+		g, err := svc.CreateGroup(ctx, "g", "", domain.GroupVisibilityPublic, nil, nil)
 		require.NoError(t, err)
 
 		// 创建（quota 门禁字段落库 + Auth 增量注册）→ Keys
@@ -114,7 +95,7 @@ func TestPublishMatrix(t *testing.T) {
 
 		// 改额度（quota）→ Keys
 		q := int64(2000)
-		_, err = svc.UpdateKey(ctx, u.ID, created.ID, nil, nil, nil, &q)
+		_, err = svc.UpdateKey(ctx, u.ID, created.ID, nil, nil, nil, &q, nil)
 		require.NoError(t, err)
 		require.True(t, pr.last().Keys, "key 改额度 → Keys:true")
 
@@ -168,7 +149,7 @@ func TestPublishMatrix(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, pr.last().Users, "注册 → Users:true")
 
-		u, err := svc.CreateUser(ctx, "adm@example.com", "pw12345678", domain.RoleUser, domain.UserStatusActive, 8, 1000)
+		u, err := svc.CreateUser(ctx, "adm@example.com", "pw12345678", domain.RoleUser, domain.UserStatusActive, 8, 1000, 0)
 		require.NoError(t, err)
 		require.True(t, pr.last().Users, "管理面创建用户 → Users:true")
 
@@ -180,7 +161,7 @@ func TestPublishMatrix(t *testing.T) {
 			ID: u.ID, Role: &role, Status: &st,
 			MaxConcurrency: &mc, OldMaxConcurrency: &oldMC,
 			Balance: &bal, OldBalance: &oldBal,
-		})
+		}, 0)
 		require.NoError(t, err)
 		require.True(t, pr.last().Users, "更新用户 → Users:true")
 		require.Equal(t, 3, pr.total(), "一次操作一条 NOTIFY")
@@ -204,13 +185,16 @@ func TestPublishMatrix(t *testing.T) {
 			SupportedFormats: []domain.RequestFormat{domain.FormatOpenAIChat},
 		})
 		require.NoError(t, err)
-		g1, err := svc.CreateGroup(ctx, "g1", domain.GroupVisibilityPublic, nil, nil)
+		g1, err := svc.CreateGroup(ctx, "g1", "", domain.GroupVisibilityPublic, nil, nil)
 		require.NoError(t, err)
-		g2, err := svc.CreateGroup(ctx, "g2", domain.GroupVisibilityPublic, nil, nil)
+		g2, err := svc.CreateGroup(ctx, "g2", "", domain.GroupVisibilityPublic, nil, nil)
 		require.NoError(t, err)
 
-		acc, err := svc.CreateAccount(ctx, &domain.Account{
-			Name: "a1", TemplateID: tpl.ID, UpstreamKey: "sk-1", GroupIDs: &[]int64{g1.ID, g2.ID},
+		acc, err := svc.CreateAccount(ctx, repository.AccountPatch{
+			Name:        strPtr("a1"),
+			TemplateID:  int64Ptr(tpl.ID),
+			UpstreamKey: strPtr("sk-1"),
+			GroupIDs:    &[]int64{g1.ID, g2.ID},
 		})
 		require.NoError(t, err)
 		got := pr.last()
@@ -219,9 +203,9 @@ func TestPublishMatrix(t *testing.T) {
 
 		// 移组 g1→g2 + upstream_key 变更：Groups（旧+新）+ Clients 同一条
 		before := pr.total()
-		_, err = svc.UpdateAccount(ctx, &domain.Account{
-			ID: acc.ID, Name: "a1", TemplateID: tpl.ID, UpstreamKey: "sk-2", GroupIDs: &[]int64{g2.ID},
-		})
+		_, err = svc.PatchAccount(ctx, acc.ID, repository.AccountPatch{
+			UpstreamKey: strPtr("sk-2"), GroupIDs: &[]int64{g2.ID},
+		}, nil)
 		require.NoError(t, err)
 		got = pr.last()
 		require.ElementsMatch(t, []int64{g1.ID, g2.ID, g2.ID}, got.Groups, "移组 A→B：旧组+新组")
@@ -241,14 +225,14 @@ func TestPublishMatrix(t *testing.T) {
 	})
 }
 
-// TestPublishNilPublisher pub 未装配（T2 过渡）→ no-op 不 panic。
+// TestPublishNilPublisher pub 未装配（过渡）→ no-op 不 panic。
 func TestPublishNilPublisher(t *testing.T) {
 	ctx := context.Background()
 	fs := newFakeStore()
 	svc := &Service{store: fs, inv: &invRecorder{}, log: nil}
 	u := seedUser(t, fs, "nilpub@example.com", 0, 0)
 	svc.publish(ctx, notify.Change{Users: true}) // 直接调用也不 panic（nil 容忍）
-	_, err := svc.CreateUser(ctx, u.Email+"2", "pw12345678", domain.RoleUser, domain.UserStatusActive, 8, 1000)
+	_, err := svc.CreateUser(ctx, u.Email+"2", "pw12345678", domain.RoleUser, domain.UserStatusActive, 8, 1000, 0)
 	require.NoError(t, err, "nil publisher 下业务路径正常")
 }
 
@@ -268,55 +252,26 @@ func TestReloadSettings(t *testing.T) {
 	require.Equal(t, "false", svc.settingValue("signup_enabled"), "ReloadSettings 后生效")
 }
 
-// TestUpdateSettingLocalScopeReload #36 本地实例即时重算（R2 M-1）：UpdateSetting
-// 除广播 NOTIFY（其余实例）外，还须直连本地分发器（自播 NOTIFY 被 Listener
-// Src 跳过，本地实例快照刷新与 scope 重载不能依赖 NOTIFY 回环）。观测键用
-// signup_enabled（cluster.instances 已随 Redis 实例发现移除，spec
-// 2026-08-25-redis-instance-discovery-design §2.4——时序契约本身不变，换键锚定）。
-func TestUpdateSettingLocalScopeReload(t *testing.T) {
-	ctx := context.Background()
-	fs := newFakeStore()
-	ld := &recLocalDispatcher{}
-	svc := &Service{store: fs, local: ld, log: nil}
-	svc.reloadSettings(ctx)
-	require.Equal(t, "true", svc.settingValue("signup_enabled"), "无 DB 行 → 注册表默认 true")
-
-	_, err := svc.UpdateSetting(ctx, "signup_enabled", "false")
-	require.NoError(t, err)
-	require.Equal(t, "false", svc.settingValue("signup_enabled"), "本地快照即时生效（既有行为）")
-	got := ld.changes()
-	require.Len(t, got, 1, "本地分发收到一次 settings 变更")
-	require.True(t, got[0].Settings, "本地分发载荷 Settings:true")
-
-	// 非 settings 变更不触发本地分发（本地直连仅限 settings scope 分发）。
-	svc2 := &Service{store: fs, local: ld, inv: NopInvalidator{}, log: nil}
-	svc2.reloadSettings(ctx)
-	u := seedUser(t, fs, "ld@example.com", 0, 0)
-	_, err = svc2.CreateUser(ctx, u.Email+"2", "pw12345678", domain.RoleUser, domain.UserStatusActive, 8, 1000)
-	require.NoError(t, err)
-	require.Len(t, ld.changes(), 1, "用户创建不触发本地 settings 分发")
-}
-
 // 组/assignment 倍率断言补充（避免上文中途废弃的深拷贝占位）。
 func TestPublishMultipliersAndGroupDelete(t *testing.T) {
 	ctx := context.Background()
 	svc, fs, pr := newPubSvc()
-	g, err := svc.CreateGroup(ctx, "g", domain.GroupVisibilityPublic, nil, nil)
+	g, err := svc.CreateGroup(ctx, "g", "", domain.GroupVisibilityPublic, nil, nil)
 	require.NoError(t, err)
 	require.True(t, pr.last().Multipliers, "创建组 → Multipliers:true")
-	require.False(t, pr.last().Keys, "组创建无 key → 不置 Keys（A-3：创建后建 key 的即时性由 A-2 增量注册保证）")
+	require.False(t, pr.last().Keys, "组创建无 key → 不置 Keys（创建后建 key 的即时性由 增量注册保证）")
 
 	_, err = svc.UpdateGroup(ctx, &domain.Group{ID: g.ID, Name: "g", PriceMultiplier: 20000, ProtocolConverts: nil})
 	require.NoError(t, err)
 	require.True(t, pr.last().Multipliers, "更新组倍率 → Multipliers:true")
-	require.True(t, pr.last().Keys, "组更新（含 protocol_convert 变更）→ Keys:true——旧 key meta 即时收敛（A-3）")
+	require.True(t, pr.last().Keys, "组更新（含 protocol_convert 变更）→ Keys:true——旧 key meta 即时收敛")
 
 	u := seedUser(t, fs, "am@example.com", 0, 0)
 	_, _, err = svc.SetGroupAssignments(ctx, g.ID, []int64{u.ID}, map[int64]*int{u.ID: intPtr(5000)})
 	require.NoError(t, err)
 	require.True(t, pr.last().Multipliers, "assignment 专属倍率 → Multipliers:true")
 
-	// 用户维度写（评审 M-1 补齐）：SetUserGroups → Multipliers:true 同组维度
+	// 用户维度写（补齐）：SetUserGroups → Multipliers:true 同组维度
 	_, _, err = svc.SetUserGroups(ctx, u.ID, []int64{g.ID}, nil)
 	require.NoError(t, err)
 	require.True(t, pr.last().Multipliers, "用户维度分组写 → Multipliers:true")
@@ -330,9 +285,9 @@ func TestPublishMultipliersAndGroupDelete(t *testing.T) {
 	require.Equal(t, before+1, pr.total(), "一次操作一条 NOTIFY（合并单条）")
 }
 
-// TestPublishEmptyChangeSkipped 评审 I-1：空 Change（全字段 false + Groups 空）
+// TestPublishEmptyChangeSkipped：空 Change（全字段 false + Groups 空）
 // → publish 判空跳过，Publisher 收到 0 条。CreateAccount 无 GroupIDs 的空载荷
-// 即被覆盖（与 O2 inv.Accounts 空集 no-op 同语义）。
+// 即被覆盖（与 inv.Accounts 空集 no-op 同语义）。
 func TestPublishEmptyChangeSkipped(t *testing.T) {
 	ctx := context.Background()
 
@@ -350,14 +305,16 @@ func TestPublishEmptyChangeSkipped(t *testing.T) {
 		})
 		require.NoError(t, err)
 		before := pr.total() // 上一步创建模板已发布 1 条（Templates:true）
-		_, err = svc.CreateAccount(ctx, &domain.Account{
-			Name: "a1", TemplateID: tpl.ID, UpstreamKey: "sk-1", // 无 GroupIDs
+		_, err = svc.CreateAccount(ctx, repository.AccountPatch{
+			Name:        strPtr("a1"),
+			TemplateID:  int64Ptr(tpl.ID),
+			UpstreamKey: strPtr("sk-1"),
 		})
 		require.NoError(t, err)
 		require.Equal(t, before, pr.total(), "无分组账号 → 空 Change 跳过，不发布")
 	})
 
-	t.Run("UpdateAccount 无变更 → 空载荷不发布", func(t *testing.T) {
+	t.Run("补丁无变更 → 空载荷不发布", func(t *testing.T) {
 		svc, _, pr := newPubSvc()
 		tpl, err := svc.CreateTemplate(ctx, &domain.Template{
 			Name: "t", BaseURL: "https://t.example.com",
@@ -366,8 +323,10 @@ func TestPublishEmptyChangeSkipped(t *testing.T) {
 		require.NoError(t, err)
 		// 无分组账号（创建时无 GroupIDs → 发布跳过，计数不变）
 		before := pr.total() // 上一步模板创建已发布 1 条（Templates:true）
-		acc, err := svc.CreateAccount(ctx, &domain.Account{
-			Name: "a1", TemplateID: tpl.ID, UpstreamKey: "sk-1",
+		acc, err := svc.CreateAccount(ctx, repository.AccountPatch{
+			Name:        strPtr("a1"),
+			TemplateID:  int64Ptr(tpl.ID),
+			UpstreamKey: strPtr("sk-1"),
 		})
 		require.NoError(t, err)
 		require.Equal(t, before, pr.total(), "无分组账号创建 → 空 Change 跳过")
@@ -375,15 +334,13 @@ func TestPublishEmptyChangeSkipped(t *testing.T) {
 		// GroupIDs nil = 不变（账号无组 → oldGroups 空），UpstreamKey 相同
 		// → keyChanged false → gids 空 → 空 Change 跳过
 		before = pr.total()
-		_, err = svc.UpdateAccount(ctx, &domain.Account{
-			ID: acc.ID, Name: "a1", TemplateID: tpl.ID, UpstreamKey: "sk-1",
-		})
+		_, err = svc.PatchAccount(ctx, acc.ID, repository.AccountPatch{UpstreamKey: strPtr("sk-1")}, nil)
 		require.NoError(t, err)
 		require.Equal(t, before, pr.total(), "无变更更新 → 空 Change 跳过，不发布")
 	})
 }
 
-// TestPublishDetachedFromRequestCtx 评审 I-2：请求 ctx 已取消时发布仍发出——
+// TestPublishDetachedFromRequestCtx 请求 ctx 已取消时发布仍发出——
 // publish 用 context.WithoutCancel 剥离取消信号（客户端断开不吞 NOTIFY），
 // Publisher 收到的 ctx 未取消（Err()==nil）。
 func TestPublishDetachedFromRequestCtx(t *testing.T) {

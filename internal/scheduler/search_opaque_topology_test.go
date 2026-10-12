@@ -22,7 +22,7 @@ func TestSearchRouteTopologyPreserved(t *testing.T) {
 		Models:           []string{"gpt-4o"},
 		ModelMapping:     map[string]domain.ModelMappingEntry{"gpt-4o": {MappedModel: "upstream-b", Mode: domain.ModelMappingModeImplicit}},
 	}
-	a := &domain.Account{ID: 10, TemplateID: 1, Template: tpl, UpstreamKey: "k", Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4}
+	a := &domain.Account{ID: 10, TemplateID: 1, Template: tpl, UpstreamKey: "k", Enabled: true, MaxConcurrency: 4}
 	s := newTestScheduler(t, []*domain.Account{a})
 
 	// 同一快照内：Select(Responses) 应用映射，SelectOpaque(Responses) 透明
@@ -30,14 +30,14 @@ func TestSearchRouteTopologyPreserved(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "upstream-b", sel.Model, "Select 命中映射")
 	require.Equal(t, domain.ModelMappingModeImplicit, sel.ModelMappingMode)
-	s.Release(sel.AccountID)
+	sel.Release()
 
 	sel2, err := s.SelectOpaque(10, domain.FormatOpenAIResponses, "gpt-4o")
 	require.NoError(t, err)
 	require.Equal(t, "gpt-4o", sel2.Model, "SelectOpaque 跳过映射，保持客户端模型")
 	require.Equal(t, domain.ModelMappingModeInvalid, sel2.ModelMappingMode)
 	require.Equal(t, "", sel2.LogMappedModel("gpt-4o"), "opaque MappedModel 为空")
-	s.Release(sel2.AccountID)
+	sel2.Release()
 
 	// Search 桶不存在：直接 Select(Search) 恒 404，不回退
 	_, err = s.Select(10, domain.FormatOpenAISearch, "gpt-4o")
@@ -51,13 +51,13 @@ func TestSearchRouteTopologyPreserved(t *testing.T) {
 	sel3, err := s.SelectOpaque(10, domain.FormatOpenAIResponses, "gpt-4o")
 	require.NoError(t, err, "历史模板仅声明 responses，Search 复用 responses 桶应成功")
 	require.Equal(t, domain.FormatOpenAIResponses, sel3.Format, "桶格式为 responses")
-	s.Release(sel3.AccountID)
+	sel3.Release()
 
 	// 非 Search 行为不变：Responses 映射仍生效
 	sel4, err := s.Select(10, domain.FormatOpenAIResponses, "gpt-4o")
 	require.NoError(t, err)
 	require.Equal(t, "upstream-b", sel4.Model)
-	s.Release(sel4.AccountID)
+	sel4.Release()
 }
 
 // TestSearchOpaqueDoesNotAlterEligibility ensures mapping does not affect Search eligibility
@@ -71,28 +71,28 @@ func TestSearchOpaqueDoesNotAlterEligibility(t *testing.T) {
 		Models:           []string{"gpt-4o"},
 		ModelMapping:     map[string]domain.ModelMappingEntry{"alias": {MappedModel: "gpt-4o", Mode: domain.ModelMappingModeExplicit}},
 	}
-	a := &domain.Account{ID: 10, TemplateID: 1, Template: tpl, UpstreamKey: "k", Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4}
+	a := &domain.Account{ID: 10, TemplateID: 1, Template: tpl, UpstreamKey: "k", Enabled: true, MaxConcurrency: 4}
 	s := newTestScheduler(t, []*domain.Account{a})
 
 	// 普通 Responses 对 alias 命中 mapping 的 tier1 (Serves via mapping)
 	sel, err := s.Select(10, domain.FormatOpenAIResponses, "alias")
 	require.NoError(t, err)
 	require.Equal(t, "gpt-4o", sel.Model)
-	s.Release(sel.AccountID)
+	sel.Release()
 
 	// Search 透明同样经 Responses 桶对 alias 可选，但返回 alias（不映射到 gpt-4o）
 	sel2, err := s.SelectOpaque(10, domain.FormatOpenAIResponses, "alias")
 	require.NoError(t, err)
 	require.Equal(t, "alias", sel2.Model, "Search 透明不映射")
-	s.Release(sel2.AccountID)
+	sel2.Release()
 
 	// buildRoutes must not have Search entry regardless of mapping
-	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil)
+	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil, nil, nil)
 	require.NoError(t, re.Reload(context.Background()))
 	loader := newMemLoader(map[int64][]*domain.Account{10: {a}})
-	ns := New(testCfg(), loader, re, nil)
+	ns := New(testCfg(), loader, re, nil, nil, nil, nil)
 	require.NoError(t, ns.reload(context.Background()))
-	groups, _ := ns.store.groups.Load().(map[int64]*groupSnapshot)
+	groups := ns.View().Groups()
 	gs := groups[10]
 	_, hasSearch := gs.routes[routeKey{domain.FormatOpenAISearch, "gpt-4o"}]
 	require.False(t, hasSearch, "buildRoutes 不应产生 Search 桶")

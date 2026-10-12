@@ -42,6 +42,11 @@ func (f *fakeAuthUpsert) Delete(hash string) {
 	delete(f.keys, hash)
 }
 
+// UpsertManagementKey/DeleteManagementKey 补全 AuthRegistrar（管理 key 面 no-op：
+// 本用例只断言用户/客户端 key 快照路径）。
+func (f *fakeAuthUpsert) UpsertManagementKey(string, domain.ManagementKeyMeta) {}
+func (f *fakeAuthUpsert) DeleteManagementKey(string)                           {}
+
 func (f *fakeAuthUpsert) UpsertUser(userID int64, snap domain.UserSnapshot) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -65,7 +70,7 @@ func TestCreateUser_ImmediateUserSnapshot(t *testing.T) {
 	svc := &Service{store: fs, inv: rec, keys: auth, log: nil}
 
 	created, err := svc.CreateUser(context.Background(), "snap@example.com", "pw12345678",
-		domain.RoleUser, domain.UserStatusActive, 8, 1000)
+		domain.RoleUser, domain.UserStatusActive, 8, 1000, 0)
 	require.NoError(t, err)
 
 	snap, ok := auth.snapshot(created.ID)
@@ -81,7 +86,7 @@ func TestRegisterUser_ImmediateUserSnapshot(t *testing.T) {
 	fs := newFakeStore()
 	auth := newFakeAuthUpsert()
 	rec := &invRecorder{}
-	svc := New(fs, nil, rec, nil, nil, auth, nil)
+	svc := New(Deps{Store: fs, Scheduler: nil, Invalidate: rec, Publisher: nil, RuleReload: nil, Auth: auth, Log: nil, EmailCodeStore: testEmailCodes})
 	// 注册前 settings 默认 signup_enabled=true（fakeStore 未设 → DefaultSetting 回退）
 
 	u, err := svc.RegisterUser(context.Background(), "reg@example.com", "pw12345678")
@@ -102,14 +107,14 @@ func TestUpdateUser_ImmediateUserSnapshot(t *testing.T) {
 	svc := &Service{store: fs, inv: rec, keys: auth, log: nil}
 
 	u, err := svc.CreateUser(context.Background(), "up@example.com", "pw12345678",
-		domain.RoleUser, domain.UserStatusActive, 8, 1000)
+		domain.RoleUser, domain.UserStatusActive, 8, 1000, 0)
 	require.NoError(t, err)
 
 	// 变更 status 为 disabled（附带旧值条件）
 	st := domain.UserStatusDisabled
 	updated, err := svc.UpdateUser(context.Background(), &repository.UserPatch{
 		ID: u.ID, Status: &st,
-	})
+	}, 0)
 	require.NoError(t, err)
 	require.Equal(t, domain.UserStatusDisabled, updated.Status)
 
@@ -124,6 +129,6 @@ func TestCreateUser_NoAuthRegistrar_NoPanic(t *testing.T) {
 	fs := newFakeStore()
 	svc := &Service{store: fs, inv: &invRecorder{}, keys: nil, log: nil}
 	_, err := svc.CreateUser(context.Background(), "noop@example.com", "pw12345678",
-		domain.RoleUser, domain.UserStatusActive, 8, 1000)
+		domain.RoleUser, domain.UserStatusActive, 8, 1000, 0)
 	require.NoError(t, err)
 }

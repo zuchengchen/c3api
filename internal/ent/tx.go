@@ -16,6 +16,8 @@ type Tx struct {
 	Account *AccountClient
 	// AccountExt is the client for interacting with the AccountExt builders.
 	AccountExt *AccountExtClient
+	// BalanceLog is the client for interacting with the BalanceLog builders.
+	BalanceLog *BalanceLogClient
 	// EmailTemplate is the client for interacting with the EmailTemplate builders.
 	EmailTemplate *EmailTemplateClient
 	// ErrLog is the client for interacting with the ErrLog builders.
@@ -26,6 +28,8 @@ type Tx struct {
 	GroupAssignment *GroupAssignmentClient
 	// Key is the client for interacting with the Key builders.
 	Key *KeyClient
+	// ManagementKey is the client for interacting with the ManagementKey builders.
+	ManagementKey *ManagementKeyClient
 	// PriceEntry is the client for interacting with the PriceEntry builders.
 	PriceEntry *PriceEntryClient
 	// PriceVariant is the client for interacting with the PriceVariant builders.
@@ -38,6 +42,14 @@ type Tx struct {
 	Rule *RuleClient
 	// Setting is the client for interacting with the Setting builders.
 	Setting *SettingClient
+	// SupplierBalance is the client for interacting with the SupplierBalance builders.
+	SupplierBalance *SupplierBalanceClient
+	// SupplierFrozenChunk is the client for interacting with the SupplierFrozenChunk builders.
+	SupplierFrozenChunk *SupplierFrozenChunkClient
+	// SupplierReconciliation is the client for interacting with the SupplierReconciliation builders.
+	SupplierReconciliation *SupplierReconciliationClient
+	// SupplierSettlement is the client for interacting with the SupplierSettlement builders.
+	SupplierSettlement *SupplierSettlementClient
 	// TempBalance is the client for interacting with the TempBalance builders.
 	TempBalance *TempBalanceClient
 	// Template is the client for interacting with the Template builders.
@@ -185,17 +197,23 @@ func (tx *Tx) Client() *Client {
 func (tx *Tx) init() {
 	tx.Account = NewAccountClient(tx.config)
 	tx.AccountExt = NewAccountExtClient(tx.config)
+	tx.BalanceLog = NewBalanceLogClient(tx.config)
 	tx.EmailTemplate = NewEmailTemplateClient(tx.config)
 	tx.ErrLog = NewErrLogClient(tx.config)
 	tx.Group = NewGroupClient(tx.config)
 	tx.GroupAssignment = NewGroupAssignmentClient(tx.config)
 	tx.Key = NewKeyClient(tx.config)
+	tx.ManagementKey = NewManagementKeyClient(tx.config)
 	tx.PriceEntry = NewPriceEntryClient(tx.config)
 	tx.PriceVariant = NewPriceVariantClient(tx.config)
 	tx.RedemptionCode = NewRedemptionCodeClient(tx.config)
 	tx.RedemptionUse = NewRedemptionUseClient(tx.config)
 	tx.Rule = NewRuleClient(tx.config)
 	tx.Setting = NewSettingClient(tx.config)
+	tx.SupplierBalance = NewSupplierBalanceClient(tx.config)
+	tx.SupplierFrozenChunk = NewSupplierFrozenChunkClient(tx.config)
+	tx.SupplierReconciliation = NewSupplierReconciliationClient(tx.config)
+	tx.SupplierSettlement = NewSupplierSettlementClient(tx.config)
 	tx.TempBalance = NewTempBalanceClient(tx.config)
 	tx.Template = NewTemplateClient(tx.config)
 	tx.TemplateExt = NewTemplateExtClient(tx.config)

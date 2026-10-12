@@ -7,10 +7,12 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,25 +24,32 @@ import (
 	"github.com/is7qin/c3api/internal/service"
 )
 
-// hUsageSnap 逐账号可编程快照数据源（handler 装配矩阵注入面——service
-// CodexUsageSnapshotter 接口）。
+// hUsageSnap 逐账号可编程快照数据源（handler 装配矩阵注入面——handler
+// CodexUsageProber 接口，经 OpsOptions.UsageSnap 构造注入）。calls 记录每账号
+// 实收拨号次数（冻结断言：失效账号零调用）。
 type hUsageSnap struct {
 	snaps map[int64]*domain.CodexUsageSnapshot
 	errs  map[int64]error
+	mu    sync.Mutex
+	calls map[int64]int
 }
 
 func (s *hUsageSnap) GetUsageSnapshot(ctx context.Context, cred *domain.AccountCredential) (*domain.CodexUsageSnapshot, error) {
+	if s.calls != nil {
+		s.mu.Lock()
+		s.calls[cred.AccountID]++
+		s.mu.Unlock()
+	}
 	return s.snaps[cred.AccountID], s.errs[cred.AccountID]
 }
 
 // newUsageTestHandler /api/admin/accounts/usage 专用测试装配（h.now 注入 + 可编程
 // 快照数据源）。请求时区经 `timezone` 查询参数注入（request-tz：无装配级时区）。
-func newUsageTestHandler(t *testing.T, now time.Time, snap *hUsageSnap) (*AdminAPI, *fakeStore) {
+func newUsageTestHandler(t *testing.T, now time.Time, snap CodexUsageProber) (*AdminAPI, *fakeStore) {
 	t.Helper()
 	store := newFakeStore()
-	svc := service.New(store, fakeSched{}, service.NopInvalidator{}, nil, nil, &fakeKeys{}, nil)
-	svc.SetUsageSnapshotter(snap)
-	h := New(svc)
+	svc := service.New(service.Deps{Store: store, Scheduler: fakeSched{}, Invalidate: service.NopInvalidator{}, Publisher: nil, RuleReload: nil, Auth: &fakeKeys{}, Log: nil, EmailCodeStore: store})
+	h := New(svc, OpsOptions{UsageSnap: snap})
 	h.now = func() time.Time { return now }
 	return h, store
 }
@@ -55,6 +64,10 @@ func getUsage(h *AdminAPI, query string) *httptest.ResponseRecorder {
 
 // TestGetAccountsUsageValidation 参数校验矩阵：>100（去重后计）→ 400、空 ids →
 // 400、非数字 → 400、重复去重唯一、非法时间格式 → 400、from>to → 400。
+//
+// P3 追加：窗口**恰择一**（两态都给 / 只给一端 / 都不给 → 400 window_ambiguous）+
+// 只收时长（`window=7d` → 400 window_invalid）。**"缺省 = 当天"已删除**——它正是
+// "两态都不给"的第三种形态，按裁决删除而非兼容（无缺省即无双路径）。
 func TestGetAccountsUsageValidation(t *testing.T) {
 	h, _ := newUsageTestHandler(t, time.Date(2026, 8, 18, 15, 30, 0, 0, time.UTC), &hUsageSnap{})
 
@@ -75,10 +88,16 @@ func TestGetAccountsUsageValidation(t *testing.T) {
 		{"混入非数字", "account_ids=1,2,x", 400},
 		{"101 唯一 → 400", "account_ids=" + strings.Join(ids101, ","), 400},
 		{"101 原始含重复 → 400（normalizeIDs 惯例：原始长度检查在前）", "account_ids=" + strings.Join(dup101, ","), 400},
-		{"非法 from 格式", "account_ids=1&from=not-a-time", 400},
-		{"非法 to 格式", "account_ids=1&to=2026-13-99T00:00:00Z", 400},
+		{"非法 from 格式", "account_ids=1&to=2026-08-18T00:00:00Z&from=not-a-time", 400},
+		{"非法 to 格式", "account_ids=1&from=2026-08-18T00:00:00Z&to=2026-13-99T00:00:00Z", 400},
 		{"from > to", "account_ids=1&from=2026-08-18T12:00:00Z&to=2026-08-18T11:00:00Z", 400},
 		{"from == to", "account_ids=1&from=2026-08-18T11:00:00Z&to=2026-08-18T11:00:00Z", 400},
+		{"两态都不给 → window_ambiguous", "account_ids=1", 400},
+		{"只给 from → window_ambiguous", "account_ids=1&from=2026-08-18T11:00:00Z", 400},
+		{"只给 to → window_ambiguous", "account_ids=1&to=2026-08-18T11:00:00Z", 400},
+		{"window + from/to → window_ambiguous", "account_ids=1&window=24h&from=2026-08-18T11:00:00Z&to=2026-08-18T12:00:00Z", 400},
+		{"日历天窗口 7d → window_invalid（只收时长）", "account_ids=1&window=7d", 400},
+		{"相对窗口单独给出 → 200", "account_ids=1&window=24h", 200},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -88,13 +107,13 @@ func TestGetAccountsUsageValidation(t *testing.T) {
 	}
 }
 
-// TestGetAccountsUsageDefaultsAndOrdering 缺省时间注入（from=统计时区当日零点，
-// 未配置 = UTC；to=now——h.now 注入固定时钟，无真实 now 漂移）+ items 顺序 =
-// 去重后 account_ids 顺序 + 聚合与全量补零。
-func TestGetAccountsUsageDefaultsAndOrdering(t *testing.T) {
+// TestGetAccountsUsageWindowFormAndOrdering 相对窗口形态（P3）：`window=24h` 由
+// 服务端自持注入时钟算出**双界整点**的绝对窗口，另加 items 顺序 = 去重后
+// account_ids 顺序 + 聚合与全量补零。
+func TestGetAccountsUsageWindowFormAndOrdering(t *testing.T) {
 	now := time.Date(2026, 8, 18, 15, 30, 0, 0, time.UTC)
 	h, store := newUsageTestHandler(t, now, &hUsageSnap{})
-	base := time.Date(2026, 8, 18, 9, 0, 0, 0, time.UTC) // 当日窗内
+	base := time.Date(2026, 8, 18, 9, 0, 0, 0, time.UTC) // 窗内
 	store.logs = []*domain.UsageLog{
 		{RequestID: "d1", AccountID: 3, Format: domain.FormatOpenAIChat, ErrorType: domain.ErrNone, TotalTokens: 10, Cost: 100, RawCost: 200, CreatedAt: base},
 		{RequestID: "d2", AccountID: 1, Format: domain.FormatOpenAIChat, ErrorType: domain.ErrNone, TotalTokens: 100, Cost: 1000, RawCost: 3000, CreatedAt: base},
@@ -102,7 +121,7 @@ func TestGetAccountsUsageDefaultsAndOrdering(t *testing.T) {
 	}
 
 	// 重复 id（3,1,2,1）→ 去重后 [3,1,2]（顺序保持首次出现序）
-	rec := getUsage(h, "account_ids=3,1,2,1")
+	rec := getUsage(h, "account_ids=3,1,2,1&window=24h")
 	require.Equal(t, 200, rec.Code, "body: %s", rec.Body.String())
 
 	var resp AccountsUsageResponse
@@ -110,10 +129,15 @@ func TestGetAccountsUsageDefaultsAndOrdering(t *testing.T) {
 	require.Len(t, resp.Items, 3, "items 恒 = 去重后 ids 全量")
 	require.Equal(t, []int64{3, 1, 2}, []int64{resp.Items[0].AccountId, resp.Items[1].AccountId, resp.Items[2].AccountId}, "items 顺序 = 去重后 account_ids 顺序")
 
-	// 缺省时间注入断言（fake 收参 = handler 注入值）
+	// 相对窗口注入断言（fake 收参 = handler 由注入时钟算出的值）：
+	// to = ceilHour(now) = 16:00Z，from = to − 24h = 前一日 16:00Z，双界整点。
 	require.Equal(t, []int64{3, 1, 2}, store.aggIDs, "去重后 ids 传入 repo")
-	require.True(t, store.aggFrom.Equal(now.UTC().Truncate(24*time.Hour)), "缺省 from = UTC 当日零点（%v）", store.aggFrom)
-	require.True(t, store.aggTo.Equal(now), "缺省 to = now（注入时钟）（%v）", store.aggTo)
+	require.True(t, store.aggTo.Equal(time.Date(2026, 8, 18, 16, 0, 0, 0, time.UTC)),
+		"to = ceilHour(now)（%v）", store.aggTo)
+	require.True(t, store.aggFrom.Equal(time.Date(2026, 8, 17, 16, 0, 0, 0, time.UTC)),
+		"from = to − 24h（%v）", store.aggFrom)
+	require.Zero(t, store.aggFrom.Nanosecond())
+	require.Equal(t, 0, store.aggFrom.Minute())
 
 	// 聚合 + 补零：a3（1 行）、a1（2 行）、a2（无记录全 0）
 	g3 := resp.Items[0].Gateway
@@ -132,7 +156,7 @@ func TestGetAccountsUsageDefaultsAndOrdering(t *testing.T) {
 	require.Equal(t, int64(0), resp.Items[2].Gateway.TotalTokens)
 }
 
-// TestGetAccountsUsageExplicitRange 显式 from/to 透传（不做"当天"注入）。
+// TestGetAccountsUsageExplicitRange 显式 from/to 透传（绝对窗口形态，零改写）。
 func TestGetAccountsUsageExplicitRange(t *testing.T) {
 	h, store := newUsageTestHandler(t, time.Date(2026, 8, 18, 15, 30, 0, 0, time.UTC), &hUsageSnap{})
 	from := "2026-08-17T00:00:00Z"
@@ -145,7 +169,7 @@ func TestGetAccountsUsageExplicitRange(t *testing.T) {
 	require.True(t, store.aggTo.Equal(wantTo), "显式 to 透传（%v）", store.aggTo)
 }
 
-// TestGetAccountsUsageUpstreamAssembly 响应面 upstream 装配（task 3 接线）：
+// TestGetAccountsUsageUpstreamAssembly 响应面 upstream 装配：
 // api-key → upstream:null + upstream_error:null 显式输出；codex 成功 → 快照；
 // codex fatal → auth_expired；上游失败 → upstream_unavailable；单账号失败其余
 // 正常（整响应 200）。
@@ -163,7 +187,7 @@ func TestGetAccountsUsageUpstreamAssembly(t *testing.T) {
 	store.accExts[3] = &domain.AccountExt{AccountID: 3, CredentialType: credential.TypeCodexPAT, CodexPATKey: strPtr("pat-bad")}
 	store.accExts[4] = &domain.AccountExt{AccountID: 4, CredentialType: credential.TypeCodexPAT, CodexPATKey: strPtr("pat-net")}
 
-	rec := getUsage(h, "account_ids=1,2,3,4")
+	rec := getUsage(h, "account_ids=1,2,3,4&window=24h")
 	require.Equal(t, 200, rec.Code, "单账号快照失败不整批失败: %s", rec.Body.String())
 	var resp AccountsUsageResponse
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
@@ -183,7 +207,7 @@ func TestGetAccountsUsageUpstreamAssembly(t *testing.T) {
 	require.NotNil(t, resp.Items[1].Upstream.Credits.Balance)
 	require.Equal(t, "12.50", *resp.Items[1].Upstream.Credits.Balance)
 	require.Nil(t, resp.Items[1].UpstreamError)
-	// ResetAt nil → 契约层显式 null（非虚假 0001-01-01——T3-1 零值泄漏端到端修复）
+	// ResetAt nil → 契约层显式 null（非虚假 0001-01-01——零值泄漏端到端修复）
 	require.Contains(t, rec.Body.String(), `"reset_at":null`, "nil ResetAt → reset_at null")
 	require.NotContains(t, rec.Body.String(), "0001-01-01", "零值时间戳不外泄")
 
@@ -197,4 +221,174 @@ func TestGetAccountsUsageUpstreamAssembly(t *testing.T) {
 	require.NotNil(t, resp.Items[3].UpstreamError)
 	require.Equal(t, AccountUsageItemUpstreamError("upstream_unavailable"), *resp.Items[3].UpstreamError)
 }
+
+// TestGetAccountsUsageNilProber 未装配降级（UsageSnap nil = 旧 service
+// nil-setter 语义）：codex 账号 → upstream/upstream_error 双 null（不 panic，
+// 不整批失败）。生产组合根恒装配 codexAdapter，此路径生产不可达。
+func TestGetAccountsUsageNilProber(t *testing.T) {
+	now := time.Date(2026, 8, 18, 15, 30, 0, 0, time.UTC)
+	h, store := newUsageTestHandler(t, now, nil)
+	store.accExts[1] = &domain.AccountExt{AccountID: 1, CredentialType: credential.TypeCodexPAT, CodexPATKey: strPtr("pat-ok")}
+
+	rec := getUsage(h, "account_ids=1&window=24h")
+	require.Equal(t, 200, rec.Code, "body: %s", rec.Body.String())
+	var resp AccountsUsageResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Len(t, resp.Items, 1)
+	require.Nil(t, resp.Items[0].Upstream, "未装配 → codex 账号 null 快照")
+	require.Nil(t, resp.Items[0].UpstreamError)
+}
+
+// TestAssembleUpstreamStoreErrorIsolated store 故障隔离（原 service 侧
+// 用例搬迁）：GetAccountExt 非 ErrNotFound 错误 → 该账号 upstream null +
+// upstream_error null（不误标上游问题）+ 批内其余账号正常。
+func TestAssembleUpstreamStoreErrorIsolated(t *testing.T) {
+	h, store := newUsageTestHandler(t, time.Date(2026, 8, 18, 15, 30, 0, 0, time.UTC), &hUsageSnap{
+		snaps: map[int64]*domain.CodexUsageSnapshot{1: {PlanType: "chatgpt-plus"}},
+	})
+	store.accExts[1] = &domain.AccountExt{AccountID: 1, CredentialType: credential.TypeCodexPAT, CodexPATKey: strPtr("pat-ok")}
+	store.accExtErr[2] = errors.New("store down") // 非 ErrNotFound store 故障
+
+	items := []domain.AccountUsage{{AccountID: 1}, {AccountID: 2}}
+	h.assembleUpstream(context.Background(), items)
+	require.NotNil(t, items[0].Upstream, "其余账号正常")
+	require.Nil(t, items[0].UpstreamError)
+	require.Nil(t, items[1].Upstream, "store 故障账号 → null 快照")
+	require.Nil(t, items[1].UpstreamError, "store 故障账号 → null 标记（不误标上游问题）")
+}
+
+// gatedSnap 批内并行装配注入面：并发在途计数 + 闸门（第 2 个并发调用到达即
+// close twoInFlight 信号——断言并行实际发生，channel 同步禁 sleep）。
+type gatedSnap struct {
+	mu          sync.Mutex
+	inflight    int
+	maxInFlight int
+	signaled    bool
+	twoInFlight chan struct{}
+	release     chan struct{}
+	snaps       map[int64]*domain.CodexUsageSnapshot
+	errs        map[int64]error
+}
+
+func (g *gatedSnap) GetUsageSnapshot(ctx context.Context, cred *domain.AccountCredential) (*domain.CodexUsageSnapshot, error) {
+	g.mu.Lock()
+	g.inflight++
+	if g.inflight > g.maxInFlight {
+		g.maxInFlight = g.inflight
+	}
+	// 首达 2 即发信号（inflight 可因闸门放行后回落再回升——仅首次 close）
+	if g.inflight == 2 && !g.signaled {
+		g.signaled = true
+		close(g.twoInFlight)
+	}
+	g.mu.Unlock()
+	<-g.release
+	g.mu.Lock()
+	g.inflight--
+	g.mu.Unlock()
+	return g.snaps[cred.AccountID], g.errs[cred.AccountID]
+}
+
+func (g *gatedSnap) max() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.maxInFlight
+}
+
+// TestAssembleUpstreamParallel 批内并行装配（原 service 侧用例搬迁）：
+// N 账号 errgroup 有界并发（8）——闸门证明 ≥2 账号快照并发在途（串行装配恒
+// 1）；结果正确 + 顺序 = ids 顺序稳定 + 单账号失败不整批失败。
+func TestAssembleUpstreamParallel(t *testing.T) {
+	snap := &gatedSnap{
+		twoInFlight: make(chan struct{}),
+		release:     make(chan struct{}),
+		snaps:       map[int64]*domain.CodexUsageSnapshot{},
+		errs:        map[int64]error{4: sdkbridge.ErrAuthExpired}, // 单账号失败
+	}
+	for i := int64(1); i <= 8; i++ {
+		snap.snaps[i] = &domain.CodexUsageSnapshot{PlanType: "chatgpt-plus"}
+	}
+	h, store := newUsageTestHandler(t, time.Date(2026, 8, 18, 15, 30, 0, 0, time.UTC), snap)
+	for i := int64(1); i <= 8; i++ {
+		store.accExts[i] = &domain.AccountExt{AccountID: i, CredentialType: credential.TypeCodexPAT, CodexPATKey: strPtr("pat-ok")}
+	}
+	items := make([]domain.AccountUsage, 0, 8)
+	for i := int64(1); i <= 8; i++ {
+		items = append(items, domain.AccountUsage{AccountID: i})
+	}
+
+	release := sync.OnceFunc(func() { close(snap.release) })
+	t.Cleanup(release) // 失败路径防 goroutine 泄漏
+	done := make(chan struct{})
+	go func() {
+		h.assembleUpstream(context.Background(), items)
+		close(done)
+	}()
+
+	select {
+	case <-snap.twoInFlight:
+		// 并行实际发生
+	case <-time.After(5 * time.Second):
+		t.Fatal("批内装配未并行（5s 内无 ≥2 并发在途）")
+	}
+	release()
+	<-done
+
+	require.GreaterOrEqual(t, snap.max(), 2, "批内快照装配并行（errgroup 有界并发）")
+	for i, it := range items {
+		require.Equal(t, int64(i+1), it.AccountID, "items 顺序 = ids 顺序（并行装配保序）")
+	}
+	for i := range items {
+		if items[i].AccountID == 4 {
+			require.Nil(t, items[i].Upstream)
+			require.NotNil(t, items[i].UpstreamError)
+			require.Equal(t, domain.UpstreamErrorAuthExpired, *items[i].UpstreamError)
+			continue
+		}
+		require.NotNil(t, items[i].Upstream, "账号 %d 快照正常", items[i].AccountID)
+		require.Nil(t, items[i].UpstreamError)
+	}
+}
 func strPtr(s string) *string { return &s }
+
+// TestGetAccountsUsageFrozenFailedAccountSkipsProbe 冻结：运行时失效
+// （failed_at 置位）的 codex 账号不打上游额度端点（prober 零调用）；upstream_error
+// 按失效来源映射（Q2）：SDK 判死 → auth_expired；规则判死 → 不标。未失效账号照常拉取。
+func TestGetAccountsUsageFrozenFailedAccountSkipsProbe(t *testing.T) {
+	now := time.Date(2026, 8, 18, 15, 30, 0, 0, time.UTC)
+	snap := &hUsageSnap{
+		snaps: map[int64]*domain.CodexUsageSnapshot{1: {PlanType: "chatgpt-plus"}},
+		calls: map[int64]int{},
+	}
+	h, store := newUsageTestHandler(t, now, snap)
+	failedAt := now.Add(-time.Hour)
+	sdkSrc := domain.FailureSourceSDK
+	ruleSrc := domain.FailureSourceRule
+	store.accs[1] = &domain.Account{ID: 1, Enabled: true}
+	store.accs[2] = &domain.Account{ID: 2, Enabled: true, FailedAt: &failedAt, FailureSource: &sdkSrc}
+	store.accs[3] = &domain.Account{ID: 3, Enabled: true, FailedAt: &failedAt, FailureSource: &ruleSrc}
+	for id := int64(1); id <= 3; id++ {
+		store.accExts[id] = &domain.AccountExt{AccountID: id, CredentialType: credential.TypeCodexPAT, CodexPATKey: strPtr("pat-" + strconv.FormatInt(id, 10))}
+	}
+
+	rec := getUsage(h, "account_ids=1,2,3&window=24h")
+	require.Equal(t, 200, rec.Code, "body: %s", rec.Body.String())
+	var resp AccountsUsageResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Len(t, resp.Items, 3)
+
+	// a1 未失效 codex → 正常拉取
+	require.NotNil(t, resp.Items[0].Upstream, "未失效账号照常返回快照")
+	require.Equal(t, 1, snap.calls[1], "未失效账号照常拨号")
+
+	// a2 SDK 判死 → 冻结：零上游拨号 + auth_expired（token 吊销场景展示不变）
+	require.Nil(t, resp.Items[1].Upstream, "失效账号 → null 快照")
+	require.NotNil(t, resp.Items[1].UpstreamError)
+	require.Equal(t, AuthExpired, *resp.Items[1].UpstreamError, "SDK 判死 → auth_expired")
+	require.Equal(t, 0, snap.calls[2], "失效账号不得打上游额度端点")
+
+	// a3 规则判死 → 冻结：零上游拨号且**不标** upstream_error（避免误标凭据失效）
+	require.Nil(t, resp.Items[2].Upstream, "失效账号 → null 快照")
+	require.Nil(t, resp.Items[2].UpstreamError, "规则判死 → 不标 upstream_error")
+	require.Equal(t, 0, snap.calls[3], "失效账号不得打上游额度端点")
+}

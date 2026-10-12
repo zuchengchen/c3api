@@ -307,7 +307,7 @@ func fakeResponsesWSWithModel(t *testing.T, hooks *fakeWSHooks, model string) *h
 			hooks.mu.Unlock()
 			if !streamed {
 				streamed = true
-				completed := `{"type":"response.completed","response":{"id":"rsp_ws_1","status":"completed","model":"` + model + `","output":[],"usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8,"input_tokens_details":{"cached_tokens":1,"text_tokens":2,"audio_tokens":0},"output_tokens_details":{"reasoning_tokens":2,"text_tokens":3,"audio_tokens":0},"cache_creation":{"ephemeral_5m_input_tokens":2,"ephemeral_1h_input_tokens":1}}}}`
+				completed := `{"type":"response.completed","response":{"id":"rsp_ws_1","status":"completed","model":"` + model + `","output":[],"usage":{"input_tokens":6,"output_tokens":5,"total_tokens":11,"input_tokens_details":{"cached_tokens":1,"text_tokens":2,"audio_tokens":0,"cache_write_tokens":3},"output_tokens_details":{"reasoning_tokens":2,"text_tokens":3,"audio_tokens":0}}}}`
 				for _, f := range []string{
 					`{"type":"response.created","response":{"id":"rsp_ws_1","model":"` + model + `"}}`,
 					`{"type":"response.output_text.delta","delta":"hi"}`,
@@ -413,7 +413,7 @@ func newCodexWSProxyWithMapping(t *testing.T, upstream string, mode domain.Model
 	ext := codexWSExt(10, "at-10", "rt-10")
 	accs := map[int64][]*domain.Account{10: {{
 		ID: 10, TemplateID: tpl.ID, Template: tpl, UpstreamKey: "",
-		Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4, Ext: ext,
+		Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4, Ext: ext,
 	}}}
 	rec := usage.New(usage.UsageConfig{
 		BatchSize: 100, FlushInterval: time.Hour,
@@ -425,13 +425,15 @@ func newCodexWSProxyWithMapping(t *testing.T, upstream string, mode domain.Model
 		UpstreamStreamTimeout: 30 * time.Second,
 		UsageCapture:          true,
 	}
-	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil)
+	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil, nil, nil)
 	require.NoError(t, re.Reload(context.Background()))
-	sched := scheduler.New(scheduler.Config{DefaultMaxConcurrency: 4, SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil)
+	sched := scheduler.New(scheduler.Config{SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
+	publishTestRoutes(t, sched)
+
 	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{
 		"ck-1": activeKey(1, 1, 10),
-	}}, noopUserLoader{}, nil, true)
+	}}, noopUserLoader{}, nil, nil, true)
 	require.NoError(t, auth.Reload(context.Background()))
 	hc := &http.Client{Transport: http.DefaultTransport}
 	clients := aiclient.NewFactory(hc, aiclient.Config{
@@ -447,10 +449,8 @@ func newCodexWSProxyWithMapping(t *testing.T, upstream string, mode domain.Model
 	wctx, wcancel := context.WithCancel(context.Background())
 	require.NoError(t, errlogW.Start(wctx))
 	t.Cleanup(func() { wcancel(); _ = errlogW.Close(context.Background()) })
-	codex := sdkbridge.NewCodex(failure)
-	codex.SetTransport(newProxyOfficialRewriteTransportWithAssert(t, upstream))
-	p := New(cfg, sched, credential.New(), rec, clients, auth, nil, nil, errlogW)
-	p.SetCodex(codex)
+	codex := sdkbridge.NewCodex(failure, newProxyOfficialRewriteTransportWithAssert(t, upstream), sdkbridge.RotationDeps{})
+	p := New(cfg, sched, credential.New(), rec, clients, auth, nil, nil, errlogW, Deps{Codex: codex})
 	return p, store
 }
 

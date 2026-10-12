@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	codexsdk "github.com/is7Qin/codex-sdk"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
@@ -32,14 +33,16 @@ import (
 	"github.com/is7qin/c3api/pkg/aiclient"
 )
 
-// --- T4：codex 路径 resp-ws 本地 mock 上游测试（P3-5 可编程面） ---
+// --- codex 路径 resp-ws 本地 mock 上游测试（可编程面） ---
 // 真实上游不可控面（401 轮转 / 心跳节奏 / 伪装头断言）用本地可编程 mock 覆盖；
-// 真实凭据 e2e（happy path / usage 逐字节一致）在 pg_codex_responses_ws_test.go。
+// 真实凭据 e2e（happy path / usage 5 计数与 aiclient 路径同值）在
+// pg_codex_responses_ws_test.go。
 
 // codexWSUpstream codex 路径 mock WS 上游（升级状态按序弹出，耗尽重复最后
 // 一步）+ 握手头观测 + 帧观测（首个数据帧后下发事件流 created/delta/
-// completed——与 aiclient 路径同帧断言逐字节一致 + 每帧回声）+ 读满
-// frameLimit 帧后 1000 关闭帧。
+// completed——与 aiclient 路径共用同一 completed 帧；每帧回声 = 客户端帧经 SDK
+// codex 形状归一后的字节，区别于 aiclient 路径的零解析直转）+ 读满 frameLimit
+// 帧后 1000 关闭帧。
 type codexWSUpstream struct {
 	mu         sync.Mutex
 	upgrades   int
@@ -185,19 +188,15 @@ func (m *codexWSRefreshMock) callsN() int {
 	return m.calls
 }
 
-// codexWSExt 构造带完整身份四元组的 codex-oauth 账号扩展（installation 账号
-// 级永久 / session==thread 会话级 / window={thread}:0）。
+// codexWSExt 构造 codex-oauth 账号扩展。持久身份只保留 installation_id；
+// session/thread/window 运行时由槽身份给出（不再来自 ext）。
 func codexWSExt(accountID int64, at, rt string) *domain.AccountExt {
-	ext := codexOAuthExt(accountID, at, rt)
-	ext.CodexIdentity.SessionID = "11111111-1111-7111-8111-111111111111"
-	ext.CodexIdentity.ThreadID = "22222222-2222-7222-8222-222222222222"
-	ext.CodexIdentity.WindowID = ext.CodexIdentity.ThreadID + ":0"
-	return ext
+	return codexOAuthExt(accountID, at, rt)
 }
 
 // newTestCodexWSProxy 构造 codex 类型 resp-ws 测试代理：模板（credType 类型 +
 // resp-ws 格式 + gpt-4o）+ 携带 Ext 的账号（同组 10，可多账号）+ 装配适配层
-// （统一失效回调走真实 T1 处理链——fakeFailureStore 落库替身 + 真实调度器
+// （统一失效回调走真实处理链——fakeFailureStore 落库替身 + 真实调度器
 // FailAccount 摘除）。Codex 官方默认端点 via transport 重写到 mock。bill 为计费钩子（nil = 计费全关）。
 func newTestCodexWSProxy(t *testing.T, credType credential.Type, accounts map[int64]*domain.AccountExt, upstream string, bill *BillingHooks, logs *captureLogStore) (*Proxy, *fakeFailureStore) {
 	t.Helper()
@@ -211,7 +210,7 @@ func newTestCodexWSProxy(t *testing.T, credType credential.Type, accounts map[in
 	for id, ext := range accounts {
 		accs[10] = append(accs[10], &domain.Account{
 			ID: id, TemplateID: tpl.ID, Template: tpl, UpstreamKey: "",
-			Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4, Ext: ext,
+			Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4, Ext: ext,
 		})
 	}
 	rec := usage.New(usage.UsageConfig{
@@ -224,13 +223,15 @@ func newTestCodexWSProxy(t *testing.T, credType credential.Type, accounts map[in
 		UpstreamStreamTimeout: 30 * time.Second,
 		UsageCapture:          true,
 	}
-	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil)
+	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil, testHealthSink, nil)
 	require.NoError(t, re.Reload(context.Background()))
-	sched := scheduler.New(scheduler.Config{DefaultMaxConcurrency: 4, SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil)
+	sched := scheduler.New(scheduler.Config{SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
+	publishTestRoutes(t, sched)
+
 	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{
 		"ck-1": activeKey(1, 1, 10),
-	}}, noopUserLoader{}, nil, true)
+	}}, noopUserLoader{}, nil, nil, true)
 	require.NoError(t, auth.Reload(context.Background()))
 	hc := &http.Client{Transport: http.DefaultTransport}
 	clients := aiclient.NewFactory(hc, aiclient.Config{
@@ -249,10 +250,8 @@ func newTestCodexWSProxy(t *testing.T, credType credential.Type, accounts map[in
 	wctx, wcancel := context.WithCancel(context.Background())
 	require.NoError(t, errlogW.Start(wctx))
 	t.Cleanup(func() { wcancel(); _ = errlogW.Close(context.Background()) })
-	codex := sdkbridge.NewCodex(failure)
-	codex.SetTransport(newProxyOfficialRewriteTransportWithAssert(t, upstream))
-	p := New(cfg, sched, credential.New(), rec, clients, auth, nil, bill, errlogW)
-	p.SetCodex(codex)
+	codex := sdkbridge.NewCodex(failure, newProxyOfficialRewriteTransportWithAssert(t, upstream), sdkbridge.RotationDeps{})
+	p := New(cfg, sched, credential.New(), rec, clients, auth, nil, bill, errlogW, Deps{Codex: codex})
 	return p, store
 }
 
@@ -279,11 +278,12 @@ func dialResponsesWSHeaders(t *testing.T, srv *httptest.Server, h http.Header) *
 	return c
 }
 
-// TestCodexWSBlackHoleDialTimeout codex 拨号同款超时（T3）：黑洞上游永不回
+// TestCodexWSBlackHoleDialTimeout codex 拨号同款超时：黑洞上游永不回
 // 101 → wrapped ctx 超时 → SDK dialStatus(nil)=0（resp=nil 安全返回）→
 // DialError{StatusCode:0} → handleCodexDialError 既有 default 分支连接级转移
 // （零新分支）→ 耗尽错误帧 + 连接级/5xx 分流 冷却 + 并发槽释放。
 func TestCodexWSBlackHoleDialTimeout(t *testing.T) {
+	testHealthSink.reset()
 	old := wsDialTimeout
 	wsDialTimeout = 50 * time.Millisecond
 	t.Cleanup(func() { wsDialTimeout = old })
@@ -302,13 +302,13 @@ func TestCodexWSBlackHoleDialTimeout(t *testing.T) {
 		[]byte(`{"type":"response.create","model":"gpt-4o","input":"hi"}`)))
 	ef := readResponsesWSFrame(t, c)
 	require.Contains(t, string(ef), `"type":"error"`)
-	require.Contains(t, string(ef), "Upstream request failed", "WS 耗尽 CustomMessage（P22 honor msg）")
+	require.Contains(t, string(ef), "Upstream request failed", "WS 耗尽 CustomMessage（honor msg）")
 	readResponsesWSClose(t, c, websocket.StatusNormalClosure)
 
-	p.sched.FlushRules()          // MarkResult 异步投递：断言前排空
+	p.sched.FlushRules() // MarkResult 异步投递：断言前排空
+	require.Len(t, testHealthSink.throttlesFor(10), 1, "黑洞超时 → 连接级/5xx 分流惩罚")
 	ri, ok := p.sched.Runtime(10) // codex 代理账号 ID = 组键 10（newTestCodexWSProxy）
 	require.True(t, ok)
-	require.Equal(t, domain.StatusUnhealthy, ri.Status, "黑洞超时 → 连接级/5xx 分流 冷却")
 	require.Zero(t, ri.Concurrency, "耗尽路径并发槽必须释放")
 	require.NoError(t, p.rec.Close(context.Background()))
 	waitStoreLogs(t, store, 1) // errlog 异步落袋（20ms flush；worker 由 helper cleanup 收尾，不手动 Close）
@@ -324,9 +324,10 @@ func TestCodexWSBlackHoleDialTimeout(t *testing.T) {
 
 // TestCodexWSMockRotateRefreshSuccess 端到端主流程（oauth）：升级 401 → SDK
 // 单飞 refresh（真端点 mock）→ 重拨 200 → 完整会话（事件流 + 回声 + 关闭）
-// + usage 嗅探计费（5 计数与 aiclient 路径逐字节一致）+ 伪装四元组握手头断
-// 言 + 透传面（客户端头保留 / session 头族 + OpenAI-Beta 剔除 / 网关 key 不
-// 泄漏）+ 帧内 client_metadata 注入断言。
+// + usage 嗅探计费（5 计数与 aiclient 路径同值，共用同一 completed 帧）+ 伪装四元组握手头断
+// 言 + 客户端头一律不递（spec §12：session 头族/OpenAI-Beta 不得顶掉账号身份，
+// 自定义头如 X-Client-Version 也不得出现）+ 网关 key 不泄漏 + 帧内
+// client_metadata 注入断言。
 func TestCodexWSMockRotateRefreshSuccess(t *testing.T) {
 	up, hooks := newCodexWSUpstream(t, []int{401, 200}, 3)
 	defer up.Close()
@@ -337,8 +338,9 @@ func TestCodexWSMockRotateRefreshSuccess(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(p.HandleResponsesWS))
 	defer srv.Close()
-	// 客户端带伪装冲突面头（session 头族 + OpenAI-Beta 旧版本）——必须被剔除
-	//（P3-7/P3-8），不能覆盖账号伪装身份；X-Client-Version 正常透传。
+	// 客户端带伪装冲突面头（session 头族 + OpenAI-Beta 旧版本）与自定义头——按
+	// spec §12 一律不递上游：前者不得覆盖账号伪装身份，后者
+	//（X-Client-Version）自该裁决起也不再透传（见下方断言）。
 	c := dialResponsesWSHeaders(t, srv, http.Header{
 		"Authorization":       {"Bearer ck-1"},
 		"X-Client-Version":    {"codex-1.2.3"},
@@ -362,9 +364,18 @@ func TestCodexWSMockRotateRefreshSuccess(t *testing.T) {
 	require.Equal(t, `{"type":"response.created","response":{"id":"rsp_ws_1","model":"gpt-4o"}}`, got[0])
 	require.Equal(t, `{"type":"response.output_text.delta","delta":"hi"}`, got[1])
 	require.Contains(t, got[2], `"type":"response.completed"`)
-	require.Contains(t, got[2], `"input_tokens":3`)
-	// 回声帧：payload 为客户端帧 + SDK 注入的 client_metadata（帧透传 1:1
-	// 语义——注入层成本与真实 codex 客户端一致）
+	require.Contains(t, got[2], `"input_tokens":6`)
+	// 回声帧 = 客户端帧经 SDK 按 codex 形状归一后的字节（无条件生效）：顶层
+	// 白名单过滤（非白名单键如 f2 的 delta / f3 的 n 被剥离）→ 强制追加
+	// store:false → 末尾注入 client_metadata（伪装身份对象）。归一后
+	// client_metadata 值之前的字节完全确定，逐字节断言；client_metadata 值含
+	// 每帧 UUIDv7 动态身份（turn_id/traceparent），就其尾部结构单独断言。
+	const metaKey = `"client_metadata":`
+	wantNormalizedPrefix := []string{
+		`{"type":"response.create","model":"gpt-4o","input":"hi","store":false,` + metaKey,
+		`{"type":"response.input_text.delta","store":false,` + metaKey,
+		`{"type":"custom.mid","store":false,` + metaKey,
+	}
 	for i, want := range []string{f1, f2, f3} {
 		var echo struct {
 			Type    string `json:"type"`
@@ -372,15 +383,28 @@ func TestCodexWSMockRotateRefreshSuccess(t *testing.T) {
 		}
 		require.NoError(t, json.Unmarshal([]byte(got[3+i]), &echo))
 		require.Equal(t, "echo", echo.Type)
-		require.Contains(t, echo.Payload, gjson.Get(want, "type").String(), "帧内容原样透传")
-		require.Contains(t, echo.Payload, `"client_metadata"`)
+		// 精确字节断言：client_metadata 值之前的归一字节逐字节相等——覆盖
+		// ① 白名单键保序保留（type/model/input）② 非白名单键剥离（delta/n）
+		// ③ store:false 强制追加 ④ client_metadata 为末尾唯一附加键。
+		idx := strings.Index(echo.Payload, metaKey)
+		require.GreaterOrEqual(t, idx, 0, "归一帧必带 client_metadata")
+		require.Equal(t, wantNormalizedPrefix[i], echo.Payload[:idx+len(metaKey)],
+			"归一后确定字节不一致（客户端帧 %q）：白名单保序 + 剥离 + store:false", want)
+		// client_metadata 值 = 每帧注入的伪装身份对象：installation_id 固定、
+		// session/thread/window/turn/traceparent 为 UUIDv7 动态值——断言末尾
+		// 唯一附加键、键序前缀与对象闭合（不含动态取值）。
+		rest := echo.Payload[idx+len(metaKey):]
+		require.True(t, strings.HasPrefix(rest, `{"x-codex-installation-id":"inst-00000000000000000000000000000000","session_id":"`),
+			"client_metadata 为末尾唯一附加键且键序固定（installation_id 固定值）")
+		require.True(t, strings.HasSuffix(echo.Payload, "}}"), "client_metadata 对象 + 帧对象闭合")
 	}
 	readResponsesWSClose(t, c, websocket.StatusNormalClosure)
 
-	// 握手面断言（P3-5 伪装头）：两次升级（401 首拨 + 轮转后重拨），账号鉴权
-	// 注入（首拨旧 at / 重拨新 at——轮转生效）；网关 key 不泄漏；伪装四元组头
-	// = ext 身份（客户端 rogue 头被剔除）；OpenAI-Beta = 网关默认（rogue 被剔
-	// 除）；X-Client-Version 透传。
+	// 握手面断言（伪装头）：两次升级（401 首拨 + 轮转后重拨），账号鉴权
+	// 注入（首拨旧 at / 重拨新 at——轮转生效）；网关 key 不泄漏；伪装身份
+	// session/thread/window = 运行时槽身份（UUIDv7；客户端 rogue 头被剔除）；
+	// OpenAI-Beta = 网关默认（rogue 被剔除）；客户端自定义头（如
+	// X-Client-Version）自 spec §12 起一律不递。
 	hooks.mu.Lock()
 	defer hooks.mu.Unlock()
 	require.Equal(t, 2, hooks.upgrades, "401 轮转：首拨 + 重拨一次")
@@ -388,20 +412,23 @@ func TestCodexWSMockRotateRefreshSuccess(t *testing.T) {
 	require.Equal(t, "Bearer at-new", hooks.headers[1].Get("Authorization"), "轮转后新 at")
 	h := hooks.headers[1]
 	ext := codexWSExt(10, "", "")
-	require.Equal(t, ext.CodexIdentity.SessionID, h.Get("Session-Id"), "session-id = 账号 ext 身份（rogue 已剔除）")
-	require.Equal(t, ext.CodexIdentity.ThreadID, h.Get("Thread-Id"), "thread-id = 账号 ext 身份")
-	require.Equal(t, ext.CodexIdentity.ThreadID, h.Get("X-Client-Request-Id"), "x-client-request-id 缺省 = thread-id")
-	require.Equal(t, ext.CodexIdentity.WindowID, h.Get("X-Codex-Window-Id"), "window-id = {thread}:0")
+	require.True(t, isUUIDv7(h.Get("Session-Id")), "session-id = 槽身份（UUIDv7；rogue 已剔除）")
+	require.Equal(t, h.Get("Session-Id"), h.Get("Thread-Id"), "槽内 session==thread")
+	require.Equal(t, h.Get("Thread-Id"), h.Get("X-Client-Request-Id"), "x-client-request-id 缺省 = thread-id")
+	require.Equal(t, h.Get("Thread-Id")+":0", h.Get("X-Codex-Window-Id"), "window-id = {thread}:0")
 	require.Equal(t, "responses_websockets="+aiclient.ResponsesWSBetaHeader, h.Get("OpenAI-Beta"), "网关默认 beta（rogue 已剔除）")
-	require.Equal(t, "codex-1.2.3", h.Get("X-Client-Version"), "非冲突面客户端头透传")
+	// spec §12：codex 面只发 SDK 自己写的头 ⇒ 客户端 X-Client-Version 不再透传
+	//（旧断言是「非冲突面客户端头透传」，属旧契约）。
+	require.Empty(t, h.Get("X-Client-Version"), "codex 面不得递客户端头（spec §12）")
 	require.NotEqual(t, "Bearer ck-1", h.Get("Authorization"), "网关 key 不得直通上游")
 
-	// 帧内 client_metadata 注入（伪装四元组帧级面——真实 codex 客户端语义）
+	// 帧内 client_metadata 注入（伪装身份帧级面——真实 codex 客户端语义）：
+	// installation_id 取账号 ext；session/thread/window 取运行时槽身份。
 	f0 := hooks.frames[0]
 	require.Contains(t, f0, `"x-codex-installation-id":"`+ext.CodexIdentity.InstallationID+`"`)
-	require.Contains(t, f0, `"session_id":"`+ext.CodexIdentity.SessionID+`"`)
-	require.Contains(t, f0, `"thread_id":"`+ext.CodexIdentity.ThreadID+`"`)
-	require.Contains(t, f0, `"x-codex-window-id":"`+ext.CodexIdentity.WindowID+`"`)
+	require.True(t, isUUIDv7(gjson.Get(f0, "client_metadata.session_id").String()), "帧内 session_id = 槽身份")
+	require.Equal(t, gjson.Get(f0, "client_metadata.session_id").String(), gjson.Get(f0, "client_metadata.thread_id").String(), "帧内 session==thread")
+	require.Equal(t, gjson.Get(f0, "client_metadata.thread_id").String()+":0", gjson.Get(f0, "client_metadata.x-codex-window-id").String(), "帧内 window={thread}:0")
 
 	// usage 记录：5 计数 + 成功路径（与 aiclient 路径逐字节同口径）
 	require.NoError(t, p.rec.Close(context.Background()))
@@ -411,9 +438,9 @@ func TestCodexWSMockRotateRefreshSuccess(t *testing.T) {
 	lg := store.logs[0]
 	require.Equal(t, domain.ErrNone, lg.ErrorType)
 	require.Equal(t, http.StatusOK, lg.StatusCode)
-	require.Equal(t, int64(2), lg.InputTokens, "可计费输入 = 线上 input 3 − cached 1（spec 2026-08-25 归一）")
+	require.Equal(t, int64(2), lg.InputTokens, "可计费输入 = 线上 input 6 − cached 1 − cache_write 3（P0-2 归一）")
 	require.Equal(t, int64(5), lg.OutputTokens)
-	require.Equal(t, int64(8), lg.TotalTokens)
+	require.Equal(t, int64(11), lg.TotalTokens)
 	require.Equal(t, int64(1), lg.CacheReadTokens)
 	require.Equal(t, int64(3), lg.CacheCreationTokens)
 	require.Equal(t, domain.FormatOpenAIResponsesWS, lg.Format)
@@ -462,6 +489,7 @@ func TestCodexWSRefreshed401Terminal(t *testing.T) {
 // TestCodexWSDial401RuleCustomMessage 拨号 4xx 规则驱动文案与 punish 投递（R-1）：
 // 自定义规则（Kind4xx + HTTP 401 + CustomMessage）改写 WS 错误帧，且 MarkResult 投递使账号状态按规则更新。
 func TestCodexWSDial401RuleCustomMessage(t *testing.T) {
+	testHealthSink.reset()
 	up, _ := newCodexWSUpstream(t, []int{401, 401}, 0)
 	defer up.Close()
 	_ = newCodexWSRefreshMock(t, codexUpStep{status: 200, body: `{"access_token":"at-new","refresh_token":"rt-new"}`})
@@ -469,16 +497,14 @@ func TestCodexWSDial401RuleCustomMessage(t *testing.T) {
 
 	// 定制规则引擎：种子后插入高优 CustomMessage 规则（punish=true → MarkResult 投递）。
 	frs := &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}
-	re := rule.New(rule.Config{}, frs, nil)
+	re := rule.New(rule.Config{}, frs, nil, testHealthSink, nil)
 	require.NoError(t, re.Reload(context.Background()))
 	kind4xx := "4xx"
 	customMsg := "dial-4xx-custom"
-	statusUnhealthy := domain.StatusUnhealthy
-	cooldown := "5s"
 	_, err := frs.CreateRule(context.Background(), domain.Rule{
 		Name: "custom-dial-401", Enabled: true, Priority: 5,
 		When: domain.RuleWhen{Kind: &kind4xx, HTTPStatus: intPtrT(401)},
-		Then: domain.RuleThen{Status: &statusUnhealthy, Cooldown: &cooldown, CustomMessage: &customMsg},
+		Then: domain.RuleThen{Throttle: &domain.ThrottleAction{Scope: domain.ThrottleScopeAccount, Mode: domain.ThrottleModeOpen, DurationMs: int64PtrT(5000)}, CustomMessage: &customMsg},
 	})
 	require.NoError(t, err)
 	require.NoError(t, re.Reload(context.Background()))
@@ -493,13 +519,15 @@ func TestCodexWSDial401RuleCustomMessage(t *testing.T) {
 	ext := codexWSExt(10, "at-10", "rt-10")
 	accs := map[int64][]*domain.Account{10: {{
 		ID: 10, TemplateID: tpl.ID, Template: tpl, UpstreamKey: "",
-		Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4, Ext: ext,
+		Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4, Ext: ext,
 	}}}
 	rec := usage.New(usage.UsageConfig{BatchSize: 100, FlushInterval: time.Hour, QuotaFlushInterval: time.Hour}, store, nil)
 	cfg := Config{MaxBodySize: 1 << 20, FailoverAttempts: 2, UpstreamTimeout: 5 * time.Second, UpstreamStreamTimeout: 30 * time.Second, UsageCapture: true}
-	sched := scheduler.New(scheduler.Config{DefaultMaxConcurrency: 4, SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil)
+	sched := scheduler.New(scheduler.Config{SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
-	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{"ck-1": activeKey(1, 1, 10)}}, noopUserLoader{}, nil, true)
+	publishTestRoutes(t, sched)
+
+	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{"ck-1": activeKey(1, 1, 10)}}, noopUserLoader{}, nil, nil, true)
 	require.NoError(t, auth.Reload(context.Background()))
 	hc := &http.Client{Transport: http.DefaultTransport}
 	clients := aiclient.NewFactory(hc, aiclient.Config{UpstreamTimeout: 5 * time.Second, UpstreamStreamTimeout: 30 * time.Second})
@@ -509,10 +537,8 @@ func TestCodexWSDial401RuleCustomMessage(t *testing.T) {
 	wctx, wcancel := context.WithCancel(context.Background())
 	require.NoError(t, errlogW.Start(wctx))
 	t.Cleanup(func() { wcancel(); _ = errlogW.Close(context.Background()) })
-	codexWs := sdkbridge.NewCodex(failure)
-	codexWs.SetTransport(newProxyOfficialRewriteTransportWithAssert(t, up.URL))
-	p := New(cfg, sched, credential.New(), rec, clients, auth, nil, nil, errlogW)
-	p.SetCodex(codexWs)
+	codexWs := sdkbridge.NewCodex(failure, newProxyOfficialRewriteTransportWithAssert(t, up.URL), sdkbridge.RotationDeps{})
+	p := New(cfg, sched, credential.New(), rec, clients, auth, nil, nil, errlogW, Deps{Codex: codexWs})
 
 	srv := httptest.NewServer(http.HandlerFunc(p.HandleResponsesWS))
 	defer srv.Close()
@@ -526,14 +552,13 @@ func TestCodexWSDial401RuleCustomMessage(t *testing.T) {
 	readResponsesWSClose(t, c, websocket.StatusNormalClosure)
 
 	p.sched.FlushRules()
-	ri, ok := p.sched.Runtime(10)
-	require.True(t, ok)
-	require.Equal(t, domain.StatusUnhealthy, ri.Status, "punish=true 必须投递 MarkResult → 规则 Status 生效")
-	require.NotNil(t, ri.CooldownUntil, "punish 规则的 Cooldown 必须生效")
+	ths := testHealthSink.throttlesFor(10)
+	require.Len(t, ths, 1, "punish=true 必须投递 MarkResult → 规则 Throttle 生效")
+	require.Equal(t, domain.ThrottleModeOpen, ths[0].Mode, "punish 规则的 Throttle 必须生效")
 }
 
 // TestCodexWSFatalNoTransfer 裸 fatal（refresh 判死 invalid_grant）→ 统一回
-// 调上报（账号失效剔除）+ **该请求不转移**（P3-2）：双账号池中健康账号不被
+// 调上报（账号失效剔除）+ **该请求不转移**：双账号池中健康账号不被
 // 触达（升级恰 1 次）；客户端收错误帧；失效上报恰一次（account 10）。
 func TestCodexWSFatalNoTransfer(t *testing.T) {
 	up, hooks := newCodexWSUpstream(t, []int{401}, 0)
@@ -587,23 +612,26 @@ func TestCodexWSFatalNoTransfer(t *testing.T) {
 	require.Contains(t, *store.logs[0].ErrorMessage, "refresh 被拒绝", "落盘留痕不动——SDK 原文进 ErrorMessage")
 }
 
-// TestCodexWSRefreshErrorFailover 裸 RefreshError（refresh 5xx 耗尽）→ 正常
-// failover：账号 10 连接级转移 → 账号 20 轮转成功 → 完整会话。
-func TestCodexWSRefreshErrorFailover(t *testing.T) {
-	up, hooks := newCodexWSUpstream(t, []int{401, 401, 200}, 3)
+// TestCodexWSDial429Failover codex WS 拨号 429（可重试类）→ 跨账号 failover：
+// 账号 10 拨号 429 转移 → 账号 20 拨号成功 → 完整会话（事件流 + 回声 + 1000
+// 关闭）。证明 codex WS 面 failover 按当轮账号重新拨号、凭据不串。
+//
+// 注：裸 RefreshError（refresh 5xx 耗尽）在重试矩阵下 code 0 + 无 callErr 归
+// committed 终态，不再跨账号转移（codex WS 拨号级 failover 仅 429 类可达）。
+func TestCodexWSDial429Failover(t *testing.T) {
+	testHealthSink.reset()
+	up, hooks := newCodexWSUpstream(t, []int{429, 200}, 3)
 	defer up.Close()
-	// 账号 10 的 refresh 三次尝试全 500（退避耗尽），账号 20 的 refresh 200
-	newCodexWSRefreshMock(t,
-		codexUpStep{status: 500, body: `{}`},
-		codexUpStep{status: 500, body: `{}`},
-		codexUpStep{status: 500, body: `{}`},
-		codexUpStep{status: 200, body: `{"access_token":"at-new","refresh_token":"rt-new"}`},
-	)
+	newCodexWSRefreshMock(t, codexUpStep{status: 200, body: `{"access_token":"at-new","refresh_token":"rt-new"}`})
 	store := &captureLogStore{}
 	p, _ := newTestCodexWSProxy(t, credential.TypeCodexOAuth, map[int64]*domain.AccountExt{
 		10: codexWSExt(10, "at-10", "rt-10"),
 		20: codexWSExt(20, "at-20", "rt-20"),
 	}, up.URL, nil, store)
+	// 确定性车道：账号 10 先拨（429）→ 转移账号 20（200）。
+	p.sched.PublishDecisionForTest(
+		scheduler.RouteRefFor(10, string(domain.FormatOpenAIResponsesWS), "gpt-4o"),
+		&scheduler.RouteDecision{Primary: []scheduler.CompiledCandidate{{AccountID: 10}, {AccountID: 20}}})
 
 	srv := httptest.NewServer(http.HandlerFunc(p.HandleResponsesWS))
 	defer srv.Close()
@@ -623,25 +651,24 @@ func TestCodexWSRefreshErrorFailover(t *testing.T) {
 	readResponsesWSClose(t, c, websocket.StatusNormalClosure)
 
 	hooks.mu.Lock()
-	defer hooks.mu.Unlock()
-	require.Equal(t, 3, hooks.upgrades, "账号 A 首拨 401 + 账号 B 首拨 401 + 轮转重拨 200")
-	// 两账号先拨顺序不保证（快照 map 迭代序）——断言集合语义
-	a0 := hooks.headers[0].Get("Authorization")
-	a1 := hooks.headers[1].Get("Authorization")
-	require.Contains(t, []string{"Bearer at-10", "Bearer at-20"}, a0)
-	require.Contains(t, []string{"Bearer at-10", "Bearer at-20"}, a1)
-	require.NotEqual(t, a0, a1, "两账号各拨一次（均 401）")
-	require.Equal(t, "Bearer at-new", hooks.headers[2].Get("Authorization"), "第二轮账号 refresh 后新 at")
+	require.Equal(t, 2, hooks.upgrades, "账号 10 首拨 429 + 账号 20 转移拨号 200")
+	require.Equal(t, "Bearer at-10", hooks.headers[0].Get("Authorization"), "首拨账号 10")
+	require.Equal(t, "Bearer at-20", hooks.headers[1].Get("Authorization"), "转移后按新账号凭据重拨")
+	hooks.mu.Unlock()
+	p.sched.FlushRules()
+	require.Len(t, testHealthSink.throttlesFor(10), 1, "账号 10 429 惩罚恰一次投递")
+	require.Empty(t, testHealthSink.throttlesFor(20), "成功账号 20 不受罚")
 	require.NoError(t, p.rec.Close(context.Background()))
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	require.Len(t, store.logs, 1)
 	require.Equal(t, domain.ErrNone, store.logs[0].ErrorType, "failover 后成功")
+	require.Equal(t, int64(20), store.logs[0].AccountID, "落账 = 成功尝试账号")
 }
 
-// TestCodexWSDeathFrameFatal WS 业务判死事件帧（T5 §3 唯一跨边界点）：
+// TestCodexWSDeathFrameFatal WS 业务判死事件帧（§3 唯一跨边界点）：
 // token_invalidated 错误帧 → 适配层 FatalAuth（Auth.Fatal 毒化 + 统一失效
-// 回调单次上报——写 failed_at + StatusDisabled，共用 T1 处理函数）；判死帧
+// 回调单次上报——写 failed_at + StatusDisabled，共用处理函数）；判死帧
 // 照常透传客户端；会话随后 1000 正常收尾。
 func TestCodexWSDeathFrameFatal(t *testing.T) {
 	// 定制上游：首客户端帧后下发判死事件帧 + created + completed + 回声，
@@ -723,7 +750,7 @@ func TestCodexWSDeathFrameFatal(t *testing.T) {
 	require.Contains(t, got[0], `"token_invalidated"`, "判死帧透传客户端")
 	readResponsesWSClose(t, c, websocket.StatusNormalClosure)
 
-	// 失效上报恰一次（T5 §3 显式 FailureHandler——共用 T1 处理函数）
+	// 失效上报恰一次（§3 显式 FailureHandler——共用处理函数）
 	require.Equal(t, 1, recorderCalls(recorder), "帧判死 → 统一回调恰一次")
 	_, acc, reason := recorder.snapshot()
 	require.Equal(t, int64(10), acc)
@@ -771,8 +798,8 @@ func TestCodexWSAdapterMissing(t *testing.T) {
 	defer up.Close()
 	store := &captureLogStore{}
 	p, _ := newTestCodexWSProxy(t, credential.TypeCodexPAT,
-		map[int64]*domain.AccountExt{10: {AccountID: 10, CredentialType: credential.TypeCodexPAT, CodexIdentity: &domain.CodexIdentity{InstallationID: "i"}}}, up.URL, nil, store)
-	p.SetCodex(nil) // 模拟 main 未装配
+		map[int64]*domain.AccountExt{10: codexPATExt(10, "pat-10")}, up.URL, nil, store)
+	p.codex = nil // 模拟 main 未装配
 
 	srv := httptest.NewServer(http.HandlerFunc(p.HandleResponsesWS))
 	defer srv.Close()
@@ -967,61 +994,79 @@ func TestCodexWSHeartbeatCadence(t *testing.T) {
 
 // --- 纯函数单测 ---
 
-// TestCodexWSPassthroughHeaders 透传面单测：hop-by-hop/网关 key 剔除（复用
-// wsPassthroughHeaders）+ session 头族 + OpenAI-Beta 剔除（P3-7/P3-8）；其余
-// 原样。
-func TestCodexWSPassthroughHeaders(t *testing.T) {
-	h := http.Header{
-		"Connection":          {"upgrade"},
-		"Sec-Websocket-Key":   {"k"},
+// TestCodexWSUpstreamSeesDisguisedUA R4（端到端）：客户端带 curl UA + 伪造
+// Originator ⇒ 上游握手看到的是 SDK 自己的伪装默认值。断言引库内常量
+// codexsdk.DefaultCodexUserAgent / DefaultOriginator，绝不把指纹字符串抄进用例
+// （它是随 SDK 版本漂移的值，硬编码必成腐化点）。
+//
+// 机理（本用例存在的理由）：dialCodexWS 不喂任何客户端头；SDK 侧 buildHeaders
+// 设伪装默认（client.go:305-306），客户端 UA 无从顶掉。所以「网关侧不递 UA」
+// 正是让 SDK 默认伪装值得以保留的那一步，网关不需要另设 UA。
+func TestCodexWSUpstreamSeesDisguisedUA(t *testing.T) {
+	up, hooks := newCodexWSUpstream(t, []int{200}, 3)
+	defer up.Close()
+	store := &captureLogStore{}
+	p, _ := newTestCodexWSProxy(t, credential.TypeCodexOAuth,
+		map[int64]*domain.AccountExt{10: codexWSExt(10, "at-10", "rt-10")}, up.URL, nil, store)
+
+	srv := httptest.NewServer(http.HandlerFunc(p.HandleResponsesWS))
+	defer srv.Close()
+	// 客户端把「伪装身份族 + 自定义头 + footprint + 网关自身写入」一并塞进来：按 spec §12
+	// 裁决，codex 面只发 SDK 自己写的头，这些一个都不该到上游。
+	c := dialResponsesWSHeaders(t, srv, http.Header{
 		"Authorization":       {"Bearer ck-1"},
-		"Session-Id":          {"s"},
-		"Thread-Id":           {"t"},
-		"X-Client-Request-Id": {"c"},
-		"X-Codex-Window-Id":   {"w"},
-		"OpenAI-Beta":         {"responses_websockets=2025-01-01"},
+		"User-Agent":          {"curl/8.7.1"},
+		"Originator":          {"evil-vscode"},
+		"Session-Id":          {"client-session"},
+		"Thread-Id":           {"client-thread"},
+		"X-Client-Request-Id": {"client-req"},
+		"X-Codex-Window-Id":   {"client-window"},
+		"OpenAI-Beta":         {"responses_websockets=1999-01-01"},
 		"X-Client-Version":    {"codex-1.2.3"},
-		"User-Agent":          {"ua"},
+		"X-Opencode-Session":  {"oc-1"},
+		"X-Client-Originator": {"Zed"},
+		"X-Request-Id":        {"req-1"},
+	})
+	defer c.CloseNow()
+	require.NoError(t, c.Write(context.Background(), websocket.MessageText,
+		[]byte(`{"type":"response.create","model":"gpt-4o","input":"hi"}`)))
+	// 事件流 3 帧（created/delta/completed）+ 1 回声——只需握手头被上游观测即可。
+	for i := 0; i < 4; i++ {
+		readResponsesWSFrame(t, c)
 	}
-	out := codexWSPassthroughHeaders(h)
-	require.Empty(t, out.Get("Connection"))
-	require.Empty(t, out.Get("Sec-Websocket-Key"))
-	require.Empty(t, out.Get("Authorization"))
-	require.Empty(t, out.Get("Session-Id"))
-	require.Empty(t, out.Get("Thread-Id"))
-	require.Empty(t, out.Get("X-Client-Request-Id"))
-	require.Empty(t, out.Get("X-Codex-Window-Id"))
-	require.Empty(t, out.Get("OpenAI-Beta"))
-	require.Equal(t, "codex-1.2.3", out.Get("X-Client-Version"))
-	require.Equal(t, "ua", out.Get("User-Agent"))
+
+	hooks.mu.Lock()
+	defer hooks.mu.Unlock()
+	require.NotEmpty(t, hooks.headers, "上游握手未被观测")
+	got := hooks.headers[0]
+	require.Equal(t, codexsdk.DefaultCodexUserAgent, got.Get("User-Agent"),
+		"上游必须看到 SDK 伪装默认 UA（客户端 curl UA 已被剔）")
+	require.Equal(t, codexsdk.DefaultOriginator, got.Get("Originator"),
+		"上游必须看到 SDK 伪装默认 originator")
+	// spec §12：客户端头一律不递。分两类断言 ——
+	// ① 纯客户端键（SDK 永不写）：必须整键不出现（X-Client-Version / X-Opencode-Session
+	//    过去是透传的，属旧契约）。
+	for _, k := range []string{"X-Client-Version", "X-Opencode-Session", "X-Client-Originator", "X-Request-Id"} {
+		require.Empty(t, got.Get(k), "codex 面不得把客户端头 %s 递给上游（spec §12）", k)
+		_, ok := got[k]
+		require.False(t, ok, "客户端头 %s 不得出现在上游握手头里（map 槽位级断言）", k)
+	}
+	// ② 身份族键：SDK 会依账号 ext 自己写（网关身份）⇒ 断言的是「不是客户端那个值」，
+	//    而不是「不存在」（写成不存在会与 SDK 的正常行为冲突）。
+	for _, tc := range []struct{ key, clientVal string }{
+		{"Session-Id", "client-session"},
+		{"Thread-Id", "client-thread"},
+		{"X-Client-Request-Id", "client-req"},
+		{"X-Codex-Window-Id", "client-window"},
+	} {
+		require.NotEqual(t, tc.clientVal, got.Get(tc.key),
+			"身份族 %s 必须由 SDK 依账号 ext 写，客户端值不得顶掉（spec §12）", tc.key)
+	}
+	// OpenAI-Beta 同理：由 SDK 自己写网关 beta 值，客户端值不得顶掉。
+	require.NotEmpty(t, got.Get("OpenAI-Beta"), "beta 头由 SDK 写，必须存在")
+	require.NotContains(t, got.Get("OpenAI-Beta"), "1999-01-01", "客户端 beta 值不得顶掉 SDK 的")
 }
 
-// TestCodexIdentityFromExt 伪装四元组组装：ext 身份 → Session/CodexMeta 映射
-// （session==thread / window={thread}:0 / installation 帧级）；缺列 → 空值。
-func TestCodexIdentityFromExt(t *testing.T) {
-	ext := codexWSExt(10, "", "")
-	sess, meta := codexIdentityFromExt(ext)
-	require.Equal(t, ext.CodexIdentity.SessionID, sess.SessionID)
-	require.Equal(t, ext.CodexIdentity.ThreadID, sess.ThreadID)
-	require.Equal(t, ext.CodexIdentity.WindowID, sess.WindowID)
-	require.Empty(t, sess.ClientRequestID, "SDK 缺省回退 thread-id")
-	require.Equal(t, ext.CodexIdentity.InstallationID, meta.InstallationID)
-	require.Equal(t, ext.CodexIdentity.SessionID, meta.SessionID)
-	require.Equal(t, ext.CodexIdentity.ThreadID, meta.ThreadID)
-	require.Equal(t, ext.CodexIdentity.WindowID, meta.WindowID)
-
-	emptySess, emptyMeta := codexIdentityFromExt(nil)
-	require.Zero(t, emptySess)
-	require.Zero(t, emptyMeta)
-	// nil 身份（codex_identity jsonb 可空——未配置/异常）→ 空组装不 panic
-	noIdentity := &domain.AccountExt{AccountID: 10, CredentialType: credential.TypeCodexOAuth}
-	nSess, nMeta := codexIdentityFromExt(noIdentity)
-	require.Zero(t, nSess, "nil 身份 → 空 Session（identitySig 既有兜底，零新增语义）")
-	require.Zero(t, nMeta, "nil 身份 → 空 CodexMeta")
-	// 缺列（旧数据）→ 空值不注入
-	partial := &domain.AccountExt{AccountID: 10, CredentialType: credential.TypeCodexOAuth, CodexIdentity: &domain.CodexIdentity{InstallationID: "inst-1"}}
-	s2, m2 := codexIdentityFromExt(partial)
-	require.Empty(t, s2.SessionID)
-	require.Empty(t, m2.ThreadID)
-	require.Equal(t, "inst-1", m2.InstallationID)
-}
+// 伪装身份装配已收敛到 scheduler.Selection.CodexIdentity（一次给全四元组，注入
+// 值取自槽状态、与账号 ext 无关）；此处不再有 proxy 侧组装函数可测——其正确性由
+// scheduler 包 TestSelectionCodexIdentityFromSlot 覆盖。

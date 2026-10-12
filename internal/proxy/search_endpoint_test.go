@@ -54,7 +54,7 @@ type codexSearchUpstream struct {
 	calls  int
 	paths  []string
 	auths  []string
-	turns  []string // x-codex-turn-metadata 头值（统一不转发断言）
+	turns  []string // x-codex-turn-metadata 头值（静态路径如实透传 / SDK 路径不转发断言）
 	bodies [][]byte
 	steps  []codexSearchStep
 	last   codexSearchStep
@@ -133,7 +133,7 @@ type searchTestAcct struct {
 	credType credential.Type
 	key      string
 	ext      *domain.AccountExt
-	// mapping 模板映射（Todo 3 identity 不变量测试；nil = 无映射——既有
+	// mapping 模板映射（identity 不变量测试；nil = 无映射——既有
 	// 用例零影响）。
 	mapping map[string]domain.ModelMappingEntry
 }
@@ -163,7 +163,7 @@ func (f *fakeFunctionPriceLookup) ResolvePrices(model string, promptTokens int64
 
 // newTestSearchProxy 构造 search 测试代理：每账号独立模板（同组 10——
 // openai-responses 格式 + gpt-4o；混合类型组 = 多模板多账号）+ 装配适配层
-// （统一失效回调走真实 T1 处理链——fakeFailureStore 落库替身 + 真实调度器
+// （统一失效回调走真实处理链——fakeFailureStore 落库替身 + 真实调度器
 // FailAccount 摘除）。Codex 端点固定 SDK 官方 https://chatgpt.com/backend-api/codex/alpha/search（test transport 仅 host 重写保留官方 path）。
 // bill 为计费钩子（nil = 计费全关）。
 func newTestSearchProxy(t *testing.T, accts []searchTestAcct, upstream string, bill *BillingHooks, logs *captureLogStore) (*Proxy, *fakeFailureStore) {
@@ -171,7 +171,7 @@ func newTestSearchProxy(t *testing.T, accts []searchTestAcct, upstream string, b
 	accs := make(map[int64][]*domain.Account, 1)
 	for _, a := range accts {
 		baseURL := upstream
-		if isCodexCredentialType(a.credType) {
+		if a.credType.IsCodex() {
 			baseURL = ""
 		}
 		tpl := &domain.Template{
@@ -183,7 +183,7 @@ func newTestSearchProxy(t *testing.T, accts []searchTestAcct, upstream string, b
 		}
 		accs[10] = append(accs[10], &domain.Account{
 			ID: a.id, TemplateID: tpl.ID, Template: tpl, UpstreamKey: a.key,
-			Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4, Ext: a.ext,
+			Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4, Ext: a.ext,
 		})
 	}
 	rec := usage.New(usage.UsageConfig{
@@ -196,13 +196,15 @@ func newTestSearchProxy(t *testing.T, accts []searchTestAcct, upstream string, b
 		UpstreamStreamTimeout: 30 * time.Second,
 		UsageCapture:          true,
 	}
-	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil)
+	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil, nil, nil)
 	require.NoError(t, re.Reload(context.Background()))
-	sched := scheduler.New(scheduler.Config{DefaultMaxConcurrency: 4, SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil)
+	sched := scheduler.New(scheduler.Config{SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
+	publishTestRoutes(t, sched)
+
 	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{
 		"ck-1": activeKey(1, 1, 10),
-	}}, noopUserLoader{}, nil, true)
+	}}, noopUserLoader{}, nil, nil, true)
 	require.NoError(t, auth.Reload(context.Background()))
 	hc := &http.Client{Transport: http.DefaultTransport}
 	clients := aiclient.NewFactory(hc, aiclient.Config{
@@ -211,8 +213,7 @@ func newTestSearchProxy(t *testing.T, accts []searchTestAcct, upstream string, b
 	})
 	store := &fakeFailureStore{}
 	failure := sdkbridge.NewFailureHandler(sdkbridge.FailureDeps{Store: store, Failer: sched, Log: nil})
-	codex := sdkbridge.NewCodex(failure)
-	codex.SetTransport(newProxyOfficialRewriteTransportWithAssert(t, upstream))
+	codex := sdkbridge.NewCodex(failure, newProxyOfficialRewriteTransportWithAssert(t, upstream), sdkbridge.RotationDeps{})
 	errlogW := usage.NewErrLogWorker(usage.ErrLogConfig{
 		QueueSize: 4096, BatchSize: 100,
 		FlushInterval: 20 * time.Millisecond,
@@ -220,8 +221,7 @@ func newTestSearchProxy(t *testing.T, accts []searchTestAcct, upstream string, b
 	wctx, wcancel := context.WithCancel(context.Background())
 	require.NoError(t, errlogW.Start(wctx))
 	t.Cleanup(func() { wcancel(); _ = errlogW.Close(context.Background()) })
-	p := New(cfg, sched, credential.New(), rec, clients, auth, nil, bill, errlogW)
-	p.SetCodex(codex)
+	p := New(cfg, sched, credential.New(), rec, clients, auth, nil, bill, errlogW, Deps{Codex: codex})
 	return p, store
 }
 
@@ -229,7 +229,7 @@ func newTestSearchProxy(t *testing.T, accts []searchTestAcct, upstream string, b
 func i64ptr(v int64) *int64 { return &v }
 
 // postSearch 向网关发 /v1/alpha/search 请求（Bearer ck-1 + 可选
-// x-codex-turn-metadata——统一不转发断言面）。
+// x-codex-turn-metadata——静态路径的如实透传断言面）。
 func postSearch(t *testing.T, srv *httptest.Server, body string, turnMetadata string) *http.Response {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/alpha/search", strings.NewReader(body))
@@ -261,7 +261,8 @@ func searchBillingHooks(fn *fakeFunctionPriceLookup) *BillingHooks {
 
 // TestSearchStaticPassthroughBilling api_key 静态透传（分派断言 + 透传断言 +
 // 计费断言）：Bearer upstream key 直连上游、URL 裸根派生 /v1/alpha/search、
-// 请求体/响应体原样（opaque results 不解析）、x-codex-turn-metadata 不转发；
+// 请求体/响应体原样（opaque results 不解析）、x-codex-turn-metadata 如实透传
+// （客户端头不经翻译不映射，只过全仓唯一一份 relayDeny；该键不在清单）；
 // 2xx → format=openai-search + call_count=1 + price_per_call_millis（表行价
 // 2500）+ cost=2500（applyBilling search 分支非 0 计费断言）。
 func TestSearchStaticPassthroughBilling(t *testing.T) {
@@ -281,11 +282,11 @@ func TestSearchStaticPassthroughBilling(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", string(b))
 	require.Equal(t, searchRespRaw, string(b), "响应原样透传（opaque results/encrypted_output 不解析）")
 
-	// 静态路径 wire 断言：Bearer upstream key + 派生 URL + 请求体原样 + 头不转发
+	// 静态路径 wire 断言：Bearer upstream key + 派生 URL + 请求体原样 + 客户端头如实透传
 	require.Equal(t, 1, upc.callsN())
 	require.Equal(t, "/v1/alpha/search", upc.path(0), "URL 裸根派生 base/v1/alpha/search")
 	require.Equal(t, "Bearer sk-upstream", upc.auth(0), "api_key 静态透传——Bearer upstream key 直连")
-	require.Equal(t, "", upc.turn(0), "x-codex-turn-metadata 不转发（静态路径）")
+	require.Equal(t, "turn-123", upc.turn(0), "x-codex-turn-metadata 如实透传（静态路径——不在 relayDeny）")
 	require.Equal(t, searchReqBody, string(upc.body(0)), "请求体原样送达上游")
 
 	// 2xx 计费落账断言（applyBilling search 分支——非 0 计费）
@@ -328,7 +329,7 @@ func TestSearchFunctionPriceDefaultFallback(t *testing.T) {
 	require.Equal(t, int64(1000), store.logs[0].Cost, "默认兜底 1000 毫分（$0.01/次）——非 0 计费")
 }
 
-// TestProxyQuotaDeductedBySearchDefaultPrice 跨路径回归（Todo 4）：search 端点
+// TestProxyQuotaDeductedBySearchDefaultPrice 跨路径回归：search 端点
 // quota 按最终 Cost（默认按次价 1000 毫分）经 finish 后扣——search 无 token
 // 分量（TotalTokens=0），若扣减源回退 token 口径 consumed 恒 0，断言立即失败。
 func TestProxyQuotaDeductedBySearchDefaultPrice(t *testing.T) {
@@ -453,7 +454,7 @@ func TestSearch4xxPassthroughNoBilling(t *testing.T) {
 	require.Zero(t, lg.Cost, "4xx 不计费（cost=0）")
 }
 
-// TestSearchCodexEnvelope4xxPassthrough SDK 路径 4xx 信封（translateError T2）：
+// TestSearchCodexEnvelope4xxPassthrough SDK 路径 4xx 信封（translateError）：
 // 同样透传不转移不计费（与静态路径同语义——错误信封分路径表述）。
 func TestSearchCodexEnvelope4xxPassthrough(t *testing.T) {
 	up, _ := newCodexSearchUpstream(t, codexSearchStep{status: 429, body: `{"error":{"message":"rate limited"}}`})
@@ -505,13 +506,13 @@ func TestSearchFatalMarksFailed(t *testing.T) {
 	require.Zero(t, store.logs[0].Cost, "fatal 不计费")
 }
 
-// TestSearchFailoverCrossTypeDispatch failover 跨类型分派（P1-1 教训回归）：
-// 组内 codex-pat 账号 5xx 故障 → 换 api_key 账号 → **按新类型重新分派**（第
-// 二轮走静态透传路径——Bearer upstream key，而非复用旧 SDK 调用器把健康
-// api_key 账号路由到 Ext 空凭据路径）。
+// TestSearchFailoverCrossTypeDispatch failover 跨类型分派（教训回归）：
+// 组内 codex-pat 账号 429（可重试类）故障 → 换 api_key 账号 → **按新类型重新
+// 分派**（第二轮走静态透传路径——Bearer upstream key，而非复用旧 SDK 调用器把
+// 健康 api_key 账号路由到 Ext 空凭据路径）。
 func TestSearchFailoverCrossTypeDispatch(t *testing.T) {
 	up, upc := newCodexSearchUpstream(t,
-		codexSearchStep{status: 500, body: `{"error":{"message":"boom"}}`},
+		codexSearchStep{status: 429, body: `{"error":{"message":"slow down"}}`},
 		codexSearchStep{status: 200, body: searchRespRaw})
 	defer up.Close()
 	store := &captureLogStore{}
@@ -527,9 +528,9 @@ func TestSearchFailoverCrossTypeDispatch(t *testing.T) {
 	b, _ := io.ReadAll(resp.Body)
 	require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", string(b))
 	require.Equal(t, searchRespRaw, string(b))
-	require.Equal(t, 2, upc.callsN(), "5xx → 转移其它账号（恰两次上游接触）")
+	require.Equal(t, 2, upc.callsN(), "429 → 转移其它账号（恰两次上游接触）")
 
-	// 跨类型重新分派断言（P1-1 教训回归）：两轮尝试分别走两种凭据路径——SDK
+	// 跨类型重新分派断言（教训回归）：两轮尝试分别走两种凭据路径——SDK
 	// Search（Bearer pat-10）与静态透传（Bearer sk-upstream），且**第二轮按当轮
 	// sel.CredentialType 重新分派**（复用旧调用器会把健康账号路由到 Ext 空凭据
 	// 路径——此处第二轮用新类型凭据成功，恰证明按新类型走了新路径）。轮次顺序
@@ -558,9 +559,10 @@ func TestSearchFailoverCrossTypeDispatch(t *testing.T) {
 	require.Equal(t, wantAcc, store.logs[0].AccountID, "落账 = 最后一次实际尝试账号")
 }
 
-// TestSearchIndependentSelection 独立选号断言（P2——无会话绑定）：同组两账号
-// 轮询，两次顺序请求各独立 Select、命中不同账号（无会话亲和机制——search
-// 请求自包含）。
+// TestSearchIndependentSelection 独立选号断言（无会话绑定）：同组两账号，
+// 两次顺序请求各独立 Select。cutover 后选号确定性（Primary 序，无加权轮转），
+// 故以指纹 latch 隔离首轮命中账号——第二轮必须独立重选到另一账号，证明请求
+// 自包含、无会话亲和（若绑会话则第二轮仍复用首轮账号）。
 func TestSearchIndependentSelection(t *testing.T) {
 	up, _ := newCodexSearchUpstream(t, codexSearchStep{status: 200, body: searchRespRaw})
 	defer up.Close()
@@ -577,6 +579,17 @@ func TestSearchIndependentSelection(t *testing.T) {
 		b, _ := io.ReadAll(resp.Body)
 		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", string(b))
 		resp.Body.Close()
+		// 首轮后隔离命中账号（Primary[0]=10），次轮独立选到账号 20。
+		if i == 0 {
+			loader := p.sched.Loader().(noopLoader)
+			for _, a := range loader.accs[10] {
+				if a.ID == 10 {
+					fp, ferr := scheduler.CandidateFingerprint(a)
+					require.NoError(t, ferr)
+					require.True(t, p.sched.TryLatch(10, fp, a.IdentityRevision))
+				}
+			}
+		}
 	}
 	require.NoError(t, p.rec.Close(context.Background()))
 	store.mu.Lock()
@@ -591,16 +604,16 @@ func TestSearchIndependentSelection(t *testing.T) {
 
 // TestSearchFailoverZeroReleasesSlot 防呆（spec 纵深，与 chat 同款）：直构
 // failover_attempts=0（绕过 validate 的 >=1 下限——测试侧 p.cfg 改写等价直构）
-// 时 failover 循环零次执行，首次 Select 已占并发槽——修复前槽永不释放（组内
-// 账号耗尽后全组 429 死锁，重启才能恢复）；耗尽路径必须补 Release。N=0 时
-// lastCode=0 → ErrNetwork → 502 "Upstream request failed"。
+// 新语义 normalized 1..8/default3。plan 车道下每账号至多派发一次（候选唯一、
+// 无重扫），单账号组 5xx 终态 → 恰 1 次拨号后耗尽 502，lease 经正常
+// 路径释放恰一次。
 func TestSearchFailoverZeroReleasesSlot(t *testing.T) {
 	up, upc := newCodexSearchUpstream(t, codexSearchStep{status: 500, body: `{}`})
 	defer up.Close()
 	store := &captureLogStore{}
 	p, _ := newTestSearchProxy(t, []searchTestAcct{{id: 10, tplID: 1, credType: credential.TypeAPIKey, key: "sk-upstream"}},
 		up.URL, nil, store)
-	p.cfg.FailoverAttempts = 0 // 直构：绕过 validate 下限
+	p.cfg.FailoverAttempts = 0 // 直构：绕过 validate 下限 → normalized 3
 
 	srv := httptest.NewServer(AIRouter(p))
 	defer srv.Close()
@@ -609,14 +622,14 @@ func TestSearchFailoverZeroReleasesSlot(t *testing.T) {
 	b, _ := io.ReadAll(resp.Body)
 	require.Equal(t, http.StatusBadGateway, resp.StatusCode, "body=%s", string(b))
 	require.Contains(t, string(b), "Upstream request failed")
-	require.Equal(t, 0, upc.callsN(), "N=0 循环零次执行：无上游接触")
+	require.Equal(t, 1, upc.callsN(), "plan 车道单账号 5xx 终态：恰 1 次拨号（候选唯一，无重扫）")
 	ri, ok := p.sched.Runtime(10)
 	require.True(t, ok)
-	require.Zero(t, ri.Concurrency, "failover_attempts=0 首次选号占槽必须释放（防呆 Release）")
-	require.Zero(t, p.rec.Pending(), "N=0 耗尽路径失败行不产生明细 pending（err_logs 承载）")
+	require.Zero(t, ri.Concurrency, "normalized failover must release lease exactly once")
+	require.Zero(t, p.rec.Pending(), "耗尽路径失败行不产生明细 pending（err_logs 承载）")
 }
 
-// TestSearchSelectFormatUnavailable404 选号失败映射（P3-4）：组内模板不支持
+// TestSearchSelectFormatUnavailable404 选号失败映射：组内模板不支持
 // openai-responses → ErrFormatUnavailable → 404（handleSelectError 既有语义）；
 // 上游零接触。
 func TestSearchSelectFormatUnavailable404(t *testing.T) {

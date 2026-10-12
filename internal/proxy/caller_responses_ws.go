@@ -5,7 +5,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +17,7 @@ import (
 	"github.com/tidwall/sjson"
 
 	"github.com/is7qin/c3api/internal/billing"
+	"github.com/is7qin/c3api/internal/continuation"
 	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/scheduler"
 	"github.com/is7qin/c3api/pkg/aiclient"
@@ -39,11 +39,12 @@ var wsDialTimeout = 15 * time.Second
 // 只在传输面（WS 升级 + 双向事件帧转发 + usage 嗅探 + 心跳）。
 //
 // 热路径纪律（架构定稿 §5）：流式中间帧零解析直转——账目分层：网关层零解析
-// 零分配（bytes.Contains 子串预筛，命中才字节扫描取 usage——usage_extract.go
-// A-1 scanKeyValue 单遍扫描）；库层（coder/websocket）每帧 io.ReadAll 物化 +
+// 零分配（仅嗅探 response.completed 帧，走 usage_extract.go
+// sniffResponsesCompletedUsage 的 scanKeyValue 单遍字节扫描——精确 type
+// 判定，无子串预筛）；库层（coder/websocket）每帧 io.ReadAll 物化 +
 // permessage-deflate 往返属库内账目，非网关责任。只嗅探 response.completed
-// 帧（预筛命中才最小字节扫描）；首帧（response.create = 请求帧）才做模型改写
-// （ModelMapping 语义，与 setModel 同构）——也是 W4 图像剥离的帧级预处理点。
+// 帧（命中才最小字节扫描）；首帧（response.create = 请求帧）才做模型改写
+// （ModelMapping 语义，与 setModel 同构）——也是 图像剥离的帧级预处理点。
 
 const (
 	// responsesWSFirstFrameTimeout 升级后首个请求帧（response.create）等待上限：
@@ -119,6 +120,12 @@ func (p *Proxy) HandleResponsesWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reqModel := gjson.GetBytes(first, "model").String()
+	rm.AffinityHash, rm.HasAffinity = affinityIdentityFromFrame(first)
+
+	// 硬续接（WS 面）：首帧 previous_response_id 在计划就绪后解析绑定并钉选
+	// 账号（route class 取计划规范身份，与 create 侧绑定键同源）；解析失败
+	// fail-closed（错误帧承载，无 HTTP 码），零上游拨号。
+	contPrevID := gjson.GetBytes(first, "previous_response_id").String()
 
 	// service_tier 归一化 + 转发策略（首帧读后、Select 前——与 HTTP
 	// handleFormat 的 strip/reject 同位置，均先于选号；codex 分流在后，首帧
@@ -151,22 +158,47 @@ func (p *Proxy) HandleResponsesWS(w http.ResponseWriter, r *http.Request) {
 
 	// 选号（含账号并发槽抢占）：格式硬过滤由调度器路由承担（模板
 	// SupportedFormats 含 resp-ws 才建路由）。挂死客户端不占槽（槽在首帧后取）。
-	sel, err := p.sched.Select(groupID, domain.FormatOpenAIResponsesWS, reqModel)
+	identity := scheduler.AttemptPlanIdentity{RequestID: reqID, UserID: rm.meta.UserID, ApplyModelMapping: true, AffinityHash: rm.AffinityHash, HasAffinity: rm.HasAffinity}
+	sel, plan, attempt, err := p.selectWithPlan(groupID, domain.FormatOpenAIResponsesWS, reqModel, identity)
 	if err != nil {
 		wsWriteError(client, selectErrorMessage(err))
 		p.recordRejected(r.Context(), reqID, groupID, 0, reqModel, "", domain.FormatOpenAIResponsesWS, statusFor(err), domain.ErrNoAccount, 0, usageTuple{}, start, selectErrorMessage(err))
 		return
 	}
+	// 续接解析：计划规范 route class 下查绑定；missing/expired/Redis 不可用
+	// fail-closed（释放已占并发槽，零上游拨号）。
+	var contBinding *continuation.Binding
+	if contPrevID != "" {
+		b, ferr := p.contResolve(r.Context(), rm.meta.UserID, groupID, contProtocolWS, contPrevID, attempt)
+		if ferr != nil {
+			sel.Release()
+			wsWriteError(client, ferr.msg)
+			p.recordRejected(r.Context(), reqID, groupID, 0, reqModel, "", domain.FormatOpenAIResponsesWS, ferr.status, domain.Err4xx, 0, usageTuple{}, start, ferr.msg)
+			return
+		}
+		contBinding = b
+	}
+	// 续接钉选：绑定账号身份漂移/不可派生 → fail-closed（错误帧），绝不迁移。
+	if contBinding != nil {
+		pinned, pinnedAttempt, ferr := p.contPin(&plan, sel, attempt, contBinding)
+		if ferr != nil {
+			wsWriteError(client, ferr.msg)
+			p.recordRejected(r.Context(), reqID, groupID, contBinding.AccountID, reqModel, "", domain.FormatOpenAIResponsesWS, ferr.status, domain.Err4xx, 0, usageTuple{}, start, ferr.msg)
+			return
+		}
+		sel, attempt = pinned, pinnedAttempt
+	}
+	defer leaseGuard(sel)
 
 	// failover 循环（共享骨架，见 pipeline.go）：precheck=true（resp-ws 保留
-	// chat 价预检照常执行——评审 P2-3 裁决：纯 image 价模型经 resp 出图会被
+	// chat 价预检照常执行——纯 image 价模型经 resp 出图会被
 	// 既有预检 402，接受，职责边界清晰；共享 helper 只对 images 格式切换）；
 	// 4xx 透传统一走循环分类（finish + wsSink 错误帧，emOr 语义保持）；耗尽
 	// 固定文案由 wsSink 承载（WS 无 Retry-After/429 语义）。codex 拨号分类
 	//（handleCodexDialError 的 stop 分支——501/fatal/4xx 已收尾）留在
 	// wsAttempt 内（不统一 codex 4xx 收尾差异：分类代码位置 + 错误文本来源）。
-	p.failoverLoop(w, r, domain.FormatOpenAIResponsesWS, domain.FormatOpenAIResponsesWS, reqID, groupID, start, reqModel, nil, sel,
-		attemptState{client: client, firstTyp: firstTyp, first: first, stripTier: stripTier},
+	p.failoverLoopWithPlan(w, r, domain.FormatOpenAIResponsesWS, reqID, groupID, start, reqModel, nil, sel, plan, attempt,
+		attemptState{client: client, firstTyp: firstTyp, first: first, stripTier: stripTier, hardContinuation: contBinding != nil},
 		p.wsAttempt, p.wsSink, true)
 }
 
@@ -176,7 +208,7 @@ func (p *Proxy) HandleResponsesWS(w http.ResponseWriter, r *http.Request) {
 // handleCodexDialError）与静态拨号（credentialFor + ResponsesWSDial）、relay
 // （relayWS 合一骨架 + 双传输适配 aiclientTransport/codexTransport——首帧模型
 // 改写 + 双向帧透传 + usage 嗅探 + codex 每帧判死钩子）。
-// 错误文本回传（B1 分通道）：4xx respBody 只放上游 body message（无则空——
+// 错误文本回传（分通道）：4xx respBody 只放上游 body message（无则空——
 // 帧侧 wsSink emOr 回退固定网关文案），dialErr 全文走 callErr 通道（循环 4xx
 // 分支以 callErr 回退落盘保全文）；0/5xx/429 保持 msg 归一兜底（上游 message
 // → dialErr 文本回退——纯落盘用途，不达用户帧）；code==0 恒 callErr=nil
@@ -184,23 +216,24 @@ func (p *Proxy) HandleResponsesWS(w http.ResponseWriter, r *http.Request) {
 type wsAttempt struct{ p *Proxy }
 
 func (a *wsAttempt) call(ctx context.Context, w http.ResponseWriter, r *http.Request, reqID string, groupID int64, start time.Time, sel *scheduler.Selection, reqModel string, body []byte, st attemptState) (int, []byte, http.Header, bool, error) {
-	// TODO(P22-I1): 当前 hdr 恒 nil（UpstreamCaller.Call 未回收 resp.Header），
-	// 仅 fallback 1 生效；待扩展 Header 透传后替换为真实透传
-	// （Global Constraints 豁免 fallback 保留）
+	// 当前 hdr 恒 nil，未回收上游 Header，仅 fallback 生效；后续扩展透传后替换为真实透传
+	// 循环的 dispatch ctx 携带唯一 owner 观测：relay/reportWSOutcome 经
+	// r.Context() 取用（handled=true 终态由 caller 侧完成观测）。
+	r = r.WithContext(ctx)
 	p := a.p
-	if isCodexCredentialType(sel.CredentialType) {
-		// codex 独立 relay 变体（T4 §1）：SDK Dial 路径——快照派生 cred 直供
+	if sel.CredentialType.IsCodex() {
+		// codex 独立 relay 变体：SDK Dial 路径——快照派生 cred 直供
 		// 适配层（不经 credentialFor 单字符串路径：codex 凭据为复合结构
 		// oauth_token+refresh_token+expires_at+pat+accountID，单字符串契约表
 		// 达不了——注册表未注册 codex 类型，见 dialCodexWS 注释），伪装四元
-		// 组 + 头部族剥离 + 心跳单源全部在 dialCodexWS/codexTransport
-		//（codex_responses_ws.go）。
+		// 组 + 心跳单源全部在 dialCodexWS/codexTransport（codex_responses_ws.go）；
+		// 该面**不递任何客户端头**（spec §12：只发 SDK 自己写的头），故不存在"头部族剥离清单"这种东西。
 		up, dialErr := p.dialCodexWS(r, sel)
 		if dialErr == nil {
-			// frameHook：每帧判死嗅探（T5 §3 唯一跨边界点——读帧成功后、usage
-			// 嗅探与 client.Write 前调用，与现状 codex_responses_ws.go:339-341
-			// 先于 354 的调用序一致）；判死帧照常透传客户端（错误事件属业务
-			// 流），会话随后由上游关闭帧自然收尾。闭包捕获 p/sel——每 relay
+			// frameHook：每帧判死嗅探（唯一跨边界点——读帧成功后、usage
+			// 嗅探与 client.Write 前调用，即 relayWS 的 frameHook 调用序）；
+			// 判死帧照常透传客户端（错误事件属业务流），会话随后由上游关闭帧
+			// 自然收尾。闭包捕获 p/sel——每 relay
 			// 一次分配（与 reqMeta/logCtx 同级），非每帧。
 			frameHook := func(f []byte) {
 				if fatal := sniffCodexWSDeath(f); fatal != nil {
@@ -211,22 +244,26 @@ func (a *wsAttempt) call(ctx context.Context, w http.ResponseWriter, r *http.Req
 			if handled {
 				return 0, nil, nil, true, nil
 			}
-			// 首帧转发失败 = 上游未消费请求 → 连接级错误转移（同拨号失败）
-			return 0, []byte(fwMsg), nil, false, nil
+			if fwMsg == "" {
+				fwMsg = "upstream first frame write failed"
+			}
+			// 首帧未写出表示上游尚未消费请求，保留 not-sent/retryable 语义；业务帧写出后不得迁移。
+			// 观测归循环统一（observeDispatchFailure：code 0 → not_sent failed）。
+			return 0, []byte(fwMsg), nil, false, errors.New(fwMsg)
 		}
 		if stop, code, msg := p.handleCodexDialError(r, reqID, groupID, start, sel, reqModel, st.client, dialErr); stop {
-			// 501/fatal/4xx 已收尾（错误帧 + 记录）——请求终止不转移
+			// 501/fatal/4xx 已收尾（错误帧与记录已落），请求终止不再转移
 			return 0, nil, nil, true, nil
 		} else {
-			// 429 → Kind429 转移；5xx（归一 lastCode 原样）/RefreshError/
-			// 网络（code 0）→ RuleKindOf(code) 转移——分类由循环统一完成。
+			// 429/5xx/网络错误走 failover 转移，分类与冷却由循环统一处理
+			// （观测归 observeDispatchFailure）。
 			return code, []byte(msg), nil, false, nil
 		}
 	}
 	cred, err := p.credentialFor(ctx, sel)
 	if err != nil {
-		// 凭据错误按网络错误处理（等价 handleFormat 的 code==0 语义）
-		return 0, []byte(domain.TruncateErrMsg(err.Error())), nil, false, nil
+		// 凭据获取失败，上游未消费记 not-sent 可重试，未见业务帧（观测归循环）
+		return 0, []byte(domain.TruncateErrMsg(err.Error())), nil, false, err
 	}
 	// 拨号超时上限（黑洞上游接受 TCP 不回 101 → 无界等待占死并发槽）：wrapped
 	// ctx 取消不向上传播（原 r.Context() 未取消）→ 超时按连接级错误转移
@@ -234,7 +271,7 @@ func (a *wsAttempt) call(ctx context.Context, w http.ResponseWriter, r *http.Req
 	// r.Context() 同时取消 → 499 语义不变。每 attempt 一次（与 aiclient
 	// UpstreamTimeout wrap 同级），非每帧。
 	ctx, cancel := context.WithTimeout(r.Context(), wsDialTimeout)
-	up, resp, dialErr := p.clients.ResponsesWSDial(ctx, sel.TemplateID, sel.BaseURL, cred, wsPassthroughHeaders(r.Header))
+	up, resp, dialErr := p.clients.ResponsesWSDial(ctx, sel.TemplateID, sel.BaseURL, cred, aiclient.RelayHeaders(r.Header))
 	cancel()
 	if dialErr == nil {
 		// stripTier 删除动作（现状 relay 内部）上移调用方（spec 修订）：与
@@ -251,16 +288,16 @@ func (a *wsAttempt) call(ctx context.Context, w http.ResponseWriter, r *http.Req
 		if handled {
 			return 0, nil, nil, true, nil
 		}
-		// 首帧转发失败 = 上游未消费请求 → 连接级错误转移（同拨号失败）
-		return 0, []byte(fwMsg), nil, false, nil
+		if fwMsg == "" {
+			fwMsg = "upstream first frame write failed"
+		}
+		// 首帧未写出表示上游尚未消费请求，保留 not-sent/retryable 语义；业务帧写出后不得迁移。
+		// 观测归循环统一（observeDispatchFailure：code 0 → not_sent failed）。
+		return 0, []byte(fwMsg), nil, false, errors.New(fwMsg)
 	}
-	// 拨号失败分类（与 handleFormat 的 code 分支同构）：msg 归一 = 上游 body
-	// message（B1 分通道——4xx 无则空、dialErr 全文走 callErr；0/5xx/429 保持
-	// 下方 dialErr 文本回退，纯落盘用途）。code 原样回传——5xx 归一（修复性
-	// 声明：现状 default 分支归 0 → 耗尽记 ErrNetwork + MarkResult httpStatus
-	// 0；统一为 code 原样 → et=Err5xx + httpStatus 5xx，对齐 codex 分支与
-	// HTTP 路径，规则 when http_status 匹配面恢复真实值）；非 429/4xx/5xx 的
-	// 异常状态（2xx/3xx 未升级拒绝）按现状归连接级 0。
+	// 拨号失败分类：按状态码分流，4xx 分通道，5xx 保留原码，非标准码归连接级
+	// （观测归循环统一：pipelineOutcome 按 code 给出 upstream_responded/not_sent
+	// 与 terminal 语义，与既有 WS 拨号分类一致）。
 	code := 0
 	var msg string
 	if resp != nil {
@@ -269,29 +306,26 @@ func (a *wsAttempt) call(ctx context.Context, w http.ResponseWriter, r *http.Req
 		_ = resp.Body.Close()
 	}
 	if code >= 400 && code < 500 {
-		// 4xx 分通道（B1）：respBody 只放上游 message（无则空——帧侧由 wsSink
-		// emOr 回退固定网关文案）；dialErr 全文走 callErr 通道（failoverLoop
-		// 4xx 分支以 callErr 回退落盘保全文）——SDK 拨号错误文本不再顶替进用
-		// 户可见面。
+		// 4xx 分通道：用户面仅上游 message，dialErr 仅落盘，帧侧回退固定文案
 		return code, []byte(msg), nil, false, dialErr
 	}
 	if msg == "" {
 		msg = dialErr.Error()
 	}
 	if code < 400 || code >= 600 {
-		code = 0 // 连接级/非标准拒绝（含 2xx/3xx 未升级）→ 现状 default 分支语义
+		code = 0 // 连接级或非标准拒绝，归网络错误语义
 	}
 	return code, []byte(msg), nil, false, nil
 }
 
 // aiclientTransport 上游侧 *websocket.Conn 的 wsRelayTransport 适配（aiclient
-// 路径）：typ 语义逐方法透传（现状 relayResponsesWS 同款——Write/Read 携 typ
-// 原样往返）；构造器执行 SetReadLimit（现状 relayResponsesWS 函数体首行语义
+// 路径）：typ 语义逐方法透传（Write/Read 携 typ 原样往返）；构造器执行
+// SetReadLimit（沿用原 relay 骨架读限首行语义
 // ——16MB 读限不能丢，回落库默认 32KB 会拒 response.completed 全量帧）。
 type aiclientTransport struct{ up *websocket.Conn }
 
-// newAiclientTransport 构造适配层并应用读限（现状首行语义——gate 阻断项：
-// 读限不得随重构丢失）。
+// newAiclientTransport 构造适配层并应用读限（原 relay 骨架读限首行语义——gate
+// 阻断项：读限不得随重构丢失）。
 func newAiclientTransport(up *websocket.Conn) *aiclientTransport {
 	up.SetReadLimit(responsesWSReadLimit)
 	return &aiclientTransport{up: up}
@@ -336,7 +370,7 @@ const (
 	relayEndUpstreamError
 )
 
-// relayClassify 错误分类（I-1 修复核心）：上游关闭帧（upClose）优先于一切——
+// relayClassify 错误分类：上游关闭帧（upClose）优先于一切——
 // 客户端循环并发写失败（net.ErrClosed）只归因网络错误槽，绝不覆盖关闭帧
 // （健康上游 + 正常关闭帧 → 恒成功）；无关闭帧时：客户端断开 → abort，
 // 其余（上游错误/失联）→ 错误。返回结束类型与收尾依据错误（abort/error
@@ -368,21 +402,6 @@ func wsCloseStatus(err error) websocket.StatusCode {
 	return websocket.StatusInternalError
 }
 
-// sniffResponsesCompleted 热路径预筛：bytes.Contains 零分配子串预筛
-// response.completed 帧（命中才最小字节扫描取 usage——response.usage 前缀
-// 五计数：input/output/total + cache_read/cache_creation 明细）；流式中间帧
-// 零解析。ok 语义 = usage 存在（随 responsesCompletedUsage 签名改写，非"子串
-// 命中"）：误命中帧（内容文本含该子串）与 error 终态（{"type":
-// "response.completed","response":{...,"error":...}} 无 usage）→ ok=false 不
-// 更新——completed 终态唯一、元组仅此处写入（此前值恒 0），与旧行为（覆盖 0）
-// 实际等价，勿误判为行为回归。
-func sniffResponsesCompleted(frame []byte) (usageTuple, bool) {
-	if !bytes.Contains(frame, []byte(`"type":"response.completed"`)) {
-		return usageTuple{}, false
-	}
-	return responsesCompletedUsage(frame)
-}
-
 // isWebSocketUpgrade 升级请求判定（coder/websocket 未导出该检查，与库内
 // Accept 的校验同构：Connection 头含 Upgrade token 且 Upgrade 头含
 // websocket token，均大小写不敏感、逗号分隔）。路由与编排共用。
@@ -401,32 +420,6 @@ func headerHasToken(h http.Header, key, token string) bool {
 		}
 	}
 	return false
-}
-
-// wsPassthroughHeaders 客户端头透传（WS 握手面，显式契约）：透传是 WS 面
-// 有意行为——上游依赖客户端特征头（User-Agent/Origin/自定义头）做校验与
-// 路由，SDK 伪装研究完成前此面不动。剔除面 = 连接级 hop-by-hop 头
-// （Connection/Upgrade/Sec-WebSocket-*/Host/Content-Length，其中
-// Sec-WebSocket-Protocol 透传会让上游协商网关不支持的子协议 → 握手失败）
-// + 网关凭据（Authorization/x-api-key 同载网关 key——auth.go 任一非空即鉴权，
-// 不得直通上游；账号鉴权由 aiclient 注入）。codex 面 codexWSPassthroughHeaders
-// 委托本函数（再剔 session 头族 + OpenAI-Beta），本表变更双面自动覆盖。
-// HTTP 面零透传（rawPostCT 只设 Content-Type + 账号鉴权头，客户端原始头不达
-// 上游）同属有意契约——与 WS 面不对称是裁决非遗漏，互引见
-// pkg/aiclient/aiclient.go rawPostCT。其余头原样透传。
-func wsPassthroughHeaders(h http.Header) http.Header {
-	out := make(http.Header, len(h))
-	for k, v := range h {
-		switch http.CanonicalHeaderKey(k) {
-		case "Connection", "Upgrade",
-			"Sec-Websocket-Key", "Sec-Websocket-Version",
-			"Sec-Websocket-Protocol", "Sec-Websocket-Extensions",
-			"Host", "Content-Length", "Authorization", "X-Api-Key":
-			continue
-		}
-		out[k] = v
-	}
-	return out
 }
 
 // wsWriteError 向已升级客户端发送 error 事件帧后关闭（WS 无 HTTP 状态码，

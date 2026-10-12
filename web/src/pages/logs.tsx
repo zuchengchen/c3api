@@ -35,7 +35,7 @@ type RequestFormat = components['schemas']['RequestFormat']
 type UsageLog = components['schemas']['UsageLog']
 type ErrLog = components['schemas']['ErrLog']
 
-// 表头样式（sub2api 配方）：uppercase 小字 + sticky（评审 Minor-1：必须位于
+// 表头样式（sub2api 配方）：uppercase 小字 + sticky（必须位于
 // 纵向滚动容器内——纯 overflow-x 容器中 sticky top 不生效）。
 function Th({ className, ...props }: React.ComponentProps<typeof TableHead>) {
   return (
@@ -278,7 +278,7 @@ export default function Logs() {
     enabled: filterOpen.user,
     placeholderData: keepPreviousData,
     staleTime: 60_000,
-    select: r => r.rows.map(u => ({ id: u.ID, label: u.Email ?? `#${u.ID}` })),
+    select: r => r.rows.flatMap(u => u.ID === undefined ? [] : [{ id: u.ID, label: u.Email ?? `#${u.ID}` }]),
   })
   const groupCandidates = useQuery({
     queryKey: ['logs-filter', 'groups', { term: debouncedSearch.group }],
@@ -286,7 +286,7 @@ export default function Logs() {
     enabled: filterOpen.group,
     placeholderData: keepPreviousData,
     staleTime: 60_000,
-    select: r => r.rows.map(g => ({ id: g.ID, label: g.Name || `#${g.ID}` })),
+    select: r => r.rows.flatMap(g => g.ID === undefined ? [] : [{ id: g.ID, label: g.Name || `#${g.ID}` }]),
   })
   const accountCandidates = useQuery({
     queryKey: ['logs-filter', 'accounts', { term: debouncedSearch.account }],
@@ -294,7 +294,7 @@ export default function Logs() {
     enabled: filterOpen.account,
     placeholderData: keepPreviousData,
     staleTime: 60_000,
-    select: r => r.rows.map(a => ({ id: a.ID, label: a.Name || `#${a.ID}` })),
+    select: r => r.rows.flatMap(a => a.ID === undefined ? [] : [{ id: a.ID, label: a.Name || `#${a.ID}` }]),
   })
   // key 候选：已选 user/group 筛选条件下候选限缩（关联收窄；name 搜索同构）
   const keyCandidates = useQuery({
@@ -308,7 +308,7 @@ export default function Logs() {
     enabled: filterOpen.key,
     placeholderData: keepPreviousData,
     staleTime: 60_000,
-    select: r => r.rows.map(k => ({ id: k.ID, label: k.Name || `#${k.ID}` })),
+    select: r => r.rows.flatMap(k => k.ID === undefined ? [] : [{ id: k.ID, label: k.Name || `#${k.ID}` }]),
   })
 
   // —— 列可见性（localStorage 持久化）——
@@ -462,7 +462,7 @@ export default function Logs() {
         <h2 className="text-sm font-medium text-muted-foreground">{t(tab === 'errors' ? 'logs.tab.errors' : 'logs.tab.usage')}</h2>
         <DropdownMenu>
           <DropdownMenuTrigger render={<Button variant="outline" size="sm"><SlidersHorizontal className="size-4" />{t('logs.columnSettings')}</Button>} />
-          <DropdownMenuContent align="end" className="max-h-80 w-48">
+          <DropdownMenuContent align="end" className="w-48">
             <DropdownMenuGroup>
               <DropdownMenuLabel>{t('logs.columnSettings')}</DropdownMenuLabel>
               {(tab === 'errors' ? ERR_HIDDENABLE_COLS : USAGE_HIDDENABLE_COLS).map(key => (
@@ -499,7 +499,7 @@ export default function Logs() {
           {/* 玻璃与滚动分离：Card 透明化，玻璃与圆角由包裹表格的 ScrollArea 承载（单层边框）；
               横竖滚动均由 ScrollArea 自绘滚动条承接，Table 去自身玻璃与横向滚动依赖，
               避免 Card overflow-hidden 与 Table 横向滚动嵌套导致的裁切/贴边 */}
-          <ScrollArea className="max-h-[calc(100vh-16rem)] rounded-[14px] border border-transparent bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] after:pointer-events-none after:absolute after:inset-0 after:z-20 after:rounded-[14px] after:border after:border-[rgba(19,45,83,0.26)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:after:border-[rgba(148,180,220,0.32)]" showHorizontal>
+          <ScrollArea className="max-h-[calc(100vh-16rem)] rounded-[14px] border border-[rgba(19,45,83,0.26)] bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:border-[rgba(148,180,220,0.32)]" showHorizontal>
           <Table containerClassName="overflow-x-visible border-0 shadow-none rounded-none bg-transparent backdrop-blur-none">
             <TableHeader className="!bg-transparent">
               <TableRow>
@@ -685,7 +685,7 @@ export default function Logs() {
                           <span className={cn('size-2 rounded-full', latencyColor(l.TTFTMS))} />
                           <span className="text-muted-foreground">{t('logs.latency.ttft')} {fmtDuration(l.TTFTMS)}</span>
                         </div>
-                        <div className="text-muted-foreground/60">{t('logs.latency.total')} {fmtDuration(l.LatencyMS)}</div>
+                        <div className="text-muted-foreground/60">{t('logs.latency.total')} {l.LatencyMS != null ? fmtDuration(l.LatencyMS) : '—'}</div>
                       </div>
                     ) : l.LatencyMS != null ? (
                       <span className="text-muted-foreground">{fmtDuration(l.LatencyMS)}</span>

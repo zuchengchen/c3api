@@ -12,6 +12,9 @@ type Account func(*sql.Selector)
 // AccountExt is the predicate function for accountext builders.
 type AccountExt func(*sql.Selector)
 
+// BalanceLog is the predicate function for balancelog builders.
+type BalanceLog func(*sql.Selector)
+
 // EmailTemplate is the predicate function for emailtemplate builders.
 type EmailTemplate func(*sql.Selector)
 
@@ -26,6 +29,9 @@ type GroupAssignment func(*sql.Selector)
 
 // Key is the predicate function for key builders.
 type Key func(*sql.Selector)
+
+// ManagementKey is the predicate function for managementkey builders.
+type ManagementKey func(*sql.Selector)
 
 // PriceEntry is the predicate function for priceentry builders.
 type PriceEntry func(*sql.Selector)
@@ -44,6 +50,18 @@ type Rule func(*sql.Selector)
 
 // Setting is the predicate function for setting builders.
 type Setting func(*sql.Selector)
+
+// SupplierBalance is the predicate function for supplierbalance builders.
+type SupplierBalance func(*sql.Selector)
+
+// SupplierFrozenChunk is the predicate function for supplierfrozenchunk builders.
+type SupplierFrozenChunk func(*sql.Selector)
+
+// SupplierReconciliation is the predicate function for supplierreconciliation builders.
+type SupplierReconciliation func(*sql.Selector)
+
+// SupplierSettlement is the predicate function for suppliersettlement builders.
+type SupplierSettlement func(*sql.Selector)
 
 // TempBalance is the predicate function for tempbalance builders.
 type TempBalance func(*sql.Selector)

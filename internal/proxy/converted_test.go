@@ -12,20 +12,23 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/is7qin/c3api/internal/continuation"
 	"github.com/is7qin/c3api/internal/credential"
 	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/rule"
 	"github.com/is7qin/c3api/internal/scheduler"
 	"github.com/is7qin/c3api/internal/usage"
 	"github.com/is7qin/c3api/pkg/aiclient"
+	"github.com/is7qin/c3api/pkg/redisx"
 )
 
-// --- 协议转换路径（W5）接线测试 ---
+// --- 协议转换路径接线测试 ---
 
 // capturedUpstream 记录最近一次请求的路径与体（上游协议断言），并按路径/stream
 // 返回对应协议的非流式 JSON 或 SSE 流。
@@ -34,7 +37,7 @@ type capturedUpstream struct {
 	path     string
 	body     map[string]any
 	stream   bool
-	dataOnly bool // /v1/responses 流式不产 event: 行（P3：非规范上游形态，同 fakeupstream）
+	dataOnly bool // /v1/responses 流式不产 event: 行（非规范上游形态，同 fakeupstream）
 }
 
 func (c *capturedUpstream) last(t *testing.T) (string, map[string]any, bool) {
@@ -66,7 +69,7 @@ func (c *capturedUpstream) srv(t *testing.T) *httptest.Server {
 				only := c.dataOnly
 				c.mu.Unlock()
 				if only {
-					// P3 形态：只发 data: 行（缺 event: 名），帧自带 type 字段
+					// 形态：只发 data: 行（缺 event: 名），帧自带 type 字段
 					fmt.Fprint(w, `data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"hi"}`+"\n\n")
 					fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"rsp_1","object":"response","created_at":1750000000,"status":"completed","model":"gpt-4o","output":[],"usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`+"\n\n")
 					fmt.Fprint(w, "data: [DONE]\n\n")
@@ -134,8 +137,8 @@ func newConvertedTestProxy(t *testing.T, upstream string, tplFormats []domain.Re
 // newConvertedTestProxyLogs 同 newConvertedTestProxy，但允许注入 LogInserter
 // （用量断言用捕获实现）与上游流超时（中止路径用例缩短触发）。模板为全模型
 // 账号（无模型空间）：转换路径测试覆盖解析/转换/失败语义，不测模型白名单
-// 路由——含无 model 字段请求（顶层数组转换失败用例经默认桶选号；白名单账号
-// 在硬白名单语义下对无模型请求 404，见 scheduler buildRoutes）。
+// 路由——无 model 字段请求在 plan-only 契约下 fail-closed 404（无 canonical
+// 身份即无派生，见 scheduler buildRoutes 与 reservePlanAttempt）。
 func newConvertedTestProxyLogs(t *testing.T, upstream string, tplFormats []domain.RequestFormat, pcs []domain.ProtocolConvert, logs usage.LogInserter, streamTimeout time.Duration) *Proxy {
 	t.Helper()
 	tpl := &domain.Template{
@@ -145,7 +148,7 @@ func newConvertedTestProxyLogs(t *testing.T, upstream string, tplFormats []domai
 	}
 	accs := map[int64][]*domain.Account{10: {{
 		ID: 1, TemplateID: 1, Template: tpl, UpstreamKey: "sk-upstream",
-		Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4,
+		Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4,
 	}}}
 	return newConvertedTestProxyAccsLogs(t, accs, pcs, logs, streamTimeout)
 }
@@ -168,12 +171,14 @@ func newConvertedTestProxyAccsLogs(t *testing.T, accs map[int64][]*domain.Accoun
 		UpstreamStreamTimeout: streamTimeout,
 		UsageCapture:          true,
 	}
-	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil)
+	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil, nil, nil)
 	require.NoError(t, re.Reload(context.Background()))
 	sched := scheduler.New(scheduler.Config{
-		DefaultMaxConcurrency: 4, SyncInterval: time.Hour,
-	}, noopLoader{accs: accs}, re, nil)
+		SyncInterval: time.Hour,
+	}, noopLoader{accs: accs}, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
+	publishTestRoutes(t, sched)
+
 	rec := usage.New(usage.UsageConfig{
 		BatchSize: 100, FlushInterval: time.Hour, QuotaFlushInterval: time.Hour,
 	}, logs, nil)
@@ -181,14 +186,14 @@ func newConvertedTestProxyAccsLogs(t *testing.T, accs map[int64][]*domain.Accoun
 	key.ProtocolConverts = pcs
 	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{
 		"ck-1": key,
-	}}, noopUserLoader{}, nil, true)
+	}}, noopUserLoader{}, nil, nil, true)
 	require.NoError(t, auth.Reload(context.Background())) // 构造不再自载——测试显式首刷（快照注册表单一入口）
 	hc := &http.Client{Transport: http.DefaultTransport}
 	clients := aiclient.NewFactory(hc, aiclient.Config{
 		UpstreamTimeout:       5 * time.Second,
 		UpstreamStreamTimeout: 30 * time.Second,
 	})
-	return New(cfg, sched, credential.New(), rec, clients, auth, nil, nil, nil)
+	return New(cfg, sched, credential.New(), rec, clients, auth, nil, nil, nil, Deps{})
 }
 
 // TestConvertedChatToRespStreaming 客户端 chat 流式 → 上游 resp 流 →
@@ -328,11 +333,11 @@ func TestConvertedChatToMess(t *testing.T) {
 	require.Contains(t, got, `"object":"chat.completion.chunk"`)
 	require.Contains(t, got, `"delta":{"content":"hi"}`)
 	require.Contains(t, got, `"finish_reason":"stop"`)
-	require.Contains(t, got, `"usage":{"completion_tokens":20,"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":3},"total_tokens":30}`, "input 来自 message_start + output 来自 message_delta")
+	require.Contains(t, got, `"usage":{"completion_tokens":20,"prompt_tokens":13,"prompt_tokens_details":{"cached_tokens":3},"total_tokens":33}`, "prompt 含 cache_read；usage 在单独帧")
 	require.Contains(t, got, "data: [DONE]")
 }
 
-// TestConvertedChatToRespStreamingDataOnly P3：上游 resp 流缺 event: 名（只发
+// TestConvertedChatToRespStreamingDataOnly：上游 resp 流缺 event: 名（只发
 // data: 行，同仓库 fakeupstream /v1/responses）→ 转换路径不得整帧丢弃——
 // 客户端仍收到 chat chunk 流（修复前 200 + 空流，Content-Length 0）。
 func TestConvertedChatToRespStreamingDataOnly(t *testing.T) {
@@ -349,9 +354,9 @@ func TestConvertedChatToRespStreamingDataOnly(t *testing.T) {
 
 	require.Equal(t, 200, rec.Code)
 	got := rec.Body.String()
-	require.NotEmpty(t, got, "缺名帧不得静默全丢（P3）")
+	require.NotEmpty(t, got, "缺名帧不得静默全丢")
 	require.Contains(t, got, `"delta":{"content":"hi"}`, "缺名 delta 帧按 data.type 推断 → content chunk")
-	require.Contains(t, got, `"usage":{"completion_tokens":5,"prompt_tokens":3,"total_tokens":8}`, "缺名 completed 帧推断 → 收尾 chunk 内联用量")
+	require.Contains(t, got, `"usage":{"completion_tokens":5,"prompt_tokens":3,"total_tokens":8}`, "缺名 completed 帧推断 → 单独 usage 帧")
 	require.Contains(t, got, "data: [DONE]", "completed 推断 → [DONE] 收尾")
 	require.NotContains(t, got, "response.completed", "上游事件不外泄")
 }
@@ -458,24 +463,24 @@ func TestConvertedMultiDirection(t *testing.T) {
 	require.Equal(t, "hi", body3["input"], "上游收到 resp 形态请求体（未转换）")
 }
 
-// TestConvertedRequestConvertFailReleasesSlot 请求体转换失败 → 本地 400，且
-// 目标选号已占的并发槽必须释放（防槽位泄漏）。
-func TestConvertedRequestConvertFailReleasesSlot(t *testing.T) {
+// TestConvertedUnconvertibleBodyFailsClosedNoSlot 顶层数组 JSON 合法
+// （json.Valid 通过）但不可转换——且不含可提取 model：plan-only 契约下选号
+// 先失败关闭（404，无 canonical 身份即无派生），转换面不再持有目标并发槽。
+func TestConvertedUnconvertibleBodyFailsClosedNoSlot(t *testing.T) {
 	up := &capturedUpstream{}
 	srv := up.srv(t)
 	defer srv.Close()
 	p := newConvertedTestProxy(t, srv.URL, []domain.RequestFormat{domain.FormatOpenAIResponses}, []domain.ProtocolConvert{domain.ProtocolConvertChatToResp})
 
-	// 顶层数组 JSON 合法（json.Valid 通过）但不可转换 → ConvertRequest 报错
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`[1,2,3]`))
 	req.Header.Set("Authorization", "Bearer ck-1")
 	rec := httptest.NewRecorder()
 	p.HandleChat(rec, req)
 
-	require.Equal(t, http.StatusBadRequest, rec.Code, "转换失败 → 本地 400")
+	require.Equal(t, http.StatusNotFound, rec.Code, "无 model 身份 → fail-closed 404（不派生、不转换）")
 	ri, ok := p.sched.Runtime(1)
 	require.True(t, ok)
-	require.Zero(t, ri.Concurrency, "转换失败路径释放目标选号并发槽（无泄漏）")
+	require.Zero(t, ri.Concurrency, "fail-closed 路径零并发槽占用")
 }
 
 // TestConvertedChatToMessStreamingLogTotalTokens 转换流（chat→anthropic）流式
@@ -569,20 +574,20 @@ func TestConvertedChatToMessNonStreamingLogTotalTokens(t *testing.T) {
 	require.Equal(t, int64(8), lg.TotalTokens, "非流式 tt 由 anthropicUsageFromResponse 自带（it + ot）")
 }
 
-// --- 429 回退扩展（A-1：ErrNoAvailable 也触发转换）测试 ---
+// --- 429 回退扩展（ErrNoAvailable 也触发转换）测试 ---
 
 // userScenarioAccs 用户场景组账号（2026-08-18 用户报告）：模板 A 全协议
 // full-model（无模型空间）+ 模板 B 仅 openai-responses（models 白名单
-// gpt-4o）；fullStatus 控制模板 A 账号状态（disabled = 转换回退场景，
-// active = 直连对照组）。
-func userScenarioAccs(srvURL string, fullStatus domain.AccountStatus) map[int64][]*domain.Account {
+// gpt-4o）；fullEnabled 控制模板 A 账号启用位（false = 转换回退场景，
+// true = 直连对照组）。
+func userScenarioAccs(srvURL string, fullEnabled bool) map[int64][]*domain.Account {
 	tplFull := &domain.Template{ID: 1, Name: "full-t", BaseURL: srvURL, CredentialType: credential.TypeAPIKey,
 		SupportedFormats: []domain.RequestFormat{domain.FormatOpenAIChat, domain.FormatOpenAIResponses}}
 	tplResp := &domain.Template{ID: 2, Name: "resp-t", BaseURL: srvURL, CredentialType: credential.TypeAPIKey,
 		SupportedFormats: []domain.RequestFormat{domain.FormatOpenAIResponses}, Models: []string{"gpt-4o"}}
 	return map[int64][]*domain.Account{10: {
-		{ID: 1, TemplateID: 1, Template: tplFull, UpstreamKey: "sk-upstream", Status: fullStatus, Weight: 100, MaxConcurrency: 4},
-		{ID: 2, TemplateID: 2, Template: tplResp, UpstreamKey: "sk-upstream", Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4},
+		{ID: 1, TemplateID: 1, Template: tplFull, UpstreamKey: "sk-upstream", Enabled: fullEnabled, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4},
+		{ID: 2, TemplateID: 2, Template: tplResp, UpstreamKey: "sk-upstream", Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4},
 	}}
 }
 
@@ -595,7 +600,7 @@ func TestConvertedUserScenarioDisabledFullModel(t *testing.T) {
 	up := &capturedUpstream{}
 	srv := up.srv(t)
 	defer srv.Close()
-	p := newConvertedTestProxyAccs(t, userScenarioAccs(srv.URL, domain.StatusDisabled),
+	p := newConvertedTestProxyAccs(t, userScenarioAccs(srv.URL, false),
 		[]domain.ProtocolConvert{domain.ProtocolConvertChatToResp})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
@@ -617,7 +622,7 @@ func TestConvertedUserScenarioFullModelActive(t *testing.T) {
 	up := &capturedUpstream{}
 	srv := up.srv(t)
 	defer srv.Close()
-	p := newConvertedTestProxyAccs(t, userScenarioAccs(srv.URL, domain.StatusActive),
+	p := newConvertedTestProxyAccs(t, userScenarioAccs(srv.URL, true),
 		[]domain.ProtocolConvert{domain.ProtocolConvertChatToResp})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
@@ -635,8 +640,8 @@ func TestConvertedUserScenarioFullModelActive(t *testing.T) {
 // TestConvertedChatBusyFallback 全忙变体（429 语义扩展边界）：客户端路由存在
 // 但账号并发满（非 disabled）→ ErrNoAvailable → 同样转换回退。先经
 // sched.Select 直接占满 chat 账号唯一并发槽再发请求；断言转换目标账号槽位
-// 随请求结束释放（复用 TestConvertedRequestConvertFailReleasesSlot 的 Runtime
-// 断言模式）。
+// 随请求结束释放（复用 TestConvertedUnconvertibleBodyFailsClosedNoSlot 的
+// Runtime 断言模式）。
 func TestConvertedChatBusyFallback(t *testing.T) {
 	up := &capturedUpstream{}
 	srv := up.srv(t)
@@ -646,8 +651,8 @@ func TestConvertedChatBusyFallback(t *testing.T) {
 	tplResp := &domain.Template{ID: 2, Name: "resp-t", BaseURL: srv.URL, CredentialType: credential.TypeAPIKey,
 		SupportedFormats: []domain.RequestFormat{domain.FormatOpenAIResponses}, Models: []string{"gpt-4o"}}
 	accs := map[int64][]*domain.Account{10: {
-		{ID: 1, TemplateID: 1, Template: tplChat, UpstreamKey: "sk-upstream", Status: domain.StatusActive, Weight: 100, MaxConcurrency: 1},
-		{ID: 2, TemplateID: 2, Template: tplResp, UpstreamKey: "sk-upstream", Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4},
+		{ID: 1, TemplateID: 1, Template: tplChat, UpstreamKey: "sk-upstream", Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 1},
+		{ID: 2, TemplateID: 2, Template: tplResp, UpstreamKey: "sk-upstream", Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4},
 	}}
 	p := newConvertedTestProxyAccs(t, accs, []domain.ProtocolConvert{domain.ProtocolConvertChatToResp})
 
@@ -655,7 +660,7 @@ func TestConvertedChatBusyFallback(t *testing.T) {
 	sel, err := p.sched.Select(10, domain.FormatOpenAIChat, "gpt-4o")
 	require.NoError(t, err)
 	require.Equal(t, int64(1), sel.AccountID)
-	defer p.sched.Release(1)
+	defer sel.Release()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
 		`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`))
@@ -678,7 +683,7 @@ func TestConvertedChatBusyFallback(t *testing.T) {
 
 // TestConvertedTargetAlsoBusy429 目标也全忙：客户端 429（ErrNoAvailable）→
 // 转换目标 Select ErrNoAvailable → 响应 429 "no available account" +
-// Retry-After: 1 原样（错误分流与 P-1 目标 404 成对覆盖）。
+// Retry-After: 1 原样（错误分流与 目标 404 成对覆盖）。
 func TestConvertedTargetAlsoBusy429(t *testing.T) {
 	up := &capturedUpstream{}
 	srv := up.srv(t)
@@ -688,8 +693,8 @@ func TestConvertedTargetAlsoBusy429(t *testing.T) {
 	tplResp := &domain.Template{ID: 2, Name: "resp-t", BaseURL: srv.URL, CredentialType: credential.TypeAPIKey,
 		SupportedFormats: []domain.RequestFormat{domain.FormatOpenAIResponses}, Models: []string{"gpt-4o"}}
 	accs := map[int64][]*domain.Account{10: {
-		{ID: 1, TemplateID: 1, Template: tplChat, UpstreamKey: "sk-upstream", Status: domain.StatusDisabled, Weight: 100, MaxConcurrency: 4},
-		{ID: 2, TemplateID: 2, Template: tplResp, UpstreamKey: "sk-upstream", Status: domain.StatusActive, Weight: 100, MaxConcurrency: 1},
+		{ID: 1, TemplateID: 1, Template: tplChat, UpstreamKey: "sk-upstream", Enabled: false, MaxConcurrency: 4},
+		{ID: 2, TemplateID: 2, Template: tplResp, UpstreamKey: "sk-upstream", Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 1},
 	}}
 	p := newConvertedTestProxyAccs(t, accs, []domain.ProtocolConvert{domain.ProtocolConvertChatToResp})
 
@@ -697,7 +702,7 @@ func TestConvertedTargetAlsoBusy429(t *testing.T) {
 	sel, err := p.sched.Select(10, domain.FormatOpenAIResponses, "gpt-4o")
 	require.NoError(t, err)
 	require.Equal(t, int64(2), sel.AccountID)
-	defer p.sched.Release(2)
+	defer sel.Release()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
 		`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`))
@@ -710,7 +715,7 @@ func TestConvertedTargetAlsoBusy429(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "no available account")
 }
 
-// TestConvertedTargetFormatUnavailable404 P-1 分流钉死（行为漂移声明）：客户端
+// TestConvertedTargetFormatUnavailable404 分流钉死（行为漂移声明）：客户端
 // 429（ErrNoAvailable）进入转换分支后目标 Select ErrFormatUnavailable（组配了
 // chat_to_resp 但组内无 resp 模板——配置错误）→ 404 "no account supports this
 // request format" 且无 Retry-After（修复前该场景是 429 + Retry-After——404 是
@@ -723,7 +728,7 @@ func TestConvertedTargetFormatUnavailable404(t *testing.T) {
 		SupportedFormats: []domain.RequestFormat{domain.FormatOpenAIChat}}
 	accs := map[int64][]*domain.Account{10: {{
 		ID: 1, TemplateID: 1, Template: tplChat, UpstreamKey: "sk-upstream",
-		Status: domain.StatusDisabled, Weight: 100, MaxConcurrency: 4,
+		Enabled: false, MaxConcurrency: 4,
 	}}}
 	p := newConvertedTestProxyAccs(t, accs, []domain.ProtocolConvert{domain.ProtocolConvertChatToResp})
 
@@ -754,4 +759,227 @@ func TestConvertedGroupNotFoundNoConvert(t *testing.T) {
 
 	require.Equal(t, http.StatusNotFound, rec.Code)
 	require.Contains(t, rec.Body.String(), "group not found")
+}
+
+// --- 硬续接绑定（resp_to_mess 转换路径）---
+
+// convContUpstream anthropic 假上游：/v1/messages 非流式 JSON / SSE 流均携带
+// 给定 message id，命中计数。
+func convContUpstream(t *testing.T, msgID string, hits *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if b, _ := body["stream"].(bool); b {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(200)
+			fl := w.(http.Flusher)
+			fmt.Fprintf(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":%q,\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n", msgID)
+			fl.Flush()
+			fmt.Fprint(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n")
+			fmt.Fprint(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+			fl.Flush()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": msgID, "type": "message", "role": "assistant", "model": "claude",
+			"content": []any{map[string]any{"type": "text", "text": "hi"}},
+			"usage":   map[string]any{"input_tokens": 3, "output_tokens": 5},
+		})
+	}))
+}
+
+// convAcc anthropic 全模型账号（模板 BaseURL 即上游）。
+func convAcc(id int64, tpl *domain.Template) *domain.Account {
+	bu := tpl.BaseURL
+	return &domain.Account{ID: id, TemplateID: tpl.ID, Template: tpl, BaseURL: &bu, UpstreamKey: "sk-upstream", Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4}
+}
+
+func convTpl(id int64, url string) *domain.Template {
+	return &domain.Template{ID: id, Name: "ct", BaseURL: url, CredentialType: credential.TypeAPIKey, SupportedFormats: []domain.RequestFormat{domain.FormatAnthropic}}
+}
+
+// convContProxy resp_to_mess 转换代理 + 续接 store 装配（nil = 未装配）。
+func convContProxy(t *testing.T, accs map[int64][]*domain.Account, store *continuation.Store) *Proxy {
+	t.Helper()
+	return convContProxyBind(t, accs, store, nil)
+}
+
+// convContProxyBind 同 convContProxy，但一并装配异步绑定 worker（nil = REST
+// 流式绑定 no-op；调用方负责 worker 生命周期）。
+func convContProxyBind(t *testing.T, accs map[int64][]*domain.Account, store *continuation.Store, bind *ContBindWorker) *Proxy {
+	t.Helper()
+	p := newConvertedTestProxyAccs(t, accs, []domain.ProtocolConvert{domain.ProtocolConvertRespToMess})
+	if store != nil {
+		p.cont = store
+	}
+	p.contBinder = bind
+	return p
+}
+
+// convContLookup 转换路径绑定键：客户端协议是 Responses（tag=responses），但
+// 计划规范 route class 是转换目标（anthropic）身份。
+func convContLookup(t *testing.T, s *continuation.Store, contID string) (*continuation.Binding, bool) {
+	t.Helper()
+	b, ok, err := s.Lookup(context.Background(), 1, 10, contRouteID(t, domain.FormatAnthropic, "", domain.OpAnthropicMessages), contProtocolREST, contID)
+	require.NoError(t, err)
+	return b, ok
+}
+
+func TestConvertedRespToMessJSONBindsContinuation(t *testing.T) {
+	_, s, hook := contFixture(t)
+	var hits atomic.Int32
+	up := convContUpstream(t, "msg_cv_1", &hits)
+	defer up.Close()
+	tpl := convTpl(1, up.URL)
+	p := convContProxy(t, map[int64][]*domain.Account{10: {convAcc(1, tpl)}}, s)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4o","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer ck-1")
+	w := httptest.NewRecorder()
+	p.HandleResponses(w, req)
+
+	require.Equal(t, 200, w.Code)
+	require.Contains(t, w.Body.String(), "msg_cv_1")
+	require.EqualValues(t, 1, hook.n.Load(), "one bind command per converted Responses request")
+	b, ok := convContLookup(t, s, "msg_cv_1")
+	require.True(t, ok, "converted response id must be bound before visibility")
+	require.Equal(t, int64(1), b.AccountID)
+	require.Equal(t, int64(1), b.IdentityRevision)
+}
+
+// waitConvertedBinding polls until the async worker persisted a converted
+// (resp_to_mess) binding under the target-protocol route class.
+func waitConvertedBinding(t *testing.T, s *continuation.Store, id string) *continuation.Binding {
+	t.Helper()
+	var got *continuation.Binding
+	require.Eventually(t, func() bool {
+		b, ok := convContLookup(t, s, id)
+		if ok {
+			got = b
+		}
+		return ok
+	}, 5*time.Second, 5*time.Millisecond, "converted binding %s must land asynchronously", id)
+	return got
+}
+
+func TestConvertedRespToMessStreamFramesVisible(t *testing.T) {
+	_, s, _ := contFixture(t)
+	var hits atomic.Int32
+	up := convContUpstream(t, "msg_cv_stream", &hits)
+	defer up.Close()
+	tpl := convTpl(1, up.URL)
+	w := startTestContBind(t, s, ContBindConfig{})
+	p := convContProxyBind(t, map[int64][]*domain.Account{10: {convAcc(1, tpl)}}, s, w)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4o","input":"hi","stream":true}`))
+	req.Header.Set("Authorization", "Bearer ck-1")
+	p.HandleResponses(rec, req)
+	require.Equal(t, 200, rec.Code)
+	require.Contains(t, rec.Body.String(), "msg_cv_stream", "mapped frames must not wait for Redis")
+	require.Contains(t, rec.Body.String(), "response.completed")
+	b := waitConvertedBinding(t, s, "msg_cv_stream")
+	require.Equal(t, int64(1), b.AccountID)
+}
+
+func TestConvertedRespToMessJSONBindFailClosed(t *testing.T) {
+	mr, s, _ := contFixture(t)
+	var hits atomic.Int32
+	up := convContUpstream(t, "msg_cv_dead", &hits)
+	defer up.Close()
+	tpl := convTpl(1, up.URL)
+	p := convContProxy(t, map[int64][]*domain.Account{10: {convAcc(1, tpl)}}, s)
+
+	oldTO := contOpTimeout
+	contOpTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { contOpTimeout = oldTO })
+	mr.Close() // Redis 故障：绑定 fail-closed，转换响应弃置
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4o","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer ck-1")
+	w := httptest.NewRecorder()
+	p.HandleResponses(w, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	require.NotContains(t, w.Body.String(), "msg_cv_dead", "未绑定 id 不得泄漏")
+	require.EqualValues(t, 1, hits.Load(), "绑定失败终态不迁移、不重播")
+}
+
+func TestConvertedRespToMessStreamRedisDownStillVisible(t *testing.T) {
+	mr, s, _ := contFixture(t)
+	var hits atomic.Int32
+	up := convContUpstream(t, "msg_cv_sdead", &hits)
+	defer up.Close()
+	tpl := convTpl(1, up.URL)
+	w := startTestContBind(t, s, ContBindConfig{})
+	p := convContProxyBind(t, map[int64][]*domain.Account{10: {convAcc(1, tpl)}}, s, w)
+
+	mr.Close() // Redis 故障：绑定批次失败，但业务帧仍立即下行，失败只计数
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4o","input":"hi","stream":true}`))
+	req.Header.Set("Authorization", "Bearer ck-1")
+	rec := httptest.NewRecorder()
+	p.HandleResponses(rec, req)
+
+	require.Equal(t, 200, rec.Code, "async bind failure must not rewrite the current response")
+	require.Contains(t, rec.Body.String(), "msg_cv_sdead", "unbound id still reaches the client (no gate)")
+	require.Contains(t, rec.Body.String(), "response.created")
+	require.Eventually(t, func() bool { return w.Failed() > 0 }, 5*time.Second, 5*time.Millisecond, "batch failure must be counted")
+}
+
+func TestConvertedNonResponsesClientZeroRedis(t *testing.T) {
+	_, s, hook := contFixture(t)
+	var hits atomic.Int32
+	up := convContUpstream(t, "msg_cv_chat", &hits)
+	defer up.Close()
+	tpl := convTpl(1, up.URL)
+	p := newConvertedTestProxyAccs(t, map[int64][]*domain.Account{10: {convAcc(1, tpl)}}, []domain.ProtocolConvert{domain.ProtocolConvertChatToMess})
+	p.cont = s
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	req.Header.Set("Authorization", "Bearer ck-1")
+	w := httptest.NewRecorder()
+	p.HandleChat(w, req)
+
+	require.Equal(t, 200, w.Code)
+	require.Zero(t, hook.n.Load(), "非 Responses 客户端转换路径零 Redis、零闸门")
+}
+
+func TestConvertedRespToMessContinuationPinsBoundAccount(t *testing.T) {
+	mr, s1, _ := contFixture(t)
+	c2, err := redisx.Open(redisx.Options{Addr: mr.Addr()})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisx.Close(c2) })
+	s2, err := continuation.New(c2, "cont-test-secret-0123456789")
+	require.NoError(t, err)
+
+	var hits1, hits2 atomic.Int32
+	up1 := convContUpstream(t, "msg_gen_1", &hits1)
+	defer up1.Close()
+	up2 := convContUpstream(t, "msg_other_2", &hits2)
+	defer up2.Close()
+	tpl1, tpl2 := convTpl(1, up1.URL), convTpl(2, up2.URL)
+	acc1, acc2 := convAcc(1, tpl1), convAcc(2, tpl2)
+
+	p1 := convContProxy(t, map[int64][]*domain.Account{10: {acc1, acc2}}, s1)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4o","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer ck-1")
+	w := httptest.NewRecorder()
+	p1.HandleResponses(w, req)
+	require.Equal(t, 200, w.Code)
+	require.EqualValues(t, 1, hits1.Load())
+
+	// 续接（另一实例、acc2 优先计划）：必须钉回绑定账号 acc1，绝不迁移。
+	p2 := convContProxy(t, map[int64][]*domain.Account{10: {acc2, acc1}}, s2)
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-4o","input":"again","previous_response_id":"msg_gen_1"}`))
+	req2.Header.Set("Authorization", "Bearer ck-1")
+	w2 := httptest.NewRecorder()
+	p2.HandleResponses(w2, req2)
+
+	require.Equal(t, 200, w2.Code, "body=%s", w2.Body.String())
+	require.EqualValues(t, 0, hits2.Load(), "钉选续接不得触碰未绑定偏好账号")
+	require.EqualValues(t, 2, hits1.Load(), "续接必须派发到绑定账号")
 }

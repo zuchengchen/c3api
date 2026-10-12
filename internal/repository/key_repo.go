@@ -18,6 +18,7 @@ import (
 
 	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/ent"
+	"github.com/is7qin/c3api/internal/ent/group"
 	"github.com/is7qin/c3api/internal/ent/key"
 )
 
@@ -31,7 +32,7 @@ var keyAdminSortFields = map[string]string{
 type KeyRepo struct {
 	client *ent.Client
 	// driver 为 raw SQL（AddQuotaUsed 单语句 CASE 批量更新）用：与 txDriver
-	// 组合保证 raw SQL 与 ent 构建器同事务连接（WithTx 同构，评审 I-1）。
+	// 组合保证 raw SQL 与 ent 构建器同事务连接（WithTx 同构）。
 	driver dialect.Driver
 }
 
@@ -55,15 +56,22 @@ func (r *KeyRepo) CreateKey(ctx context.Context, k *domain.Key) (*domain.Key, er
 	return toDomainKey(row), nil
 }
 
+// GetKey 取单个 key（不过滤软删——GET 单个可查已删项）。走 Query/Only 而非
+// client.Key.Get：需 eager-load 组边（`Get` 不接受 `With*`），组边按软删过滤
+// （组存活时回填 GroupName，非存活 → nil → 空串）。ownedKey 写路径（Update/
+// Rotate/Delete）经此多一次组查询——低频，可接受。
 func (r *KeyRepo) GetKey(ctx context.Context, id int64) (*domain.Key, error) {
-	row, err := r.client.Key.Get(ctx, id)
+	row, err := r.client.Key.Query().
+		Where(key.IDEQ(id)).
+		WithGroup(func(q *ent.GroupQuery) { q.Where(group.DeletedAtIsNil()) }).
+		Only(ctx)
 	if err != nil {
 		return nil, errMissingID(err, id)
 	}
 	return toDomainKey(row), nil
 }
 
-// QuotaUsed 读单 key 当前已用额度（#14 预算复核点读：本地预算耗尽时
+// QuotaUsed 读单 key 当前已用额度（预算复核点读：本地预算耗尽时
 // SELECT quota_used——DB 权威值，usage.Recorder 批量增量回写后滞后 ≤ flush
 // 间隔；复核成功才重新分配本地预算）。热路径不调（仅复核慢路径）。
 func (r *KeyRepo) QuotaUsed(ctx context.Context, id int64) (int64, error) {
@@ -117,7 +125,11 @@ func (r *KeyRepo) ListKeys(ctx context.Context, q ListQuery) ([]*domain.Key, int
 	if q.Offset < 0 {
 		q.Offset = 0
 	}
-	rows, err := pred.Order(order).Offset(q.Offset).Limit(q.Limit).All(ctx)
+	// 组名回填：仅行查询挂存活过滤 eager-load（Count 复用 pred 不加边）；
+	// 软删组被过滤 → Edges.Group == nil → GroupName 留空。
+	rows, err := pred.
+		WithGroup(func(gq *ent.GroupQuery) { gq.Where(group.DeletedAtIsNil()) }).
+		Order(order).Offset(q.Offset).Limit(q.Limit).All(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -148,7 +160,10 @@ func (r *KeyRepo) ListKeysByUser(ctx context.Context, userID int64, q ListQuery)
 	if q.Offset < 0 {
 		q.Offset = 0
 	}
-	rows, err := pred.Order(order).Offset(q.Offset).Limit(q.Limit).All(ctx)
+	// 组名回填：仅行查询挂存活过滤 eager-load（Count 复用 pred 不加边）。
+	rows, err := pred.
+		WithGroup(func(gq *ent.GroupQuery) { gq.Where(group.DeletedAtIsNil()) }).
+		Order(order).Offset(q.Offset).Limit(q.Limit).All(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -162,20 +177,24 @@ func (r *KeyRepo) ListKeysByUser(ctx context.Context, userID int64, q ListQuery)
 // KeyPatch key 更新补丁（对齐 UserPatch 范式）：显式字段 = 请求显式提供的字段；
 // nil = 不改（仅 Set 非 nil 列——并发两个 PUT 改不同字段各自生效，不再全列
 // 无条件写回覆盖先写者）。
-// quota_used 不写——Recorder 派生计数器（p2-12 核实：service 层无任何路径
+// quota_used 不写——Recorder 派生计数器（核实：service 层无任何路径
 // 意图写该列，全字段写回会覆盖 AddQuotaUsed 增量 → 永久少记、gate 超用
 // 不 429）；ent Save re-SELECT 返回行 → 调用方拿到的 QuotaUsed 反为 DB 新鲜
-// 值，upsertKeyMeta 顺带同步最新。
+// 值，upsertKeyMetaInMemory 顺带同步最新。
+// **唯一例外**：Quota 显式设为 0（= 不限）时同步清零 quota_used——见 UpdateKey
+// （不限额度下"已用"无意义，且累计语义会让旧消耗带进下一次设额）。
 type KeyPatch struct {
 	ID             int64
 	Name           *string
 	Status         *domain.KeyStatus
 	MaxConcurrency *int
 	Quota          *int64
+	GroupID        *int64
 }
 
-// UpdateKey 按 patch 更新 name/status/max_concurrency/quota（不写 key_raw——
+// UpdateKey 按 patch 更新 name/status/max_concurrency/quota/group_id（不写 key_raw——
 // 明文变更仅 CreateKey/RotateKey 路径）；仅 Set 非 nil 列，nil = 该列不动。
+// 组切换仅改 key.group_id（FK 指向存活组由 service 层 checkGroupEligible 保证）。
 func (r *KeyRepo) UpdateKey(ctx context.Context, p *KeyPatch) (*domain.Key, error) {
 	upd := r.client.Key.UpdateOneID(p.ID)
 	if p.Name != nil {
@@ -189,6 +208,19 @@ func (r *KeyRepo) UpdateKey(ctx context.Context, p *KeyPatch) (*domain.Key, erro
 	}
 	if p.Quota != nil {
 		upd.SetQuota(*p.Quota)
+		// 额度显式设为 0（= 不限）→ 同步清零累计消耗。两条理由：
+		//  ① 不限额度下"已用"无意义——留着只会让 UI 显示"已用 $X / 不限"；
+		//  ② 它是**累计**上限，不清零则旧消耗会带进下一次设额（用户刚设好额度
+		//     就被历史消耗挡住）。
+		// 这是 quota_used 的唯一服务端写点。与 Recorder 增量回写的交错安全：
+		// AddQuotaUsed 带 "quota" > 0 守卫，行锁串行化下两种提交顺序都收敛到 0
+		// （回写先 → 被本次清零覆盖；清零先 → 回写被 WHERE 排除）。
+		if *p.Quota == 0 {
+			upd.SetQuotaUsed(0)
+		}
+	}
+	if p.GroupID != nil {
+		upd.SetGroupID(*p.GroupID)
 	}
 	row, err := upd.Save(ctx)
 	if err != nil {
@@ -226,7 +258,7 @@ func (r *KeyRepo) DeleteKey(ctx context.Context, id int64) error {
 // DeleteKeysByGroup 软删除组的全部 key（组删除级联——deleted_at 置值，行保留
 // 不破坏 key.group_id 外键），返回本次被软删的明文列表（Auth 增量清理用；
 // 已软删 key 过滤——其明文此前已从 Auth 移除，重复返回无意义）。
-// 原子化（F5）：单条原生 SQL UPDATE + RETURNING 合一——SELECT 与 UPDATE 之间
+// 原子化：单条原生 SQL UPDATE + RETURNING 合一——SELECT 与 UPDATE 之间
 // 无窗口（并发新建 key 不会落在读-写间隙里被静默软删且明文不在返回列表）；
 // 先例 AddQuotaUsed（r.driver 为 raw SQL 入口，与 ent 构建器同事务连接）。
 func (r *KeyRepo) DeleteKeysByGroup(ctx context.Context, groupID int64) ([]string, error) {
@@ -291,7 +323,7 @@ func (r *KeyRepo) LoadKeys(ctx context.Context) (map[string]domain.KeyMeta, erro
 				meta.UserStatus = domain.UserStatus(row.Edges.User.Status)
 				meta.UserMaxConc = row.Edges.User.MaxConcurrency
 			}
-			// 组级 protocol_convert 快照（W5 热路径分支数据源；组软删窗口内
+			// 组级 protocol_convert 快照（热路径分支数据源；组软删窗口内
 			// 行仍在 → 值照旧，快照一致性由 Reload 收敛）。
 			if row.Edges.Group != nil {
 				meta.ProtocolConverts = toDomainProtocolConverts(row.Edges.Group.ProtocolConvert)
@@ -304,7 +336,7 @@ func (r *KeyRepo) LoadKeys(ctx context.Context) (map[string]domain.KeyMeta, erro
 
 // AddQuotaUsed 批量回写 key 额度消耗（增量；Recorder 节奏，内存权威，
 // DB 滞后 ≤ flush 间隔）。单条 SQL CASE 批量更新替代逐 key UpdateOneID 轮询
-// （#15 验收：10k 逐 key 额度写回是统计面慢 flush 3-5min 周期根因之一）。
+// （验收：10k 逐 key 额度写回是统计面慢 flush 3-5min 周期根因之一）。
 // key 已删（不在 IN 列表）静默跳过——回写无意义（与旧逐 key
 // ent.IsNotFound 跳过语义一致）。调用方（usage.Recorder.flushStats）按
 // quotaBatchSize 分块并以块为失败回灌原子单位——本方法单语句全成或全败。
@@ -332,7 +364,11 @@ func (r *KeyRepo) AddQuotaUsed(ctx context.Context, deltas map[int64]int64) erro
 	if len(ids) == 0 {
 		return nil
 	}
-	b.WriteString(`ELSE "quota_used" END, "updated_at" = now() WHERE "id" IN (`)
+	// "quota" > 0 守卫：无额度 key（quota = 0 = 不限）恒不累计——把"无额度 key
+	// 恒 0"这条不变量从 gate 的条目簿记下沉到写入方，同时封死"额度刚被清零、
+	// 本实例或他实例仍在途的增量随后回写"这条复活路径（UpdateKey 清零后，
+	// 迟到的回写不得把已用量带回来）。
+	b.WriteString(`ELSE "quota_used" END, "updated_at" = now() WHERE "quota" > 0 AND "id" IN (`)
 	b.WriteString(strings.Join(ids, ", "))
 	b.WriteByte(')')
 	var res sql.Result

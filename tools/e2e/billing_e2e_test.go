@@ -42,7 +42,6 @@ import (
 )
 
 const (
-	adminToken  = "e2e-admin-token"
 	jwtSecret   = "e2e-jwt-secret-change-me"
 	serverAddr  = "127.0.0.1:18090" // 避开本机 VPN/代理已占用端口段（18080-18089 曾被占）
 	serverAddr2 = "127.0.0.1:18091" // 辅助实例：billing off 短路验证（独立配置/独立端口）
@@ -103,12 +102,66 @@ type e2eEnv struct {
 	pg   *pgxpool.Pool // c3api_e2e 库（SQL 断言）
 	tmp  string
 	addr string // 网关监听地址（主实例=serverAddr；辅助实例=18091/18092）
+	// adminJWT 本环境引导得到的 platform_admin JWT（bootstrapAdminJWT 设置；
+	// 静态 admin token 已删除，spec 2026-10-09 §4.9）。env.admin 用它鉴权。
+	adminJWT string
+}
+
+// bootstrapAdminJWT 无凭据引导（spec 2026-10-09 §4.9）：等待 /healthz 就绪 → 注册
+// 首个用户（fresh DB 首个注册即 platform_admin → JWT）；409/无 token → 登录后校验
+// /api/admin/settings 确认为 platform_admin；均失败 → Fatalf。返回 JWT（= 就绪）。
+func (e *e2eEnv) bootstrapAdminJWT() string {
+	e.t.Helper()
+	base := "http://" + e.addr
+	healthDeadline := time.Now().Add(60 * time.Second)
+	for {
+		resp, err := http.Get(base + "/healthz")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		if time.Now().After(healthDeadline) {
+			e.t.Fatalf("server %s /healthz 未在 60s 内就绪", e.addr)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	const email = "e2e-bootstrap@loadtest.test"
+	post := func(path string) (string, int) {
+		b, _ := json.Marshal(map[string]any{"email": email, "password": "loadtest-pass-1"})
+		resp, err := http.Post(base+path, "application/json", bytes.NewReader(b))
+		e.t.Helper()
+		require.NoError(e.t, err)
+		defer resp.Body.Close()
+		buf := new(bytes.Buffer)
+		_, _ = buf.ReadFrom(resp.Body)
+		var out struct {
+			Token string `json:"token"`
+		}
+		_ = json.Unmarshal(buf.Bytes(), &out)
+		return out.Token, resp.StatusCode
+	}
+	token, code := post("/api/user/auth/register")
+	if token == "" || code == http.StatusConflict {
+		// 409 email exists ≠ 已 bootstrap（该邮箱可能只是普通用户）：登录后校验。
+		token, _ = post("/api/user/auth/login")
+	}
+	require.NotEmpty(e.t, token, "bootstrap 未取得 JWT（register/login 失败）")
+	req, err := http.NewRequest(http.MethodGet, e.adminURL("/settings"), nil)
+	require.NoError(e.t, err)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(e.t, err)
+	resp.Body.Close()
+	require.Equal(e.t, http.StatusOK, resp.StatusCode, "bootstrap user is not platform_admin")
+	return token
 }
 
 // admin 管理面请求：body nil = 无请求体；返回状态码 + 响应体。
 func (e *e2eEnv) admin(method, path string, body any) (int, string) {
 	e.t.Helper()
-	return e.req(method, e.adminURL(path), "Bearer "+adminToken, body)
+	return e.req(method, e.adminURL(path), "Bearer "+e.adminJWT, body)
 }
 
 // user 用户面请求（JWT）；key 为 AI 请求（/v1）鉴权 key 时走 ai。
@@ -168,8 +221,8 @@ func (e *e2eEnv) balance(userID int64) int64 {
 	return v
 }
 
-// ---- 轮询收敛助手（spec-f2-ledger-cursor M3）----
-// F2 扣费两跳异步：usage flusher 落库（flush_interval=300ms）→ billing 扫游标
+// ---- 轮询收敛助手（spec-f2-ledger-cursor）----
+// 扣费两跳异步：usage flusher 落库（flush_interval=300ms）→ billing 扫游标
 // 扣费（flush_interval=300ms），最坏 ≈750ms；固定 sleep 余量不足，负载下必
 // flake。断言一律有界轮询：条件成立即返回，超时 FailNow 并附最后观测值。
 
@@ -221,7 +274,7 @@ func pollUserLastLogCost(t *testing.T, env *e2eEnv, userID, want int64) {
 	})
 }
 
-// waitSnapshot 等待去抖窗口 + 一次重载完成（O2：管理面变更生效延迟 ≤200ms
+// waitSnapshot 等待去抖窗口 + 一次重载完成（管理面变更生效延迟 ≤200ms
 // 窗口 + 一次重载时长——变更后的断言性请求须落在重载之后，等效旧实现同步
 // invalidate 的"变更即生效"，只是生效点推迟到窗口到点）。
 func waitSnapshot() { time.Sleep(300 * time.Millisecond) }
@@ -309,7 +362,6 @@ func TestBillingE2E(t *testing.T) {
 
 	cfg := fmt.Sprintf(`server = { addr = "%s", read_header_timeout = "10s", max_header_bytes = 1048576 }
 log = { level = "warn", output = "stdout" }
-admin = { token = "%s" }
 auth = { jwt_secret = "%s" }
 db = { dsn = "%s", max_conns = 10 }
 redis = { addr = "%s" }
@@ -318,7 +370,7 @@ upstream = { max_idle_conns = 64, max_idle_conns_per_host = 16, idle_conn_timeou
 scheduler = { default_max_concurrency = 8, sync_interval = "10s" }
 usage = { batch_size = 500, flush_interval = "300ms", log_retention_days = 2, quota_flush_interval = "5s" }
 billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval = "500ms" }
-`, serverAddr, adminToken, jwtSecret, dsn, redisAddr)
+`, serverAddr, jwtSecret, dsn, redisAddr)
 	cfgPath := filepath.Join(env.tmp, "config.toml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(cfg), 0o644))
 
@@ -346,33 +398,11 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 		_ = srvLog.Close()
 	})
 
-	// 就绪：轮询 /api/admin/settings 直到 200（ent migrate + 分区 bootstrap 完成）。
-	// 就绪前连接被拒属正常（启动中），原始请求不中断测试；须带 admin token
-	// （否则 401 恒不满足）。
-	ready := false
-	deadline := time.Now().Add(60 * time.Second)
-	for !ready && time.Now().Before(deadline) {
-		req, err := http.NewRequest(http.MethodGet, env.adminURL("/settings"), nil)
-		require.NoError(t, err)
-		req.Header.Set("Authorization", "Bearer "+adminToken)
-		resp, err := http.DefaultClient.Do(req)
-		if err == nil {
-			resp.Body.Close()
-			ready = resp.StatusCode == http.StatusOK
-		}
-		if !ready {
-			time.Sleep(500 * time.Millisecond)
-		}
-	}
-	if !ready { // 失败诊断：进程状态 + 服务日志
-		t.Logf("server ProcessState=%v", srv.ProcessState)
-		if data, err := os.ReadFile(filepath.Join(env.tmp, "server.log")); err == nil {
-			t.Logf("--- server.log ---\n%s", data)
-		}
-		t.Fatalf("server 未在 60s 内就绪")
-	}
+	// 就绪 + 引导（spec 2026-10-09 §4.9）：/healthz 就绪 → 注册首个用户
+	// （fresh DB 即 platform_admin）→ 取 JWT；再探 /api/admin/settings 确认。
+	env.adminJWT = env.bootstrapAdminJWT()
 
-	// 失败诊断（O1 收尾）：任何场景失败 → 转储内置网关 server.log 与最新
+	// 失败诊断（收尾）：任何场景失败 → 转储内置网关 server.log 与最新
 	// usage_logs 行（flusher 落库时序/DB 状态疑点直接可见——此前失败无日志
 	// 难定位）。Cleanup LIFO：先于 srv.Kill / pool.Close 执行，数据完整。
 	t.Cleanup(func() {
@@ -453,7 +483,7 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 	// --- 4. 用户/密钥 ---
 	u1 := createUser(t, env, "e2e-user@example.com", 10.0) // 1,000,000 毫分
 	_, u1Key := userKey(t, env, u1, g1)
-	// O2 去抖：u1 须在余额快照中才能通过计费预检（窗口 200ms + 重载）。
+	// 去抖：u1 须在余额快照中才能通过计费预检（窗口 200ms + 重载）。
 	waitSnapshot()
 
 	// ============ 场景 1：矩阵计费 + 余额毫分扣减 ============
@@ -508,7 +538,7 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 	t.Log("场景 2：FEFO 临时额度优先扣；余额不足 402")
 	u2 := createUser(t, env, "fefo@example.com", 0.01) // 1,000 毫分
 	u2Token, u2Key := userKey(t, env, u2, g1)
-	// O2 去抖：u2 须在余额快照中（下方首个请求的计费预检依赖）。
+	// 去抖：u2 须在余额快照中（下方首个请求的计费预检依赖）。
 	waitSnapshot()
 	// temp_balance 兑换码 500 毫分（API 面值 USD：0.005 = $0.005 = 500 毫分）
 	codeResp, respBody := env.admin(http.MethodPost, "/redemption-codes", map[string]any{
@@ -537,7 +567,7 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 	r = env.lastLogFor("e2e-model")
 	require.Equal(t, int64(500), r.Cost)
 
-	// 第二笔：余额 1000 → 500；第三笔：500 → 0；第四笔：0 仍放行（spec 2026-08-15 余额 0 放行，FEFO 覆盖）→ -500 overdraft；第五笔：负余额预检 402
+	// 第二笔：余额 1000 → 500；第三笔：500 → 0；第四笔：余额 0 预检 402（余额 ≤0 拒绝）
 	for _, want := range []int64{500, 0} {
 		c, rb2 := env.aiReq(http.MethodPost, "/v1/chat/completions", u2Key, map[string]any{
 			"model": "e2e-model", "stream": true,
@@ -546,20 +576,14 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 		require.Equal(t, 200, c, "drain: %s", rb2)
 		pollBalance(t, env, u2, want)
 	}
-	// 余额 0 仍放行一次（overdraft），见 proxy/billing_test.go:691 “余额 0 放行”
-	c, rbOver := env.aiReq(http.MethodPost, "/v1/chat/completions", u2Key, map[string]any{
-		"model": "e2e-model", "stream": true,
-		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
-	})
-	require.Equal(t, 200, c, "overdraft must still 200 (bal 0 → -500): %s", rbOver)
-	pollBalance(t, env, u2, -500) // 透支后余额 -500
-	rOver := env.lastLogFor("e2e-model")
-	require.True(t, rOver.Overdraft, "透支行 overdraft=true")
+	// 余额 0 拒绝：预检 ≤0 → 402（临时额度已耗尽，无 FEFO 兜底）；
+	// 去抖等定向余额快照 Set 落定，避免读到扣减前的旧值。
+	waitSnapshot()
 	c, rb3 := env.aiReq(http.MethodPost, "/v1/chat/completions", u2Key, map[string]any{
 		"model": "e2e-model", "stream": true,
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 	})
-	require.Equal(t, 402, c, "insufficient must 402: %s", rb3)
+	require.Equal(t, 402, c, "balance 0 must 402: %s", rb3)
 
 	// ============ 场景 3：未设价 402 ============
 	t.Log("场景 3：未设价模型 → 402（error_type=billing）")
@@ -568,7 +592,7 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 	})
 	require.Equal(t, 402, c, "no price must 402: %s", rb4)
-	// 402 拒绝行（分表裁决 R3-M1）：错误审计面归 err_logs——error_type=billing
+	// 402 拒绝行（分表裁决）：错误审计面归 err_logs——error_type=billing
 	// 全值 + status_code；usage_logs 零行（放行路径语义：失败行不入 usage_logs）。
 	// errlog worker 独立管道落库：轮询拒绝行出现（替代固定 sleep）
 	var dbEType string
@@ -584,7 +608,7 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 	code3, resp3 := env.admin(http.MethodGet, "/err_logs?model=e2e-noprice-model&from=2000-01-01T00:00:00Z&to=2030-01-01T00:00:00Z", nil)
 	require.Equal(t, 200, code3, "err logs: %s", resp3)
 	require.Contains(t, resp3, `"billing"`, "402 拒绝行 err_logs error_type=billing")
-	// R4-M3：HTTP 面 ↔ DB 面交叉验证（同一条拒绝行经 errlog worker 落库 → HTTP 查询可见）
+	// HTTP 面 ↔ DB 面交叉验证（同一条拒绝行经 errlog worker 落库 → HTTP 查询可见）
 	require.Equal(t, "billing", dbEType, "err_logs DB 面与 HTTP 面一致")
 	code3u, resp3u := env.admin(http.MethodGet, "/usage_logs?model=e2e-noprice-model&from=2000-01-01T00:00:00Z&to=2030-01-01T00:00:00Z", nil)
 	require.Equal(t, 200, code3u, "usage logs: %s", resp3u)
@@ -624,7 +648,7 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 	})
 	require.Equal(t, 200, c, "restore passthrough: %s", rb9)
 
-	// ============ 场景 4b：fast 档同策略（M-1 回归：caller 门控含 TierFast） ============
+	// ============ 场景 4b：fast 档同策略（回归：caller 门控含 TierFast） ============
 	t.Log("场景 4b：service_tier_policy_fast strip/reject")
 	// reject → 400 拒绝（不转发）
 	c, rba := env.admin(http.MethodPut, "/settings", map[string]any{
@@ -661,7 +685,7 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 	t.Log("场景 5：组倍率 ×2 → 扣费 ×2；用户-组专属倍率覆盖组（按组挂载）；0 = 免费不扣费")
 	u4 := createUser(t, env, "mult@example.com", 10.0) // grp2 倍率 2.0
 	_, u4Key := userKey(t, env, u4, g2)
-	// O2 去抖：u4 须在余额快照中（下方首个请求的计费预检依赖）。
+	// 去抖：u4 须在余额快照中（下方首个请求的计费预检依赖）。
 	waitSnapshot()
 	chat := func(key string, model string) {
 		c, rb := env.aiReq(http.MethodPost, "/v1/chat/completions", key, map[string]any{
@@ -676,12 +700,12 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 	r = env.lastLogFor("e2e-mult-model")
 	require.Equal(t, int64(1000), r.Cost, "组倍率 ×2")
 
-	// 用户-组专属倍率覆盖组（T3.5 修正：按组挂载，经 assignments 的 multipliers）：
+	// 用户-组专属倍率覆盖组（按组挂载，经 assignments 的 multipliers）：
 	// 0.5 → 500×0.5 = 250
 	c, rb10 := env.admin(http.MethodPut, "/groups/"+strconv.FormatInt(g2, 10)+"/assignments",
 		map[string]any{"user_ids": []int64{u4}, "multipliers": map[string]any{strconv.FormatInt(u4, 10): 0.5}})
 	require.Equal(t, 200, c, "set assignment mult: %s", rb10)
-	waitSnapshot() // O2 去抖：新倍率须已进快照（请求按快照计费）
+	waitSnapshot() // 去抖：新倍率须已进快照（请求按快照计费）
 	chat(u4Key, "e2e-mult-model")
 	pollBalance(t, env, u4, 1000000-1000-250)
 	r = env.lastLogFor("e2e-mult-model")
@@ -691,7 +715,7 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 	c, _ = env.admin(http.MethodPut, "/groups/"+strconv.FormatInt(g2, 10)+"/assignments",
 		map[string]any{"user_ids": []int64{u4}, "multipliers": map[string]any{strconv.FormatInt(u4, 10): 0.0}})
 	require.Equal(t, 200, c, "set free mult")
-	waitSnapshot() // O2 去抖：新倍率须已进快照
+	waitSnapshot() // 去抖：新倍率须已进快照
 	chat(u4Key, "e2e-mult-model")
 	pollUserLastLogCost(t, env, u4, 0) // cost=0 余额不动：以最新行落库为收敛信号
 	r = env.lastLogFor("e2e-mult-model")
@@ -703,7 +727,7 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 	_, u5Key := userKey(t, env, u5, g3)
 	c, rb11 := env.admin(http.MethodPut, "/groups/"+strconv.FormatInt(g3, 10), map[string]any{"name": "e2e-grp3", "price_multiplier": 0.0})
 	require.Equal(t, 200, c, "set group free: %s", rb11)
-	waitSnapshot() // O2 去抖：u5 入余额快照 + g3 倍率 0 进倍率快照（同窗口合并一次重载）
+	waitSnapshot() // 去抖：u5 入余额快照 + g3 倍率 0 进倍率快照（同窗口合并一次重载）
 	chat(u5Key, "e2e-mult-model")
 	pollUserLastLogCost(t, env, u5, 0) // u5 首行落库即收敛（此前无行，ErrNoRows 重试）
 	r = env.lastLogFor("e2e-mult-model")
@@ -814,14 +838,14 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 	require.NoError(t, err)
 	require.Equal(t, total, partTotal, "全部行落入当日分区")
 
-	// ============ 场景 8：新用户 402 窗口回归（评审 M-2 / O2） ============
+	// ============ 场景 8：新用户 402 窗口回归 ============
 	// 建用户 → 立即请求（<0.5s）→ 200：新用户必须在去抖窗口 + 一次重载后
 	// 即刻进入余额快照（防 ≤10s BalanceRefreshInterval 402 窗口）。
 	t.Log("场景 8：建用户 → 立即请求（<0.5s）→ 200（去抖窗口内余额快照收敛）")
 	uNew := createUser(t, env, "fresh-e2e@example.com", 10.0) // 1,000,000 毫分
 	waitSnapshot()                                            // 去抖窗口（200ms）+ 重载；随后请求须落在重载之后
 	_, uNewKey := userKey(t, env, uNew, g1)
-	// 评审 I-1：t0 从 userKey 返回后起算（用户已就绪、密钥已取）——createUser/
+	// t0 从 userKey 返回后起算（用户已就绪、密钥已取）——createUser/
 	// login 的 API 往返不计入 <0.5s 预算，只测"用户就绪后首次请求"的去抖收敛链。
 	t0 := time.Now()
 	c, rbNew := env.aiReq(http.MethodPost, "/v1/chat/completions", uNewKey, map[string]any{
@@ -852,7 +876,7 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 	})
 	u400 := createUser(t, env, "e2e-400@example.com", 10.0)
 	_, u400Key := userKey(t, env, u400, g400)
-	waitSnapshot() // O2 去抖：u400 须在余额快照中（计费预检依赖）
+	waitSnapshot() // 去抖：u400 须在余额快照中（计费预检依赖）
 	c, rb400 := env.aiReq(http.MethodPost, "/v1/chat/completions", u400Key, map[string]any{
 		"model": "e2e-model", "stream": false,
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
@@ -882,8 +906,8 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 	// ============ 场景 10：Key quota（billing on 按最终 Cost 后扣并耗尽；quota=0 零回写） ============
 	t.Log("场景 10：Key quota 按最终 Cost 后扣至耗尽 429；quota=0 不产生 quota 回写")
 	uQ := createUser(t, env, "quota-on@example.com", 10.0) // 1,000,000 毫分（余额远大于 quota，拦截点必在 quota）
-	_, qKey := userKeyQuota(t, env, uQ, g1, 1000)          // e2e-model 每请求 Cost=500 → 两笔耗尽
-	waitSnapshot()                                         // O2 去抖：key 入鉴权快照
+	qToken, qKey := userKeyQuota(t, env, uQ, g1, 1000)     // e2e-model 每请求 Cost=500 → 两笔耗尽
+	waitSnapshot()                                         // 去抖：key 入鉴权快照
 	chat(qKey, "e2e-model")
 	chat(qKey, "e2e-model")
 	pollQuotaUsed(t, env, qKey, 1000) // DB 回写收敛（quota_flush_interval=5s，有界轮询）
@@ -906,6 +930,25 @@ billing = { enabled = true, flush_interval = "300ms", balance_refresh_interval =
 	chat(kProbe, "e2e-model")
 	pollQuotaUsed(t, env, kProbe, 500) // 屏障：flush 已把 kProbe 的 500 落库
 	require.Equal(t, int64(0), env.quotaUsed(kZero), "quota=0 不产生 quota 回写（同窗口 kProbe 已回写）")
+
+	// 额度**设为 0**（= 不限）→ 同步清零 quota_used（不是"只停累积"）：已用 1000 归零，
+	// 且 key 立刻恢复放行（此前 429）。清零是同步写（同一 UPDATE），无异步窗口。
+	qID := env.keyID(qKey)
+	keyURL := env.aiURL(fmt.Sprintf("/api/user/keys/%d", qID))
+	c, rbR := env.req(http.MethodPut, keyURL, "Bearer "+qToken, map[string]any{"quota": 0})
+	require.Equal(t, 200, c, "quota→0: %s", rbR)
+	require.Equal(t, int64(0), env.quotaUsed(qKey), "额度设为 0 → quota_used 清零")
+	waitSnapshot()
+	chat(qKey, "e2e-model") // 清零 + 不限 → 恢复放行（此前同 key 429）
+	// 无额度 key 恒 0：迟到的增量回写被 "quota" > 0 守卫跳过（不等 flush 窗口）。
+	require.Equal(t, int64(0), env.quotaUsed(qKey), "不限额度下不再累积")
+
+	// 重新设额 → 从零起算（不被历史消耗挡住）：quota=500 恰好再放行一笔
+	c, rbR = env.req(http.MethodPut, keyURL, "Bearer "+qToken, map[string]any{"quota": 500})
+	require.Equal(t, 200, c, "quota→500: %s", rbR)
+	waitSnapshot()
+	chat(qKey, "e2e-model")
+	pollQuotaUsed(t, env, qKey, 500) // 回写恢复生效（守卫只对 quota=0 生效）
 
 	// ============ 场景 9：SIGTERM 优雅停机（流式中断 → 日志 cost 不丢） ============
 	t.Log("场景 9：优雅停机——流式中断计费完整 flush")
@@ -1120,6 +1163,14 @@ func chatOn(t *testing.T, env *e2eEnv, key, model string) {
 	require.Equal(t, 200, c, "chat %s: %s", model, rb)
 }
 
+// keyID key 明文的 DB 主键（更新端点路径用）。
+func (e *e2eEnv) keyID(keyRaw string) int64 {
+	e.t.Helper()
+	v, err := e.dbInt(`SELECT id FROM keys WHERE key_raw=$1`, keyRaw)
+	require.NoError(e.t, err)
+	return v
+}
+
 // quotaUsed key 的 DB quota_used（毫分）。
 func (e *e2eEnv) quotaUsed(keyRaw string) int64 {
 	e.t.Helper()
@@ -1149,7 +1200,6 @@ func startAuxGateway(t *testing.T, env *e2eEnv, srvBin, dsn, redisAddr string, b
 	t.Helper()
 	cfg := fmt.Sprintf(`server = { addr = "%s", read_header_timeout = "10s", max_header_bytes = 1048576 }
 log = { level = "warn", output = "stdout" }
-admin = { token = "%s" }
 auth = { jwt_secret = "%s" }
 db = { dsn = "%s", max_conns = 10 }
 redis = { addr = "%s" }
@@ -1158,7 +1208,7 @@ upstream = { max_idle_conns = 64, max_idle_conns_per_host = 16, idle_conn_timeou
 scheduler = { default_max_concurrency = 8, sync_interval = "10s" }
 usage = { batch_size = 500, flush_interval = "300ms", log_retention_days = 2, quota_flush_interval = "1s" }
 billing = { enabled = %v, flush_interval = "300ms", balance_refresh_interval = "500ms" }
-`, env.addr, adminToken, jwtSecret, dsn, redisAddr, usageCaptureOn, billingOn)
+`, env.addr, jwtSecret, dsn, redisAddr, usageCaptureOn, billingOn)
 	cfgPath := filepath.Join(env.tmp, "config.toml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(cfg), 0o644))
 	srv := exec.Command(srvBin, "-config", cfgPath)
@@ -1176,28 +1226,9 @@ billing = { enabled = %v, flush_interval = "300ms", balance_refresh_interval = "
 		}
 		_ = srvLog.Close()
 	})
-	// 就绪：轮询 admin settings 200（migrate/分区对已建库为幂等快路径）。
-	ready := false
-	deadline := time.Now().Add(60 * time.Second)
-	for !ready && time.Now().Before(deadline) {
-		req, err := http.NewRequest(http.MethodGet, env.adminURL("/settings"), nil)
-		require.NoError(t, err)
-		req.Header.Set("Authorization", "Bearer "+adminToken)
-		resp, err := http.DefaultClient.Do(req)
-		if err == nil {
-			resp.Body.Close()
-			ready = resp.StatusCode == http.StatusOK
-		}
-		if !ready {
-			time.Sleep(500 * time.Millisecond)
-		}
-	}
-	if !ready {
-		if data, err := os.ReadFile(filepath.Join(env.tmp, "server.log")); err == nil {
-			t.Fatalf("辅助网关未在 60s 内就绪（%s）:\n%s", env.addr, data)
-		}
-		t.Fatalf("辅助网关未在 60s 内就绪（%s）", env.addr)
-	}
+	// 就绪 + 引导（migrate/分区对已建库为幂等快路径）：共享库首个用户已存
+	// → bootstrap 走登录；env.adminJWT 刷新为本实例可用 JWT（spec §4.9）。
+	env.adminJWT = env.bootstrapAdminJWT()
 	return srv
 }
 

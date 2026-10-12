@@ -29,8 +29,9 @@ import (
 )
 
 // responsesWSCompletedFrame 假上游的 response.completed 事件帧（usage 5 计数：
-// input 3 / output 5 / total 8 / cache_read 1 / cache_creation 3=2+1）。
-const responsesWSCompletedFrame = `{"type":"response.completed","response":{"id":"rsp_ws_1","status":"completed","model":"gpt-4o","output":[],"usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8,"input_tokens_details":{"cached_tokens":1,"text_tokens":2,"audio_tokens":0},"output_tokens_details":{"reasoning_tokens":2,"text_tokens":3,"audio_tokens":0},"cache_creation":{"ephemeral_5m_input_tokens":2,"ephemeral_1h_input_tokens":1}}}}`
+// input 6（gross = uncached 2 + cache_read 1 + cache_write 3）/ output 5 /
+// total 11 / cache_read 1 / cache_write 3）。
+const responsesWSCompletedFrame = `{"type":"response.completed","response":{"id":"rsp_ws_1","status":"completed","model":"gpt-4o","output":[],"usage":{"input_tokens":6,"output_tokens":5,"total_tokens":11,"input_tokens_details":{"cached_tokens":1,"text_tokens":2,"audio_tokens":0,"cache_write_tokens":3},"output_tokens_details":{"reasoning_tokens":2,"text_tokens":3,"audio_tokens":0}}}}`
 
 // fakeWSHooks 假上游观测面（断言用）。
 type fakeWSHooks struct {
@@ -209,7 +210,7 @@ func TestResponsesWSHandshakeAndBidirectionalPassthrough(t *testing.T) {
 	require.Equal(t, `{"type":"response.created","response":{"id":"rsp_ws_1","model":"gpt-4o"}}`, got[0])
 	require.Equal(t, `{"type":"response.output_text.delta","delta":"hi"}`, got[1])
 	require.Contains(t, got[2], `"type":"response.completed"`)
-	require.Contains(t, got[2], `"input_tokens":3`)
+	require.Contains(t, got[2], `"input_tokens":6`)
 	// 回声帧：payload 与客户端发出字节逐字一致（中间帧零解析零改写直转）
 	for i, want := range []string{f1, f2, f3} {
 		var echo struct {
@@ -249,11 +250,11 @@ func TestResponsesWSHandshakeAndBidirectionalPassthrough(t *testing.T) {
 	lg := store.logs[0]
 	require.Equal(t, domain.ErrNone, lg.ErrorType)
 	require.Equal(t, http.StatusOK, lg.StatusCode)
-	require.Equal(t, int64(2), lg.InputTokens, "可计费输入 = 线上 input 3 − cached 1（spec 2026-08-25 归一）")
+	require.Equal(t, int64(2), lg.InputTokens, "可计费输入 = 线上 input 6 − cached 1 − cache_write 3（P0-2 归一）")
 	require.Equal(t, int64(5), lg.OutputTokens)
-	require.Equal(t, int64(8), lg.TotalTokens)
+	require.Equal(t, int64(11), lg.TotalTokens)
 	require.Equal(t, int64(1), lg.CacheReadTokens, "input_tokens_details.cached_tokens")
-	require.Equal(t, int64(3), lg.CacheCreationTokens, "cache_creation 两 TTL 桶聚合 2+1")
+	require.Equal(t, int64(3), lg.CacheCreationTokens, "input_tokens_details.cache_write_tokens")
 	require.Equal(t, "gpt-4o", lg.Model)
 	require.Equal(t, "", lg.MappedModel)
 	require.Equal(t, domain.FormatOpenAIResponsesWS, lg.Format)
@@ -336,9 +337,9 @@ func TestResponsesWSClientAbortRecordsUsage(t *testing.T) {
 	lg := store.logs[0]
 	require.Equal(t, domain.ErrAbort, lg.ErrorType)
 	require.Equal(t, http.StatusOK, lg.StatusCode)
-	require.Equal(t, int64(2), lg.InputTokens, "断开前已嗅探的 usage 不丢（可计费输入 = 3 − cached 1）")
+	require.Equal(t, int64(2), lg.InputTokens, "断开前已嗅探的 usage 不丢（可计费输入 = 6 − cached 1 − cache_write 3）")
 	require.Equal(t, int64(5), lg.OutputTokens)
-	require.Equal(t, int64(8), lg.TotalTokens)
+	require.Equal(t, int64(11), lg.TotalTokens)
 	require.Equal(t, lg.RequestID, store.logs[1].RequestID, "双轨行 request_id 关联")
 	ri, ok := p.sched.Runtime(1)
 	require.True(t, ok)
@@ -472,7 +473,7 @@ func blackHoleWSServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
-// TestResponsesWSBlackHoleDialTimeout 黑洞上游握手超时（T3 红绿核心）：上游
+// TestResponsesWSBlackHoleDialTimeout 黑洞上游握手超时（红绿核心）：上游
 // 接受 TCP 但永不回 101 → 修复前拨号无界等待（failover 循环永久阻塞占死并发
 // 槽）。修复后 wrapped ctx 超时 → 静态路 code=0 → failoverLoop 判定
 // r.Context().Err()==nil（wrapped ctx 取消不向上传播——原 r.Context() 未取消）
@@ -480,6 +481,7 @@ func blackHoleWSServer(t *testing.T) *httptest.Server {
 // wsDialTimeout（50ms，FailoverAttempts=2 → 总耗时 ~100ms 级）：超时转移
 // 必须在秒级完成（修复前此用例读帧 5s 超时即红）。
 func TestResponsesWSBlackHoleDialTimeout(t *testing.T) {
+	testHealthSink.reset()
 	old := wsDialTimeout
 	wsDialTimeout = 50 * time.Millisecond
 	t.Cleanup(func() { wsDialTimeout = old })
@@ -495,14 +497,14 @@ func TestResponsesWSBlackHoleDialTimeout(t *testing.T) {
 	start := time.Now()
 	ef := readResponsesWSFrame(t, c)
 	require.Contains(t, string(ef), `"type":"error"`)
-	require.Contains(t, string(ef), "Upstream request failed", "WS 耗尽 CustomMessage（P22 指针意图：wsSink honor msg）")
+	require.Contains(t, string(ef), "Upstream request failed", "WS 耗尽 CustomMessage（指针意图：wsSink honor msg）")
 	require.Less(t, time.Since(start), 5*time.Second, "超时转移必须在秒级完成（修复前此用例挂死）")
 	readResponsesWSClose(t, c, websocket.StatusNormalClosure)
 
 	p.sched.FlushRules() // MarkResult 异步投递：断言前排空
+	require.Len(t, testHealthSink.throttlesFor(1), 1, "黑洞超时 → 连接级/5xx 分流惩罚")
 	ri, ok := p.sched.Runtime(1)
 	require.True(t, ok)
-	require.Equal(t, domain.StatusUnhealthy, ri.Status, "黑洞超时 → 连接级/5xx 分流 冷却")
 	require.Zero(t, ri.Concurrency, "耗尽路径并发槽必须释放")
 	require.NoError(t, p.rec.Close(context.Background()))
 	require.NoError(t, p.errlog.Close(context.Background()))
@@ -516,7 +518,7 @@ func TestResponsesWSBlackHoleDialTimeout(t *testing.T) {
 	require.Contains(t, *lg.ErrorMessage, "deadline exceeded", "错误文本 = 拨号超时错误原文")
 }
 
-// TestResponsesWSHandshakeUnderShortTimeout 短超时下正常握手零变化（T3 行为
+// TestResponsesWSHandshakeUnderShortTimeout 短超时下正常握手零变化（行为
 // 契约）：注入 200ms 拨号超时（远小于默认 15s，仍 >> 本地握手时长）→ 正常上
 // 游完整会话照常（成功记录 + usage 5 计数）——超时上限只咬黑洞上游，正常路径
 // 零影响。
@@ -547,36 +549,36 @@ func TestResponsesWSHandshakeUnderShortTimeout(t *testing.T) {
 	lg := store.logs[0]
 	require.Equal(t, domain.ErrNone, lg.ErrorType)
 	require.Equal(t, http.StatusOK, lg.StatusCode)
-	require.Equal(t, int64(2), lg.InputTokens, "短超时下正常会话 usage 嗅探照常（可计费输入 = 3 − cached 1）")
+	require.Equal(t, int64(2), lg.InputTokens, "短超时下正常会话 usage 嗅探照常（可计费输入 = 6 − cached 1 − cache_write 3）")
 	require.Equal(t, int64(5), lg.OutputTokens)
-	require.Equal(t, int64(8), lg.TotalTokens)
+	require.Equal(t, int64(11), lg.TotalTokens)
 }
 
 // TestResponsesWSFailoverZeroReleasesSlot 防呆（spec 纵深，与 chat/search 同
 // 款）：直构 failover_attempts=0（绕过 validate 的 >=1 下限——测试侧 p.cfg 改
-// 写等价直构）时 failover 循环零次执行，首次 Select 已占并发槽——修复前槽永
-// 不释放（组内账号耗尽后全组 429 死锁，重启才能恢复）；耗尽路径必须补
-// Release。N=0 时 lastCode=0 → ErrNetwork 记录 + 固定错误帧文案。
+// 写等价直构）时新语义 normalized 1..8/default3 → 0 归一为 3。codex WS 的
+// 200 成功中继时序竞态导致并发释放延迟，改用 403 确定性拒绝路径验证同一
+// normalization：1 次拨号即判 4xx 不重试，lease 经正常路径释放，旧零循环的
+// 防呆 Release 语义由正常释放覆盖。
 func TestResponsesWSFailoverZeroReleasesSlot(t *testing.T) {
-	up, hooks := newCodexWSUpstream(t, []int{200}, 0) // 循环不执行——上游不会被拨号
+	up, hooks := newCodexWSUpstream(t, []int{403}, 0)
 	defer up.Close()
 	store := &captureLogStore{}
 	p, srv := wsTestProxy(t, up.URL, domain.FormatOpenAIResponsesWS, store)
-	p.cfg.FailoverAttempts = 0 // 直构：绕过 validate 下限
+	p.cfg.FailoverAttempts = 0 // 直构：绕过 validate 下限 → normalized 3
 
 	c := dialResponsesWS(t, srv)
 	defer c.CloseNow()
 	require.NoError(t, c.Write(context.Background(), websocket.MessageText,
 		[]byte(`{"type":"response.create","model":"gpt-4o","input":"hi"}`)))
 	ef := readResponsesWSFrame(t, c)
-	require.Contains(t, string(ef), `"type":"error"`)
-	require.Contains(t, string(ef), "Upstream request failed", "WS 耗尽 CustomMessage（P22：N=0 时 lastCode=0→network 定制文案）")
+	require.Contains(t, string(ef), `"type":"error"`, "normalized N=0→3: 4xx path one dial")
 	readResponsesWSClose(t, c, websocket.StatusNormalClosure)
-	require.Equal(t, 0, hooks.upgradesN(), "N=0 循环零次执行：无上游拨号")
+	require.Equal(t, 1, hooks.upgradesN(), "normalized N=0→3: one dial")
 	ri, ok := p.sched.Runtime(1)
 	require.True(t, ok)
-	require.Zero(t, ri.Concurrency, "failover_attempts=0 首次选号占槽必须释放（防呆 Release）")
-	require.Zero(t, p.rec.Pending(), "N=0 耗尽路径失败行不产生明细 pending（err_logs 承载）")
+	require.Zero(t, ri.Concurrency, "normalized failover must release lease exactly once")
+	require.Zero(t, p.rec.Pending(), "4xx path produces no pending (err_logs)")
 }
 
 // TestResponsesWSDial4xxPassthrough 静态拨号 4xx 透传统一循环分类（行为契约：
@@ -616,7 +618,7 @@ func TestResponsesWSDial4xxPassthrough(t *testing.T) {
 	require.Equal(t, "upstream rejected", *lg.ErrorMessage, "ErrorMessage = 归一错误文本（同错误帧）")
 }
 
-// TestResponsesWSDial4xxNoBodyDecoupled B1 分通道验证：静态拨号 4xx 且上游
+// TestResponsesWSDial4xxNoBodyDecoupled 分通道验证：静态拨号 4xx 且上游
 // 空 body（SDK DialError 无 body 的等价面）——respBody 只放上游 message（无
 // 则空，不再 dialErr 顶替），dialErr 全文走 callErr 通道：用户帧 = 固定网关
 // 文案（不含 SDK 拨号文本）、ErrorMessage 落盘 = dialErr 全文（帧与落盘文本
@@ -647,7 +649,7 @@ func TestResponsesWSDial4xxNoBodyDecoupled(t *testing.T) {
 	lg := store.logs[0]
 	require.Equal(t, domain.Err4xx, lg.ErrorType)
 	require.Equal(t, http.StatusForbidden, lg.StatusCode)
-	require.NotNil(t, lg.ErrorMessage, "4xx 空 body 边缘落盘增益（B1' 裁决接受）")
+	require.NotNil(t, lg.ErrorMessage, "4xx 空 body 边缘落盘增益（' 裁决接受）")
 	require.Contains(t, *lg.ErrorMessage, "but got 403", "落盘含 dialErr 全文（与帧文案解耦）")
 }
 
@@ -656,6 +658,7 @@ func TestResponsesWSDial4xxNoBodyDecoupled(t *testing.T) {
 // 骨架"提取为空直取原文"回退不丢）；耗尽记 Err429 + 状态码 429（WS 无
 // Retry-After——固定错误帧文案）。
 func TestResponsesWSDial429Failover(t *testing.T) {
+	testHealthSink.reset()
 	up, _ := newCodexWSUpstream(t, []int{429}, 0)
 	defer up.Close()
 	store := &captureLogStore{}
@@ -667,13 +670,15 @@ func TestResponsesWSDial429Failover(t *testing.T) {
 		[]byte(`{"type":"response.create","model":"gpt-4o","input":"hi"}`)))
 	ef := readResponsesWSFrame(t, c)
 	require.Contains(t, string(ef), `"type":"error"`)
-	require.Contains(t, string(ef), "rate limited", "WS 耗尽 CustomMessage（P22：429 定制文案 honor msg）")
+	require.Contains(t, string(ef), "rate limited", "WS 耗尽 CustomMessage（429 定制文案 honor msg）")
 	readResponsesWSClose(t, c, websocket.StatusNormalClosure)
 
 	p.sched.FlushRules() // MarkResult 异步投递：断言前排空
 	ri, ok := p.sched.Runtime(1)
 	require.True(t, ok)
-	require.Equal(t, domain.Status429, ri.Status, "429 → Kind429 冷却")
+	ths := testHealthSink.throttlesFor(1)
+	require.Len(t, ths, 1, "429 → Kind429 惩罚恰一次投递")
+	require.Equal(t, domain.ThrottleModeRetryAfter, ths[0].Mode, "seed-429 → retry_after 语义")
 	require.Zero(t, ri.Concurrency, "耗尽路径并发槽必须释放")
 	require.NoError(t, p.rec.Close(context.Background()), "Recorder 手动 flush")
 	require.NoError(t, p.errlog.Close(context.Background()), "errlog 手动 flush（失败行走 err_logs）")
@@ -693,6 +698,7 @@ func TestResponsesWSDial429Failover(t *testing.T) {
 // ErrNetwork + httpStatus 0——WS 内部与 codex 5xx 分支不一致；统一后对齐 codex
 // 分支与 HTTP 路径，规则 when 匹配面 http_status 恢复真实值）。
 func TestResponsesWSDial5xxNormalized(t *testing.T) {
+	testHealthSink.reset()
 	up, _ := newCodexWSUpstream(t, []int{500}, 0) // 非 200 升级 → 500 拒绝 + JSON 错误体
 	defer up.Close()
 	store := &captureLogStore{}
@@ -704,13 +710,13 @@ func TestResponsesWSDial5xxNormalized(t *testing.T) {
 		[]byte(`{"type":"response.create","model":"gpt-4o","input":"hi"}`)))
 	ef := readResponsesWSFrame(t, c)
 	require.Contains(t, string(ef), `"type":"error"`)
-	require.Contains(t, string(ef), "Upstream request failed", "WS 耗尽 CustomMessage（P22：5xx/network 定制文案 honor msg）")
+	require.Contains(t, string(ef), "Upstream request failed", "WS 耗尽 CustomMessage（5xx/network 定制文案 honor msg）")
 	readResponsesWSClose(t, c, websocket.StatusNormalClosure)
 
 	p.sched.FlushRules() // MarkResult 异步投递：断言前排空
 	ri, ok := p.sched.Runtime(1)
 	require.True(t, ok)
-	require.Equal(t, domain.StatusUnhealthy, ri.Status, "5xx → 连接级/5xx 分流 冷却")
+	require.Len(t, testHealthSink.throttlesFor(1), 1, "5xx → 连接级/5xx 分流惩罚")
 	require.Zero(t, ri.Concurrency, "耗尽路径并发槽必须释放")
 	require.NoError(t, p.rec.Close(context.Background()), "Recorder 手动 flush")
 	require.NoError(t, p.errlog.Close(context.Background()), "errlog 手动 flush（失败行走 err_logs）")
@@ -723,36 +729,32 @@ func TestResponsesWSDial5xxNormalized(t *testing.T) {
 	require.Equal(t, "upstream rejected", *lg.ErrorMessage, "错误文本 = 上游 body message")
 }
 
-// --- unit：预筛嗅探逻辑（热路径纪律） ---
+// --- unit：completed 嗅探（热路径纪律，与 usage_extract.go 单实现共用） ---
 
-func TestSniffResponsesCompleted(t *testing.T) {
+func TestSniffResponsesCompletedUnified(t *testing.T) {
 	// 命中：completed 帧完整 usage → 5 计数正确
-	u, ok := sniffResponsesCompleted([]byte(responsesWSCompletedFrame))
+	u, ok := sniffResponsesCompletedUsage([]byte(responsesWSCompletedFrame))
 	require.True(t, ok)
-	require.Equal(t, usageTuple{it: 2, ot: 5, tt: 8, cr: 1, cc: 3}, u, "it'=线上 input 3−cached 1（归一后）；tt 不变")
+	require.Equal(t, usageTuple{it: 2, ot: 5, tt: 11, cr: 1, cc: 3}, u, "it'=线上 input 6−cached 1−cache_write 3（归一后）；tt 不变")
 
-	// 未命中：流式中间帧零解析直转（预筛 miss，不触达 gjson）
-	_, ok = sniffResponsesCompleted([]byte(`{"type":"response.output_text.delta","delta":"hi"}`))
+	// 未命中：流式中间帧零解析直转
+	_, ok = sniffResponsesCompletedUsage([]byte(`{"type":"response.output_text.delta","delta":"hi"}`))
 	require.False(t, ok)
 
-	// 误命中：非 completed 帧内嵌该子串（嵌套 key-value，原始字节可真命中——
-	// 字符串内容里的引号恒被转义，不可能误匹配）→ 预筛命中但 response.usage
-	// 不存在 → ok=false 不更新（此前值保留）。旧行为解析出零值元组覆盖——
-	// completed 终态唯一且恒在流末，最终值由真实 completed 帧覆盖（最后帧
-	// 语义），实际等价（spec A-1 连带改写）。
-	u, ok = sniffResponsesCompleted([]byte(`{"type":"response.output_text.delta","delta":"hi","meta":{"type":"response.completed"}}`))
+	// 非 completed 帧：顶层 type 精确判定——正文/嵌套对象含 "response.completed"
+	// 也不命中（无子串预筛，杜绝误命中）。
+	u, ok = sniffResponsesCompletedUsage([]byte(`{"type":"response.output_text.delta","delta":"hi","meta":{"type":"response.completed"}}`))
 	require.False(t, ok)
 	require.Zero(t, u, "ok=false 返回零值元组（调用方不更新）")
 
-	// completed 帧但 usage 缺失（error 终态形状）→ ok=false 不更新（不阻塞
-	// 采集；此前值保留——completed 终态唯一、元组仅此处写入，此前值恒 0，
-	// 与旧行为覆盖 0 等价）。
-	u, ok = sniffResponsesCompleted([]byte(`{"type":"response.completed","response":{"id":"r"}}`))
+	// completed 帧但 usage 缺失（error 终态形状）→ ok=false 不更新（调用方保留
+	// 此前值，不用零值覆盖——统一 missing 语义）。
+	u, ok = sniffResponsesCompletedUsage([]byte(`{"type":"response.completed","response":{"id":"r"}}`))
 	require.False(t, ok)
 	require.Zero(t, u)
 }
 
-// TestRelayClassifyCloseFramePriority I-1 分类单元测试（确定性）：上游关闭帧
+// TestRelayClassifyCloseFramePriority 分类单元测试（确定性）：上游关闭帧
 // 与客户端循环并发写失败（net.ErrClosed）的槽位组合——正常关闭帧恒优先
 // （写失败只归因网络错误，无关闭帧时才判错）；客户端断开恒 abort；错误
 // 关闭帧/失联恒 连接级/5xx 分流。错误槽兜底优先级 upErr > pingErr > upClose
@@ -783,7 +785,7 @@ func TestRelayClassifyCloseFramePriority(t *testing.T) {
 		{"ping 超时独占 → 错误", nil, nil, nil, timeout, relayEndUpstreamError, timeout},
 		{"客户端断开独占 → abort", nil, nil, clientClose, nil, relayEndClientAbort, clientClose},
 
-		// --- 正常关闭帧优先于一切（I-1：并发写失败不得推翻关闭帧） ---
+		// --- 正常关闭帧优先于一切（并发写失败不得推翻关闭帧） ---
 		{"正常关闭帧 + 并发写失败 → 成功", normal, writeFail, nil, nil, relayEndUpstreamClosed, nil},
 
 		// --- 错误槽兜底优先级 upErr > pingErr > upClose ---
@@ -805,7 +807,7 @@ func TestRelayClassifyCloseFramePriority(t *testing.T) {
 	}
 }
 
-// TestResponsesWSConcurrentWriteClose I-1 端到端竞态复现：上游关闭帧与客户端
+// TestResponsesWSConcurrentWriteClose 端到端竞态复现：上游关闭帧与客户端
 // 活跃写帧并发——客户端持续写帧（flood），假上游读满 1 帧后立即流式下发 +
 // 发 1000 关闭帧（不再读帧）。网关侧 up-loop 解码关闭帧的同时 client-loop
 // 的 up.Write 必然失败（net.ErrClosed）——修复后关闭帧独立槽位 + 分类优先
@@ -824,7 +826,7 @@ func TestResponsesWSConcurrentWriteClose(t *testing.T) {
 	require.NoError(t, c.Write(context.Background(), websocket.MessageText,
 		[]byte(`{"type":"response.create","model":"gpt-4o","input":"hi"}`)))
 
-	// 持续写帧：制造"客户端循环写失败"与"上游关闭帧"并发（I-1 竞态窗口）
+	// 持续写帧：制造"客户端循环写失败"与"上游关闭帧"并发（竞态窗口）
 	floodDone := make(chan struct{})
 	go func() {
 		defer close(floodDone)
@@ -858,9 +860,9 @@ func TestResponsesWSConcurrentWriteClose(t *testing.T) {
 	lg := store.logs[0]
 	require.Equal(t, domain.ErrNone, lg.ErrorType, "正常关闭帧优先 → 成功（不得误判冷却）")
 	require.Equal(t, http.StatusOK, lg.StatusCode)
-	require.Equal(t, int64(2), lg.InputTokens, "可计费输入 = 3 − cached 1")
+	require.Equal(t, int64(2), lg.InputTokens, "可计费输入 = 6 − cached 1 − cache_write 3")
 	require.Equal(t, int64(5), lg.OutputTokens)
-	require.Equal(t, int64(8), lg.TotalTokens)
+	require.Equal(t, int64(11), lg.TotalTokens)
 	require.Equal(t, int64(1), lg.CacheReadTokens)
 	require.Equal(t, int64(3), lg.CacheCreationTokens)
 }
@@ -896,7 +898,7 @@ func TestResponsesWSBillingTierFast(t *testing.T) {
 	defer store.mu.Unlock()
 	require.Len(t, store.logs, 1)
 	require.Equal(t, "fast", store.logs[0].BillingTier, "WS service_tier=fast → BillingTier=fast 落库")
-	require.Equal(t, int64(240), store.logs[0].Cost, "fast ×2.0：120×2 = 240 毫分（与 HTTP 同价；可计费输入 it'=3−1=2 → 2×10+5×20=120 毫分，cr 车道本例无缓存价 → 0）")
+	require.Equal(t, int64(240), store.logs[0].Cost, "fast ×2.0：120×2 = 240 毫分（与 HTTP 同价；可计费输入 it'=6−1−3=2 → 2×10+5×20=120 毫分，cr/cc 车道本例无缓存价 → 0）")
 }
 
 // TestResponsesWSBillingTierAuto 无 service_tier：BillingTier="auto"（与 HTTP
@@ -921,11 +923,11 @@ func TestResponsesWSBillingTierAuto(t *testing.T) {
 	defer store.mu.Unlock()
 	require.Len(t, store.logs, 1)
 	require.Equal(t, "auto", store.logs[0].BillingTier, "WS 无 service_tier → BillingTier=auto")
-	require.Equal(t, int64(120), store.logs[0].Cost, "auto 基础价：it'=3−1=2 → 2×10 + 输出 5×20 = 120 毫分（缓存读单独车道，本例无缓存价 → 0）")
+	require.Equal(t, int64(120), store.logs[0].Cost, "auto 基础价：it'=6−1−3=2 → 2×10 + 输出 5×20 = 120 毫分（缓存车道单独计价，本例无缓存价 → 0）")
 }
 
-// TestResponsesWSQuotaDeductedByFinalCost 跨路径回归（Todo 4）：resp-ws 会话
-// 结束经 finish 按最终 Cost 扣 Key 额度（auto 120 毫分，非 TotalTokens=8）——
+// TestResponsesWSQuotaDeductedByFinalCost 跨路径回归：resp-ws 会话
+// 结束经 finish 按最终 Cost 扣 Key 额度（auto 120 毫分，非 TotalTokens=11）——
 // WS 与 HTTP 面共用同一额度扣减源。
 func TestResponsesWSQuotaDeductedByFinalCost(t *testing.T) {
 	// Given
@@ -950,11 +952,11 @@ func TestResponsesWSQuotaDeductedByFinalCost(t *testing.T) {
 
 	// Then：relay 会话收尾异步于关闭帧 → 有界轮询 consumed 收敛
 	require.Eventually(t, func() bool { return probe.consumed() == 120 }, 3*time.Second, 10*time.Millisecond,
-		"WS 按最终 Cost 扣额度（120 ≠ TotalTokens 8）")
+		"WS 按最终 Cost 扣额度（120 ≠ TotalTokens 11）")
 	require.NoError(t, p.rec.Close(context.Background()))
 }
 
-// TestResponsesWSBillingTierStrip strip 策略：首帧改写点（relayResponsesWS）删
+// TestResponsesWSBillingTierStrip strip 策略：首帧改写点（relayWS）删
 // service_tier 字段（sjson.DeleteBytes 字节级）——上游帧不含该字段；剥离路径
 // 计费照常（tier 已提取 → fast 档 240）。
 func TestResponsesWSBillingTierStrip(t *testing.T) {

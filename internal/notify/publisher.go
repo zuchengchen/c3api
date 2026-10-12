@@ -2,13 +2,13 @@
 // Dual-licensed: AGPL-3.0-or-later (open source) or commercial license (closed-source
 // deployment exemption); see LICENSE and LICENSE.commercial. Copyright (c) 2026 is7Qin.
 
-// Package notify 多实例变更广播（#14 T1 基础层）：PG LISTEN/NOTIFY 定向刷新。
+// Package notify 多实例变更广播（基础层）：PG LISTEN/NOTIFY 定向刷新。
 //
 // 架构（设计文档 docs/superpowers/plans/2026-08-10-multi-instance-design.md
 // §2）：管理面变更落库成功后经 Publisher 发一条 NOTIFY（单 channel
 // c3api_invalidate，紧凑 JSON 载荷与 invalidate.State 同构）；每实例一个
 // Listener worker（Name="notify"）LISTEN 该 channel，解析后调注入的
-// Dispatcher（main 装配，T3）转发现有 invalidate.Debouncer 的 Mark 方法——
+// Dispatcher（main 装配）转发现有 invalidate.Debouncer 的 Mark 方法——
 // 本地/远端变更共享同一去抖窗口，天然合并去重，Debouncer 本体零改动。
 //
 // 设计要点：
@@ -65,11 +65,26 @@ type Change struct {
 	// Rules 规则表变更（规则 CRUD）→ 规则表重载（重载清窗口计数，全实例
 	// 同步执行语义）。
 	Rules bool `json:"rules,omitempty"`
+	// Pricing 定价快照变更（价格写面）→ 定价快照重载（缺价 402 窗口跨实例
+	// 收敛，不等重启）。
+	Pricing bool `json:"pricing,omitempty"`
+	// ManagementKeys 管理 key（mk-）CRUD/状态变更 → auth 快照全量 Reload
+	// （跨实例收敛；本实例写面已增量 Upsert/Delete）。
+	ManagementKeys bool `json:"management_keys,omitempty"`
 	// Groups 组级定向（账号变更的受影响组 id）。
 	Groups []int64 `json:"groups,omitempty"`
 	// Src 发布实例 ID：接收端跳过自播（省一次重复 reload）。Publisher 自动
 	// 填，调用方无需关心。
 	Src string `json:"src,omitempty"`
+}
+
+// IsEmpty 空载荷判定：9 个变更位全 false 且 Groups 为空。V/Src 不参与判定——
+// V 恒存在（json 无 omitempty），Src 由 Publisher 发布时自动填充，调用方
+// 构造时均为空。service.publish 用此前置跳过无意义 NOTIFY（
+// 创建无分组 / 补丁无分组变更的空载荷在此统一覆盖）。
+func (c Change) IsEmpty() bool {
+	return !c.Users && !c.Templates && !c.Clients && !c.Multipliers &&
+		!c.Keys && !c.Settings && !c.Rules && !c.Pricing && !c.ManagementKeys && len(c.Groups) == 0
 }
 
 // Marshal 序列化 Change（含载荷守卫）：估算 marshal 后长度 > maxPayloadBytes
@@ -122,7 +137,7 @@ func (p *Publisher) Publish(ctx context.Context, ch Change) error {
 	if p.pool == nil {
 		return fmt.Errorf("notify: publisher pool not configured")
 	}
-	ch.Src = p.src // 接收端跳过自播（Src 含实例随机 nonce，B4-1 跨实例唯一；空 src = 不跳过，单实例部署无碍）
+	ch.Src = p.src // 接收端跳过自播（Src 含实例随机 nonce，跨实例唯一；空 src = 不跳过，单实例部署无碍）
 	payload := Marshal(ch)
 	_, err := p.pool.Exec(ctx, notifySQL, string(payload))
 	if err != nil && p.log != nil {

@@ -1,6 +1,6 @@
 # PROJECT KNOWLEDGE BASE — c3api
 
-**Generated:** 2026-08-24 · **Commit:** b8a6477(F2 合入) · **Branch:** main
+**Generated:** 2026-08-24 · **Commit:** b8a6477（合入） · **Branch:** main
 **Deep-dive memory:** `.omo/memory/MEMORY.md`（主题蒸馏 + 历史裁决，本地不入 git）
 
 ## OVERVIEW
@@ -19,7 +19,7 @@ internal/
   ent/            # GENERATED——禁止手改
   scheduler/      # 选号快照；copy-modify-Store 不可变视图
   rule/           # 规则引擎；Kind 五值 ok/429/4xx/5xx/network
-  billing/        # 计费游标消费者(F2 ledger-cursor)：Cost 纯函数、Balances 快照、FlusherStats(lag 族)
+  billing/        # 计费游标消费者(ledger-cursor)：Cost 纯函数、Balances 快照、FlusherStats(lag 族)
   usage/          # usage_logs 唯一写点(InsertBatch)+在线配额累加+watermark 离线聚合
   pricing/ notify/ invalidate/ credential/ sdkbridge/ protoconv/ domain/ config/ worker/ snapshot/ auth/ server/
 pkg/              # 可复用层：aiclient(SDK 工厂)、sserelay(SSE 中继)、httpx、logx、cryptox
@@ -34,7 +34,7 @@ openapi/ deploy/ scripts/build.sh   # 无 Makefile
 |---|---|
 | 改 AI 格式路径 | `internal/proxy/forward_*.go`(HTTP 面) → `caller_*.go`(上游策略) → `pipeline.go`(守卫骨架) |
 | 协议转换 | `internal/protoconv`（chat↔resp/mess 四方向全网格；仅 chat→resp 是 gjson 字节级） |
-| 上游客户端/鉴权注入 | `pkg/aiclient`（Factory 双缓存；rawPostCT 零透传契约） |
+| 上游客户端/鉴权注入 | `pkg/aiclient`（Factory 双缓存；`rawPostCT` 收 `in http.Header` 走 `RelayHeaders`，唯一剔除清单在 `relay.go` 的 `relayDeny`） |
 | 新增管理端点 | `openapi/openapi.yaml` → 重生成 → `internal/handler/*.go` 实现 → `web` 跑 `pnpm gen:api` |
 | 扣费链路 | `internal/proxy/forward.go`(routeLog 出生定态) → `internal/repository/billing_cursor.go`(游标消费) → `internal/billing`(Cost 纯函数/Balances 快照) |
 | 定价 | `internal/pricing`（换算系 ×1e5 与 ×1e11 禁混用） |
@@ -51,16 +51,16 @@ openapi/ deploy/ scripts/build.sh   # 无 Makefile
 | `UpstreamCaller` | iface | internal/proxy/caller.go:98 | 一格式一实现； owns 记录/failover 分类 |
 | `relayWS` / `wsRelayTransport` | method/iface | internal/proxy/ws_relay.go:54/:35 | WS 双向中继合一；5 方法隔离 responses vs codex |
 | `ConvertRequest`/`StreamMapper` | func/struct | internal/protoconv/protoconv.go:29/:84 | 请求转换四方向分发；流式逐帧零分配映射 |
-| `Factory` / `rawPostCT` | struct/method | pkg/aiclient/aiclient.go:40/:205 | 模板级客户端缓存+URL 缓存；HTTP 面零透传 |
+| `Factory` / `rawPostCT` | struct/method | pkg/aiclient/aiclient.go | 模板级客户端缓存+URL 缓存；HTTP 面走 `RelayHeaders`（default-allow + `relayDeny`） |
 | `Relay`/`InferEventName` | func | pkg/sserelay/relay.go | 池化 SSE 中继；inLine 续片状态机 |
 | `Codex` | struct | internal/sdkbridge/codex.go:27 | codex SDK 适配：账号级缓存+fatal 回调+轮换 |
-| `DeductOnlyAndMark` / `markBilledExec` | method/func | internal/repository/billing_repo.go:80 / billing_cursor.go:178 | FEFO 扣减+billed 标记同事务原子；标记行数守卫堵锁丢失双扣 |
+| `SettleBalanceBatch` / `SettleFefoBatch` | method | internal/repository/billing_settle.go:60/:67 | 双车道语句化结算：扣减+billed 标记同事务原子（每窗口一次往返）；`runSettleStmt` 的 marked==batch 比对守卫 → `errConcurrentMark` 堵锁丢失双扣 |
 
 ## CONVENTIONS
 
 - **仅 chat→resp 方向是字节级(gjson)**，其余转换方向 map-based——优化不对称是有意的，别"统一"
 - **方向命名双轨**：`ProtocolConvertXToY`=客户端说 X 上游说 Y；转换函数按数据流命名(`respToChatResponse`)
-- **base_url 一律裸根**（拒绝含 `/v1`，防 `/v1/v1/...` 404）；openai 族自动补 `/v1`
+- **base_url 可带协议前缀**（如 `/zen`），但拒绝以 `/v1` 结尾（防 `/v1/v1/...` 404）；openai 族自动补 `/v1`
 - **配置 fail-fast**：未知键、时长<1ms、受控整数<1、占位密钥(change-me 等)全部启动即炸；改 TOML 键名=故意破坏性变更
 - **测试**：testify **只 require 不 assert**；PG 测试真实 PostgreSQL（pgxmock 仅 5 个遗留/冒烟文件勿扩展：repository_test/rule_repo_test/pg_account_groups_test/signup_bootstrap_pg_test/notify publisher）；全仓 `t.Parallel()`=0 串行；固定 `time.Date(2026,8,...)` 注入时间；channel 屏障替代 sleep（参考 codex_test.go runWave）
 - **前端**：pnpm only（本机须 `--config.node-linker=hoisted`）；schema.d.ts 由 `pnpm gen:api` 生成禁手改
@@ -69,7 +69,7 @@ openapi/ deploy/ scripts/build.sh   # 无 Makefile
 ## ANTI-PATTERNS（本项目明令禁止）
 
 1. 业务代码直接 import zap——日志只走 `pkg/logx`（logx.go:5）
-2. HTTP 面加任何客户端头透传——零透传是契约非遗漏（aiclient.go:201）；WS 面白名单外的头同理，Authorization/X-Api-Key 必剔（caller_responses_ws.go:398-416）
+2. 网关做**配置驱动**的「客户端头→上游头」映射——透传 = default-allow + 全仓唯一一份 `relayDeny`（详见 `pkg/aiclient/relay.go`，不可被配置穿透，扩容须过同级评审）；必剔 `Authorization`/`X-Api-Key`/`Cookie`/`Accept-Encoding`（凭据/跨租户态/gzip 漏计费）与入站足迹族（`X-Forwarded-*`/`Forwarded`/`Via` 等——描述**入站**连接，网关亦不追加自身观测；写清单须用规范形 `X-Real-Ip`/`Cf-Connecting-Ip`/`True-Client-Ip`，常见写法能编译但永不命中）及 `Expect`（入站 100-continue 协商，客户端可注入的延迟放大器）/`X-Request-Id`（网关自己写过，递上游=泄漏内部关联 id 或让客户端注入未校验值）。deny-list 不是安全边界（`X-Client-IP` 等自定义键照旧达上游，不得宣传为「防 IP 泄漏」）。codex WS 面不喂任何客户端头（握手头仅来自 SDK，spec §12）。
 3. 未知账号类型静默 fallback 到 api_key——显式报错（forward.go:736）
 4. 裸写 scheduler 已发布快照视图——必须 copy-modify-Store（scheduler.go:921）；disabled 账号不得被在途事件复活
 5. 响应后副作用跑在请求 ctx 上——NOTIFY 发布/规则重载必须 `context.WithoutCancel`；但裸 WithoutCancel 无界，本地 Apply 包 30s 超时（setting.go:79）
@@ -78,13 +78,14 @@ openapi/ deploy/ scripts/build.sh   # 无 Makefile
 8. 复用缓冲切片跨帧/跨回调保留——scanner/relay 缓冲仅回调期内有效（relay.go:23、codex.go:232）
 9. 测试 time.Sleep 掩盖竞态——用屏障/watchdog；CI 无 -race，别赌
 10. 手改生成物：`internal/ent/**`、`handler/*/api.gen.go`、`web/src/lib/api/schema.d.ts`
-11. 破坏 usage_logs 单写点——INSERT 仅 usage flusher InsertBatch（billing worker 只 UPDATE 标记）；billed 出生定态仅 routeLog 一处判定（forward.go:420-423）；扣费标记必经 markBilledExec 守卫，绕开=丢并发双扣防御（billing_cursor.go:178）
+11. 破坏 usage_logs 单写点——INSERT 仅 usage flusher InsertBatch（billing worker 只 UPDATE 标记）；billed 出生定态仅 routeLog 一处判定（forward.go:420-425）；扣费标记必经结算语句的 marked==batch 比对守卫（`errConcurrentMark`，billing_settle.go:174-188），绕开=丢并发双扣防御
 
 ## COMMANDS
 
 ```bash
 # 本地开发（:18080 网关 + :5173 前端代理 /api）
-export C3API_ADMIN_TOKEN=local-admin-token
+# 管理面鉴权：首个注册用户自动成为 platform_admin（bootstrap 后登录即可），
+# 或自签发管理 key（mk- 前缀）。
 export C3API_AUTH_JWT_SECRET=$(openssl rand -hex 16)
 go run ./cmd/server -config config.toml
 cd web && pnpm install --config.node-linker=hoisted && pnpm run dev
@@ -92,7 +93,7 @@ cd web && pnpm install --config.node-linker=hoisted && pnpm run dev
 # 测试（镜像 CI；PG 测试需 TEST_DATABASE_URL，缺省 skip）
 docker compose -f deploy/test-compose.yml up -d        # 本地 PG :15432
 export TEST_DATABASE_URL="postgres://postgres:c3api@localhost:15432/c3api_test"
-go vet ./... && go build ./... && go test -count=1 -p 1 ./...   # -p 1 包级串行：多包并行 bootstrap 同库会撞 ent 迁移（XX000）
+go vet ./... && go build ./... && scripts/test.sh -count=1   # 每个 PG 测试克隆一个私有库（模板库 + CREATE DATABASE ... TEMPLATE），不再需要 -p 1
 
 # 代码生成漂移检查（CI contract-gen 同款）
 go generate ./internal/handler/ ./internal/ent/ && git diff --exit-code
@@ -108,19 +109,19 @@ TEST_DATABASE_URL="postgres://postgres:c3api@localhost:15432/postgres" \
 
 # 压测三件套
 go run ./tools/fakeupstream -addr :9100 -chunks 100 -latency 20ms
-go run ./tools/loadtest/setup -addr http://127.0.0.1:8080 -admin-token <tok> -upstream http://127.0.0.1:9100 -users 5000 -accounts 5000 -groups 20 -keys-out keys.txt
+go run ./tools/loadtest/setup -addr http://127.0.0.1:8080 -admin-jwt <platform_admin JWT> -upstream http://127.0.0.1:9100 -users 5000 -accounts 5000 -groups 20 -keys-out keys.txt
 go run ./tools/loadtest -mode stream -addr http://127.0.0.1:8080 -key ck-xxx -concurrency 10000 -duration 5m
 ```
 
 ## NOTES（踩坑即事实）
 
 - **端口分裂**：单测 PG=:5432(CI)/15432(本地 compose)，e2e 默认 :15432 的 postgres 库自建 c3api_e2e
-- **worker 注册序=反序排空语义**：billFlusher 在 listener/authSync 之前注册（main.go:485-491，F2：首位注册→停机最后扫游标），动顺序前读注释
+- **worker 注册序=反序排空语义**：billFlusher 在 listener/authSync 之前注册（main.go:485-491：首位注册→停机最后扫游标），动顺序前读注释
 - **typed-nil 陷阱**：invBalances 声明为接口类型非具体指针（main.go:233，2026-08-10 真实 panic 事故）
-- **循环依赖靠事后回填**：svc.SetLocalDispatcher 是有意设计
+- **禁止新增事后回填（owner 2026-09-14 纪律）**：构造环必须结构性消除——把能力抽成独立组件按序构造，或走既有直连路径（dispatcher 直连 svc.ReloadSettings/ReloadPricingCtx；settings 本地生效走 invalidate KindSettings）。`svc.SetLocalDispatcher` 已按此拆除；存量 Set* 回填在清理队列
 - **ent 迁移跳过 3 张分区表**（atlas 无法 diff），分区由幂等 bootstrap 负责、失败即 fatal
 - **chi v5.3.1 双 Mount panic**：/api/admin 用 Handle 不用 Mount；SPA NotFound 会传播进子路由需自行 404 API 前缀
-- **http.Server 无 WriteTimeout**（SSE 保护）；上游传输 Proxy:nil 显式直连（HTTP_PROXY 防劫持 C2-1）
+- **http.Server 无 WriteTimeout**（SSE 保护）；上游传输 Proxy:nil 显式直连（HTTP_PROXY 防劫持）
 - **env 覆盖只替换第一个下划线**：C3API_DB_DSN→db.dsn；前缀必须大写
 - **billing 默认开启**：空价格表=所有模型 402，需先 POST /api/admin/pricing/sync
 - CI 无 `-race`、无 GOMAXPROCS、e2e 不进 CI——这三条是已知取舍不是遗漏

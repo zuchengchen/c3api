@@ -13,7 +13,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/repository"
 )
 
@@ -31,18 +30,18 @@ func newRuleSvc() (*Service, *fakeStore, *fakeReloader) {
 	return &Service{store: fs, ruleReload: rl}, fs, rl
 }
 
-// fakeRuleReloader 函数式 RuleReloader（B4-4 断言注入）。
+// fakeRuleReloader 函数式 RuleReloader（断言注入）。
 type fakeRuleReloader func(ctx context.Context) error
 
 func (f fakeRuleReloader) Reload(ctx context.Context) error { return f(ctx) }
 
-// TestReloadRulesSurvivesRequestCancel B4-4（p2-12）：请求 ctx 已取消（客户端
+// TestReloadRulesSurvivesRequestCancel：请求 ctx 已取消（客户端
 // 断开）→ 规则重载仍必须执行完成——reloadRules 用 context.WithoutCancel 剥离
 // 取消信号（与 publish 同纪律 service.go:320）；且重载拿到的 ctx 不可取消。
 func TestReloadRulesSurvivesRequestCancel(t *testing.T) {
 	called := make(chan struct{})
 	svc := &Service{ruleReload: fakeRuleReloader(func(rc context.Context) error {
-		require.NoError(t, rc.Err(), "WithoutCancel 后重载 ctx 不可取消（B4-4）")
+		require.NoError(t, rc.Err(), "WithoutCancel 后重载 ctx 不可取消")
 		close(called)
 		return nil
 	})}
@@ -52,12 +51,12 @@ func TestReloadRulesSurvivesRequestCancel(t *testing.T) {
 	select {
 	case <-called:
 	case <-time.After(time.Second):
-		t.Fatal("请求 ctx 取消后规则重载必须仍执行完成（B4-4）")
+		t.Fatal("请求 ctx 取消后规则重载必须仍执行完成")
 	}
 }
 
 func validWhen() map[string]any { return map[string]any{"kind": "5xx"} }
-func validThen() map[string]any { return map[string]any{"status": "unhealthy", "cooldown": "5s"} }
+func validThen() map[string]any { return map[string]any{"response_code": 503} }
 
 func TestCreateRule(t *testing.T) {
 	svc, _, rl := newRuleSvc()
@@ -69,8 +68,8 @@ func TestCreateRule(t *testing.T) {
 	require.Equal(t, "r1", got.Name)
 	require.True(t, got.Enabled)
 	require.Equal(t, "5xx", *got.When.Kind)
-	require.Equal(t, domain.StatusUnhealthy, *got.Then.Status)
-	require.Equal(t, "5s", *got.Then.Cooldown)
+	require.NotNil(t, got.Then.ResponseCode)
+	require.Equal(t, 503, *got.Then.ResponseCode)
 	require.Equal(t, 1, rl.calls, "规则创建后必须触发引擎 Reload")
 
 	// response_code/custom_message 契约 round-trip（指针意图，seed-400 nil/nil 形态直插，普通规则需显式 ResponseCode/CustomMessage）
@@ -83,7 +82,6 @@ func TestCreateRule(t *testing.T) {
 	require.Equal(t, 400, *got2.Then.ResponseCode)
 	require.NotNil(t, got2.Then.CustomMessage)
 	require.Equal(t, "bad request passthrough", *got2.Then.CustomMessage)
-	require.Nil(t, got2.Then.Status)
 }
 
 func TestCreateRuleRejectsUnknownWhenKey(t *testing.T) {
@@ -98,7 +96,7 @@ func TestCreateRuleRejectsUnknownWhenKey(t *testing.T) {
 
 	_, err = svc.CreateRule(context.Background(), RuleInput{
 		Name: "r2", Priority: 11, When: validWhen(),
-		Then: map[string]any{"status": "unhealthy", "bogus": true},
+		Then: map[string]any{"response_code": 503, "bogus": true},
 	})
 	require.ErrorIs(t, err, ErrInvalidInput, "then 未知键 → 400 语义")
 }
@@ -110,13 +108,12 @@ func TestCreateRuleInvalidThen(t *testing.T) {
 		Name: "r1", Priority: 10, When: validWhen(), Then: map[string]any{},
 	})
 	require.NoError(t, err, "Then{} 纯透传合法")
-	require.Nil(t, got.Then.Status)
 	require.Nil(t, got.Then.ResponseCode)
 	require.Nil(t, got.Then.CustomMessage)
 	_, err = svc.CreateRule(context.Background(), RuleInput{
-		Name: "r2", Priority: 11, When: validWhen(), Then: map[string]any{"cooldown": "0s"},
+		Name: "r2", Priority: 11, When: validWhen(), Then: map[string]any{"response_code": 999},
 	})
-	require.ErrorIs(t, err, ErrInvalidInput, "cooldown ≤ 0 → 400 语义")
+	require.ErrorIs(t, err, ErrInvalidInput, "response_code 越界 → 400 语义")
 	_, err = svc.CreateRule(context.Background(), RuleInput{
 		Name: "r3", Priority: 12, When: map[string]any{"ratio_429_ge": 0.5}, Then: validThen(),
 	})
@@ -142,10 +139,10 @@ func TestCreateRulePriorityConflict(t *testing.T) {
 	require.NoError(t, err)
 	_, err = svc.CreateRule(context.Background(), RuleInput{Name: "r2", Priority: 10, When: validWhen(), Then: validThen()})
 	require.ErrorIs(t, err, ErrConflict, "priority 唯一冲突 → ErrConflict（409 语义）")
-	require.Contains(t, err.Error(), `priority=10 or name="r2"`, "409 消息含冲突详情（G1-2）")
+	require.Contains(t, err.Error(), `priority=10 or name="r2"`, "409 消息含冲突详情")
 	_, err = svc.CreateRule(context.Background(), RuleInput{Name: "r1", Priority: 20, When: validWhen(), Then: validThen()})
 	require.ErrorIs(t, err, ErrConflict, "name 唯一冲突同样映射 ErrConflict")
-	require.Contains(t, err.Error(), `name="r1"`, "409 消息含冲突详情（G1-2）")
+	require.Contains(t, err.Error(), `name="r1"`, "409 消息含冲突详情")
 	require.Equal(t, 1, rl.calls, "冲突失败不触发 Reload")
 }
 
@@ -171,7 +168,7 @@ func TestUpdateRuleMerge(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidInput)
 	require.Equal(t, 2, rl.calls, "校验失败不触发 Reload")
 
-	// 显式 {} 清空 when（D-M2）：非 nil 空 map = 整体替换为空 when（匹配一切）
+	// 显式 {} 清空 when：非 nil 空 map = 整体替换为空 when（匹配一切）
 	cleared, err := svc.UpdateRule(context.Background(), created.ID, RulePatch{When: map[string]any{}})
 	require.NoError(t, err)
 	require.Nil(t, cleared.When.Kind, "显式 {} 清空 when")
@@ -194,12 +191,12 @@ func TestUpdateRuleMerge(t *testing.T) {
 	p := 20
 	_, err = svc.UpdateRule(context.Background(), created.ID, RulePatch{Priority: &p})
 	require.ErrorIs(t, err, ErrConflict)
-	require.Contains(t, err.Error(), `priority=20`, "更新路径 409 消息同样含冲突详情（G1-2）")
+	require.Contains(t, err.Error(), `priority=20`, "更新路径 409 消息同样含冲突详情")
 	require.Equal(t, 4, rl.calls, "冲突失败不触发 Reload")
 }
 
 // TestMapRuleRepoErrConflict mapRuleRepoErr 的 ErrConflict 分支：repository.ErrConflict →
-// service.ErrConflict（保留冲突详情，handler 409 响应带详情——G1-2 对齐 mapRepoErr）；
+// service.ErrConflict（保留冲突详情，handler 409 响应带详情——对齐 mapRepoErr）；
 // 非冲突错误原样透传。
 func TestMapRuleRepoErrConflict(t *testing.T) {
 	err := fmt.Errorf("%w: priority=%d or name=%q", repository.ErrConflict, 10, "r2")

@@ -1,22 +1,44 @@
 # 生产配置模板（compose 挂载，只读）。敏感项由环境变量
-# C3API_ADMIN_TOKEN / C3API_DB_DSN / C3API_AUTH_JWT_SECRET 注入覆盖（见 compose.yml），
+# C3API_DB_DSN / C3API_AUTH_JWT_SECRET / C3API_REDIS_ADDR 注入覆盖（见 compose.yml），
 # 此处留空即可。配置仅启动时读取，变更需滚动重启（无热更新）。
 server = { addr = ":18080", read_header_timeout = "10s", max_header_bytes = 1048576, time_zone = "" } # IANA 名（如 Asia/Shanghai）；空=进程本地
 log = { level = "info", output = "stdout" }
-# admin.token 可选——空 = 不启用静态 token，/admin 仅接受 platform_admin JWT
-# （首个注册用户自动成为 platform_admin，注册后即可登录管理面）
-admin = { token = "" }
+# 管理面鉴权：platform_admin 身份（首个注册用户自动成为 platform_admin，注册后即可
+# 登录管理面）或其管理 key（mk- 前缀，自签发）。
 # JWT 密钥（强制——缺失启动失败；生产必须经 env C3API_AUTH_JWT_SECRET 注入，
 # 随机生成 = 重启全失效 + 多实例不一致）
 auth = { jwt_secret = "" }
 db = { dsn = "", max_conns = 20 }
 proxy = {
-  max_body_size = 4194304,
+  # 请求体上限（字节，64 MiB）：读 body 时 http.MaxBytesReader 强制，超出即中断
+  # 并按 413 类错误拒绝（含 vision base64 图片的大请求需相应调大）。
+  max_body_size = 67108864,
+  # 全局在途请求上限（并发闸门，中间件层）：超限的新请求立即 429，不排队。
+  # 0 = server 侧兜底为 50000（配置下限不校验，见 config.go validate 注释）。
   max_inflight = 50000,
   upstream_timeout = "120s",
   upstream_stream_timeout = "30m",
+  # 合法域 1..8（上限 = AttemptPlan 固定去重集），0/负值或 >8 启动即失败
   failover_attempts = 3,
   usage_capture = true,
+  # client_ip 按序采信 CF-Connecting-IP → True-Client-IP → X-Real-IP（true，默认）；
+  # false 完全不读这些头直取 RemoteAddr——compose + 前置代理拓扑下只会记到内网
+  # 对端（如 172.18.0.1），审计无意义。默认开的前提是源站端口只对代理开放
+  # （防火墙封直连）；若本机直连公网暴露，须显式置 false——头可被客户端自填，
+  # client_ip 仅为尽力而为的排障标识。
+  behind_cdn = true,
+  # 低余额用户级并发钳制：余额（毫分）严格小于阈值的用户，其用户级并发上限
+  # 钳为 low_balance_max_concurrency；余额回到阈值以上恢复原上限。
+  # 阈值单位 USD；low_balance_max_concurrency = 0 关闭该特性（退回旧行为）。
+  # 默认开启（5 / 10）——升级后余额 < $10 的用户即时被钳为 5（原上限更大/不限者）。
+  low_balance_max_concurrency = 5,
+  low_balance_threshold_usd = 10,
+  # SSE 客户端保活：客户端长时间无业务输出时，网关按此间隔写出 `: keepalive\n`
+  # 注释帧以维持连接（默认 10s）。0 = 关闭通用定时心跳。五路（chat/responses/
+  # anthropic/converted）与 typed images 均受此键控制；仅 codex images 合成路径
+  #（上游非流、由 SDK 合成 keepalive+completed）不受此键影响——其保活由 SDK
+  # 自带 60s 驱动（60s 不满足最严 LB 的 ≤60s 读超时）。
+  stream_keepalive_interval = "10s",
 }
 upstream = {
   max_idle_conns = 8192,
@@ -35,7 +57,7 @@ scheduler = {
 usage = {
   batch_size = 500,
   flush_interval = "500ms",
-  # usagelog 按日分区保留天数（Phase 5 T4.5）：保留期外分区由 retention worker
+  # usagelog 按日分区保留天数：保留期外分区由 retention worker
   # DROP TABLE O(1) 清理（默认 30 天 = 30 个日分区）；<= 0 = 不删除。
   log_retention_days = 30,
   # quota 回写 cadence（spec 2026-08-14：统计 flush 删除后仅驱动额度增量回写）。
@@ -60,11 +82,11 @@ usage = {
   #                                    # 聚合统计也分区化——清理 DROP 分区 O(1)，
   #                                    # PG DELETE 不释放空间）
 }
-# 计费（Phase 5）：默认开启（与代码/example 默认一致）。首次启动后需先同步
+# 计费：默认开启（与代码/example 默认一致）。首次启动后需先同步
 # 价格（POST /admin/pricing/sync）——空价格表 = 全模型 402。开启后：请求前
-# 余额预检（快照缺失或 <0 → 402——余额 0 放行，临时额度由 FEFO 扣费消化）、
+# 余额预检（快照缺失或 ≤0 → 402；免费用户/组放行，临时额度由 FEFO 扣费消化）、
 # 临时额度 FEFO 优先扣、条件扣费允许透支、优雅停机排空不丢计费。
-# flush_interval：计费游标轮询周期（F2 ledger-cursor：billable 行由 usage
+# flush_interval：计费游标轮询周期（ledger-cursor：billable 行由 usage
 # flusher 单写落库 billed=false，本 worker 每周期取批消费 unbilled 账本——
 # FEFO 扣减与 billed 标记同事务原子；停机排空受 shutdown 预算约束，超时 Warn
 # 截断不阻塞退出）。

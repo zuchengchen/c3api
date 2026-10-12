@@ -4,7 +4,7 @@
 
 package billing
 
-// 计费游标消费者单测（F2 ledger-cursor，spec 2026-08-23 §四）：fake LedgerStore
+// 计费游标消费者单测（ledger-cursor，spec 2026-08-23 §四）：fake LedgerStore
 // 覆盖正常消费链（billed 翻转 + 余额断言）、结算失败闭合、cost=0 批量快速标记、
 // lag 护栏、Close 排空清空、会话锁互斥。PG 全链路归 repository 直调测试。
 
@@ -135,7 +135,7 @@ func (s *fakeLedgerStore) FetchUnbilledBatch(ctx context.Context, limit int) ([]
 	s.fetches++
 	ids := make([]int64, 0, len(s.rows))
 	for id, r := range s.rows {
-		if !r.billed { // D1 读取面：含 cost<=0 行，已在路由分叉
+		if !r.billed { // 读取面：含 cost<=0 行，已在路由分叉
 			ids = append(ids, id)
 		}
 	}
@@ -150,7 +150,7 @@ func (s *fakeLedgerStore) FetchUnbilledBatch(ctx context.Context, limit int) ([]
 	return out, nil
 }
 
-// SettleBalanceBatch/SettleFefoBatch 语句化结算面模拟（三车道拓扑；wave3 D-C
+// SettleBalanceBatch/SettleFefoBatch 语句化结算面模拟（三车道拓扑；
 // 桶谓词同构——候选批按 COALESCE(uid,0)%k=bucket 过滤，k<=0 视为全量单桶）：
 // 车道谓词互斥（temp-active 路由）→ 候选批（id 升序 LIMIT）→ 结构错误预检（整
 // 语句失败形态）→ 按用户聚合 FEFO 消耗/spill → 条件扣/透支/幽灵隔离 → 标记。
@@ -185,7 +185,7 @@ func (s *fakeLedgerStore) settleLocked(limit, k, bucket int, fefo bool) (domain.
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	var cands []domain.LedgerRow
-	for _, id := range ids { // 车道谓词互斥：balance NOT-IN / fefo IN temp-active；桶谓词 uid%k=bucket（D-C）
+	for _, id := range ids { // 车道谓词互斥：balance NOT-IN / fefo IN temp-active；桶谓词 uid%k=bucket
 		r := s.rows[id]
 		if r.row.Cost <= 0 || tempActive(r.row.UserID) != fefo {
 			continue
@@ -233,7 +233,7 @@ func (s *fakeLedgerStore) settleLocked(limit, k, bucket int, fefo bool) (domain.
 		}
 		bal, exists := s.balances[uid]
 		switch {
-		case !exists: // 幽灵用户：跳扣仍标记全部行（不变量 #1 尾语义）
+		case !exists: // 幽灵用户：跳扣仍标记全部行（不变量 尾语义）
 			res.Quarantined += int64(len(a.rows))
 			s.markRowsLocked(a.rows, false)
 		case spill <= 0: // temp 全覆盖：零资金移动，纯标记
@@ -327,7 +327,7 @@ func (s *fakeLedgerStore) UnbilledLag(ctx context.Context) (time.Time, bool, err
 			oldest = r.createdAt
 		}
 	}
-	return oldest, count > 0, nil // D-B：ok = 游标非空（行数不再外泄）
+	return oldest, count > 0, nil // ok = 游标非空（行数不再外泄）
 }
 
 // seedTemp 种子临时额度行（返回行 id；expiresAt 零值 = 永久 NULLS LAST）。
@@ -414,11 +414,11 @@ func (s *fakeLedgerStore) lagProbeCount() int {
 // bal.Set 定向刷新的可见性——缺失条目 Set 忽略）。Reload 预灌快照对齐生产
 // 装配序（main 启动期注册表 ReloadAll）；fakeBalLoader 无失败注入路径，错误
 // 不可能（failAt 形态仅 balances_test 直构）。
-func newFlusherWith(store *fakeLedgerStore, loader map[int64]int64) *Flusher {
+func newFlusherWith(store *fakeLedgerStore, loader map[int64]int64, sink BalanceWarningSink) *Flusher {
 	f := NewFlusher(FlushConfig{
 		FlushInterval:          time.Hour,
 		BalanceRefreshInterval: time.Hour,
-	}, store, NewBalances(fakeBalLoader{m: loader}, nil), nil)
+	}, store, NewBalances(fakeBalLoader{m: loader}, nil), nil, sink)
 	_ = f.bal.Reload(context.Background())
 	return f
 }
@@ -436,7 +436,7 @@ func newTestLogger(t *testing.T) (*logx.Logger, string) {
 	return logger, out
 }
 
-// restoreLagThrottle 注入 lag 刷新节流阈值并在测试结束还原（D2 节流可测化，
+// restoreLagThrottle 注入 lag 刷新节流阈值并在测试结束还原（节流可测化，
 // 形态对齐 inflightAbandonGrace 注入惯例）。
 func restoreLagThrottle(t *testing.T, d time.Duration) {
 	t.Helper()
@@ -466,7 +466,7 @@ func TestFlusherConsumesAndMarksBilled(t *testing.T) {
 	r3 := store.seedRow(3, 2, 200, time.Now())
 	store.setBalance(1, 1000)
 	store.setBalance(2, 500)
-	f := newFlusherWith(store, map[int64]int64{1: 1000, 2: 500})
+	f := newFlusherWith(store, map[int64]int64{1: 1000, 2: 500}, nil)
 
 	n := f.consumeCycle(context.Background(), false)
 	require.Equal(t, int64(3), n, "整批退出游标")
@@ -475,7 +475,7 @@ func TestFlusherConsumesAndMarksBilled(t *testing.T) {
 	require.NotEmpty(t, calls)
 	require.False(t, calls[0].fefo, "balance 车道先行（§〇-b 周期序）")
 	var balMarked int64
-	for _, c := range calls { // wave3 D-C：车道内 K 桶并行——断言聚合到车道粒度
+	for _, c := range calls { // 车道内 K 桶并行——断言聚合到车道粒度
 		if !c.fefo {
 			balMarked += c.marked
 		}
@@ -499,12 +499,12 @@ func TestFlusherConsumesAndMarksBilled(t *testing.T) {
 }
 
 // TestFlusherOverdraftFlow 透支流：余额不足 → 无条件扣允许透支（负余额）+
-// overdraft 回写行内（B2）。
+// overdraft 回写行内。
 func TestFlusherOverdraftFlow(t *testing.T) {
 	store := newFakeLedgerStore()
 	row := store.seedRow(1, 1, 400, time.Now())
 	store.setBalance(1, 100)
-	f := newFlusherWith(store, map[int64]int64{1: 100})
+	f := newFlusherWith(store, map[int64]int64{1: 100}, nil)
 
 	n := f.consumeCycle(context.Background(), false)
 	require.Equal(t, int64(1), n)
@@ -526,7 +526,7 @@ func TestFlusherPersistentFailureReplays(t *testing.T) {
 	store.setBalance(1, 500)
 	store.setFail(r1.ID, 1<<30)
 	store.setFail(r2.ID, 1<<30)
-	f := newFlusherWith(store, map[int64]int64{1: 500})
+	f := newFlusherWith(store, map[int64]int64{1: 500}, nil)
 	f.log = logger
 
 	n := f.consumeCycle(context.Background(), false)
@@ -547,7 +547,7 @@ func TestFlusherTransientFailureRetried(t *testing.T) {
 	row := store.seedRow(1, 1, 100, time.Now())
 	store.setBalance(1, 500)
 	store.setFail(row.ID, 1) // 仅首次失败
-	f := newFlusherWith(store, map[int64]int64{1: 500})
+	f := newFlusherWith(store, map[int64]int64{1: 500}, nil)
 
 	n := f.consumeCycle(context.Background(), false)
 	require.Zero(t, n, "首周期瞬态失败无进展")
@@ -560,7 +560,7 @@ func TestFlusherTransientFailureRetried(t *testing.T) {
 	require.Zero(t, f.quarantined.Load(), "瞬态失败不计隔离")
 }
 
-// TestFlusherQuarantineMissingUser 用户缺失（不变量 #1 尾语义）：跳过扣减仍
+// TestFlusherQuarantineMissingUser 用户缺失（不变量 尾语义）：跳过扣减仍
 // 标记全部行、Quarantined 行数随 summary 返回 → QuarantinedRows 计数 + Warn
 // ——毒用户不卡游标。
 func TestFlusherQuarantineMissingUser(t *testing.T) {
@@ -568,7 +568,7 @@ func TestFlusherQuarantineMissingUser(t *testing.T) {
 	logger, out := newTestLogger(t)
 	r1 := store.seedRow(1, 999999, 100, time.Now())
 	r2 := store.seedRow(2, 999999, 200, time.Now())
-	f := newFlusherWith(store, map[int64]int64{})
+	f := newFlusherWith(store, map[int64]int64{}, nil)
 	f.log = logger
 
 	n := f.consumeCycle(context.Background(), false)
@@ -591,7 +591,7 @@ func TestFlusherZeroCostFastMark(t *testing.T) {
 	z2 := store.seedRow(2, 2, 0, time.Now())
 	paid := store.seedRow(3, 1, 100, time.Now())
 	store.setBalance(1, 1000)
-	f := newFlusherWith(store, map[int64]int64{1: 1000})
+	f := newFlusherWith(store, map[int64]int64{1: 1000}, nil)
 
 	n := f.consumeCycle(context.Background(), false)
 	require.Equal(t, int64(3), n, "cost=0 两行纯标记 + cost>0 一行扣费")
@@ -611,7 +611,7 @@ func TestFlusherTwoLaneDisjointness(t *testing.T) {
 	tp := store.seedTemp(7, 50_000, time.Now().Add(time.Hour))
 	store.setBalance(7, 100_000)
 	store.setBalance(8, 100_000)
-	f := newFlusherWith(store, map[int64]int64{7: 80_000, 8: 100_000})
+	f := newFlusherWith(store, map[int64]int64{7: 80_000, 8: 100_000}, nil)
 
 	n := f.consumeCycle(context.Background(), false)
 	require.Equal(t, int64(2), n, "两车道同周期各自结算")
@@ -638,7 +638,7 @@ func TestFlusherLagGuardrailWarns(t *testing.T) {
 	store := newFakeLedgerStore()
 	logger, out := newTestLogger(t)
 	store.seedRow(1, 1, 100, time.Now().Add(-20*time.Hour)) // 阈值 = 24h×80% = 19.2h
-	f := newFlusherWith(store, map[int64]int64{1: 1})
+	f := newFlusherWith(store, map[int64]int64{1: 1}, nil)
 	f.log = logger
 	f.cfg.LogRetentionDays = 1
 
@@ -676,7 +676,7 @@ func TestFlusherLagDisabled(t *testing.T) {
 	store := newFakeLedgerStore()
 	logger, out := newTestLogger(t)
 	store.seedRow(1, 1, 100, time.Now().Add(-100*time.Hour))
-	f := newFlusherWith(store, map[int64]int64{1: 1})
+	f := newFlusherWith(store, map[int64]int64{1: 1}, nil)
 	f.log = logger
 	f.cfg.LogRetentionDays = 0
 
@@ -689,14 +689,14 @@ func TestFlusherLagDisabled(t *testing.T) {
 	require.NotContains(t, string(b), "retention guardrail")
 }
 
-// TestFlusherLagRefreshThrottle lag 刷新节流边沿三态（F2-opt D2）：首调必刷 /
+// TestFlusherLagRefreshThrottle lag 刷新节流边沿三态：首调必刷 /
 // 节流窗内跳过 / Close 排空语境（drain=true）绕过节流强制刷新——防「陈旧
 // unbilledN==0 × n>0」提前退出排空。
 func TestFlusherLagRefreshThrottle(t *testing.T) {
 	restoreLagThrottle(t, time.Hour) // 拉长窗口：第二调必落窗内
 	store := newFakeLedgerStore()
 	store.seedRow(1, 1, 100, time.Now())
-	f := newFlusherWith(store, map[int64]int64{1: 100})
+	f := newFlusherWith(store, map[int64]int64{1: 100}, nil)
 
 	f.consumeCycle(context.Background(), false)
 	require.Equal(t, 1, store.lagProbeCount(), "首调必刷（lastLag 零值）")
@@ -710,14 +710,14 @@ func TestFlusherLagRefreshThrottle(t *testing.T) {
 
 // TestFlusherLockMutualExclusion 会话锁互斥：他实例持锁（ok=false）→ 本周期
 // 跳过取批（零 fetch 零消费）；抢锁报错 → Warn + 跳过——双实例绝不重复消费
-// 同批（Momus M1 防线）。
+// 同批（防线）。
 func TestFlusherLockMutualExclusion(t *testing.T) {
 	t.Run("held by another instance", func(t *testing.T) {
 		store := newFakeLedgerStore()
 		store.seedRow(1, 1, 100, time.Now())
 		store.setBalance(1, 100)
 		store.holdLock()
-		f := newFlusherWith(store, map[int64]int64{1: 100})
+		f := newFlusherWith(store, map[int64]int64{1: 100}, nil)
 
 		n := f.consumeCycle(context.Background(), false)
 		require.Zero(t, n, "他实例持锁：本周期跳过")
@@ -730,7 +730,7 @@ func TestFlusherLockMutualExclusion(t *testing.T) {
 		logger, out := newTestLogger(t)
 		store.seedRow(1, 1, 100, time.Now())
 		store.lockOK = false
-		f := newFlusherWith(store, map[int64]int64{1: 100})
+		f := newFlusherWith(store, map[int64]int64{1: 100}, nil)
 		f.log = logger
 
 		n := f.consumeCycle(context.Background(), false)
@@ -743,7 +743,7 @@ func TestFlusherLockMutualExclusion(t *testing.T) {
 	})
 }
 
-// TestFlusherCloseDrainsCursor Close 排空至游标清空（D2 排空节奏）：单批
+// TestFlusherCloseDrainsCursor Close 排空至游标清空（排空节奏）：单批
 // LIMIT 2000 内积压一个取批往返全量消费 + 一次空批确认即退出，预算内完整排空、
 // 无截断 Warn；幂等二次 Close 不再消费。
 func TestFlusherCloseDrainsCursor(t *testing.T) {
@@ -754,7 +754,7 @@ func TestFlusherCloseDrainsCursor(t *testing.T) {
 		store.seedRow(int64(i), uid, 10, time.Now())
 		store.setBalance(uid, 1_000_000)
 	}
-	f := newFlusherWith(store, map[int64]int64{1: 1_000_000, 2: 1_000_000, 3: 1_000_000})
+	f := newFlusherWith(store, map[int64]int64{1: 1_000_000, 2: 1_000_000, 3: 1_000_000}, nil)
 	logger, out := newTestLogger(t)
 	f.log = logger
 
@@ -763,9 +763,9 @@ func TestFlusherCloseDrainsCursor(t *testing.T) {
 	require.NoError(t, f.Close(ctx))
 
 	require.Equal(t, 0, store.unbilledCount(), "排空至游标清空")
-	// wave3 D-B：unbilledN==0 提前退出臂已删（n==0 单一判据）——排空需一次额外
+	// unbilledN==0 提前退出臂已删（n==0 单一判据）——排空需一次额外
 	// 空批确认轮：数据批轮 + 确认轮 + 收尾空轮 = 3 次取批。
-	require.Equal(t, 3, store.fetchCount(), "排空节奏：一批一 tick 废除（D-B 多一轮空批确认）")
+	require.Equal(t, 3, store.fetchCount(), "排空节奏：一批一 tick 废除（多一轮空批确认）")
 	require.NoError(t, logger.Sync())
 	b, err := os.ReadFile(out)
 	require.NoError(t, err)
@@ -792,7 +792,7 @@ func (s *blockingSettleStore) SettleBalanceBatch(ctx context.Context, limit, k, 
 
 // TestFlusherCloseTruncatesOnBudget 停机排空受 ctx 预算约束：到期 → Cancel
 // baseCtx（在途事务快速失败回滚，行保持 unbilled 不丢）+ 截断 Warn（含已消费
-// 行数；wave3 D-B 起 remaining_rows 字段随精确 COUNT 一并删除），不无界阻塞停机。
+// 行数； 起 remaining_rows 字段随精确 COUNT 一并删除），不无界阻塞停机。
 func TestFlusherCloseTruncatesOnBudget(t *testing.T) {
 	inner := newFakeLedgerStore()
 	store := &blockingSettleStore{fakeLedgerStore: inner, started: make(chan struct{})}
@@ -801,7 +801,7 @@ func TestFlusherCloseTruncatesOnBudget(t *testing.T) {
 	inner.setBalance(1, 100)
 	inner.setBalance(2, 100)
 	logger, out := newTestLogger(t)
-	f := newFlusherWith(inner, map[int64]int64{1: 100, 2: 100})
+	f := newFlusherWith(inner, map[int64]int64{1: 100, 2: 100}, nil)
 	f.store = store // 包装注入（阻塞扣费面）
 	f.log = logger
 
@@ -818,11 +818,11 @@ func TestFlusherCloseTruncatesOnBudget(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(b), "shutdown budget exceeded, truncated drain")
 	require.Contains(t, string(b), `"consumed_rows":0`)
-	// wave3 D-B：精确 COUNT 已删，截断 Warn 不再携带 remaining_rows 字段。
+	// 精确 COUNT 已删，截断 Warn 不再携带 remaining_rows 字段。
 }
 
 // ignoreCtxSettleStore SettleBalanceBatch 忽略 ctx 永久阻塞（模拟 DB 病态卡死
-// ——取消路径本身被拖住的极端形态；A-P2-8-2 第二 select 兜底目标）。测试结束
+// ——取消路径本身被拖住的极端形态；第二 select 兜底目标）。测试结束
 // 即弃置（在途 goroutine 无放行通道，属刻意泄漏）。
 type ignoreCtxSettleStore struct {
 	*fakeLedgerStore
@@ -855,7 +855,7 @@ func (s *endlessSettleStore) SettleBalanceBatch(ctx context.Context, limit, k, b
 	return s.fakeLedgerStore.SettleBalanceBatch(ctx, limit, k, bucket)
 }
 
-// TestFlusherCloseAbandonsInflightOnTimeout A-P2-8-2：驱动不尊重 ctx 时 Close
+// TestFlusherCloseAbandonsInflightOnTimeout：驱动不尊重 ctx 时 Close
 // 不再无界等待——预算到期 → Cancel baseCtx → 收尾宽限超时 → Warn 放弃排空、
 // 截断退出（在途事务由编排层强杀收尾，行保持 unbilled 不丢）。
 func TestFlusherCloseAbandonsInflightOnTimeout(t *testing.T) {
@@ -871,7 +871,7 @@ func TestFlusherCloseAbandonsInflightOnTimeout(t *testing.T) {
 	inner.setBalance(1, 100)
 	inner.setBalance(2, 100)
 	logger, out := newTestLogger(t)
-	f := newFlusherWith(inner, map[int64]int64{1: 100})
+	f := newFlusherWith(inner, map[int64]int64{1: 100}, nil)
 	f.store = store
 	f.log = logger
 
@@ -896,7 +896,7 @@ func TestFlusherCloseAbandonsInflightOnTimeout(t *testing.T) {
 // 取消后 Close 正常排空退出（游标空即返回）。
 func TestFlusherStartTwiceFails(t *testing.T) {
 	store := newFakeLedgerStore()
-	f := newFlusherWith(store, map[int64]int64{})
+	f := newFlusherWith(store, map[int64]int64{}, nil)
 	loopCtx, loopCancel := context.WithCancel(context.Background())
 	require.NoError(t, f.Start(loopCtx))
 	err := f.Start(context.Background())
@@ -905,7 +905,7 @@ func TestFlusherStartTwiceFails(t *testing.T) {
 	require.NoError(t, f.Close(context.Background()))
 }
 
-// —— 排空周期预算（F2-opt G1 审计 D 面回归） ——
+// —— 排空周期预算（D 面回归） ——
 
 // TestFlusherDrainCycleBudget 周期预算到期收尾：持续到达形态（每次 Balance 车道
 // 结算前合成全新未标记行——endlessSettleStore 包装注入）下，无预算的 drainLoop
@@ -919,7 +919,7 @@ func TestFlusherDrainCycleBudget(t *testing.T) {
 
 	inner := newFakeLedgerStore()
 	store := &endlessSettleStore{fakeLedgerStore: inner}
-	f := newFlusherWith(inner, map[int64]int64{})
+	f := newFlusherWith(inner, map[int64]int64{}, nil)
 	f.store = store // 包装注入（持续到达形态）
 
 	start := time.Now()

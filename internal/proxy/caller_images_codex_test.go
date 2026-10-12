@@ -28,7 +28,7 @@ import (
 	"github.com/is7qin/c3api/pkg/aiclient"
 )
 
-// fakeFailureStore 失效落库替身（T1 FailureStore 面——SetAccountFailed 记录
+// fakeFailureStore 失效落库替身（FailureStore 面——SetAccountFailed 记录
 // 上报；Failer 用真实调度器——断言失效标记/摘除联动）。
 type fakeFailureStore struct {
 	mu        sync.Mutex
@@ -160,7 +160,7 @@ func codexOAuthExt(accountID int64, at, rt string) *domain.AccountExt {
 }
 
 // newTestCodexProxy 构造 codex 类型 images 测试代理：模板（credType 模板级
-// 类型）+ 携带 Ext 的账号（可多账号）+ 装配适配层（统一失效回调走真实 T1
+// 类型）+ 携带 Ext 的账号（可多账号）+ 装配适配层（统一失效回调走真实
 // 处理链——fakeFailureStore 落库替身 + 真实调度器 FailAccount 摘除）。
 // Codex 官方默认端点 via transport 重写到 mock。
 func newTestCodexProxy(t *testing.T, credType credential.Type, accounts map[int64]*domain.AccountExt, upstream string, bill *BillingHooks, logs *captureLogStore) (*Proxy, *fakeFailureStore) {
@@ -175,7 +175,7 @@ func newTestCodexProxy(t *testing.T, credType credential.Type, accounts map[int6
 	for id, ext := range accounts {
 		accs[10] = append(accs[10], &domain.Account{
 			ID: id, TemplateID: tpl.ID, Template: tpl, UpstreamKey: "",
-			Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4, Ext: ext,
+			Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4, Ext: ext,
 		})
 	}
 	rec := usage.New(usage.UsageConfig{
@@ -188,13 +188,15 @@ func newTestCodexProxy(t *testing.T, credType credential.Type, accounts map[int6
 		UpstreamStreamTimeout: 30 * time.Second,
 		UsageCapture:          true,
 	}
-	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil)
+	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil, nil, nil)
 	require.NoError(t, re.Reload(context.Background()))
-	sched := scheduler.New(scheduler.Config{DefaultMaxConcurrency: 4, SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil)
+	sched := scheduler.New(scheduler.Config{SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
+	publishTestRoutes(t, sched)
+
 	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{
 		"ck-1": activeKey(1, 1, 10),
-	}}, noopUserLoader{}, nil, true)
+	}}, noopUserLoader{}, nil, nil, true)
 	require.NoError(t, auth.Reload(context.Background()))
 	hc := &http.Client{Transport: http.DefaultTransport}
 	clients := aiclient.NewFactory(hc, aiclient.Config{
@@ -203,13 +205,11 @@ func newTestCodexProxy(t *testing.T, credType credential.Type, accounts map[int6
 	})
 	errlogW := usage.NewErrLogWorker(usage.ErrLogConfig{QueueSize: 4096, FlushInterval: time.Hour}, logs, nil)
 	store := &fakeFailureStore{}
-	// 统一失效回调（T1 装配形态）：落库替身 + 真实调度器摘除（FailAccount——
+	// 统一失效回调（装配形态）：落库替身 + 真实调度器摘除（FailAccount——
 	// 失效标记断言依赖真实摘除，路由"不重试同账号"才成立）。
 	failure := sdkbridge.NewFailureHandler(sdkbridge.FailureDeps{Store: store, Failer: sched, Log: nil})
-	codex := sdkbridge.NewCodex(failure)
-	codex.SetTransport(newProxyOfficialRewriteTransportWithAssert(t, upstream))
-	p := New(cfg, sched, credential.New(), rec, clients, auth, nil, bill, errlogW)
-	p.SetCodex(codex)
+	codex := sdkbridge.NewCodex(failure, newProxyOfficialRewriteTransportWithAssert(t, upstream), sdkbridge.RotationDeps{})
+	p := New(cfg, sched, credential.New(), rec, clients, auth, nil, bill, errlogW, Deps{Codex: codex})
 	return p, store
 }
 
@@ -289,8 +289,8 @@ func TestImagesCodexPATDirect(t *testing.T) {
 
 // TestImagesCodexCredPassing 不同账号 cred 传递断言：同一适配层两账号（不同
 // oauth at）连续请求 → 各自 at 送达上游（缓存按 accountID 隔离、互不串扰）。
-// 加权序列每账号至少出现一次（游标顺序取用）——4 请求覆盖两账号，断言双 at
-// 均送达。
+// cutover 后选号确定性（Primary 序，无加权轮转）：首轮命中账号以指纹 latch
+// 隔离，次轮独立选到另一账号——两 at 均送达，证明适配层凭据缓存按账号隔离。
 func TestImagesCodexCredPassing(t *testing.T) {
 	up, c := newCodexImageUpstream(t, codexUpStep{status: 200, body: codexTestImageResponse})
 	defer up.Close()
@@ -301,13 +301,29 @@ func TestImagesCodexCredPassing(t *testing.T) {
 		11: codexOAuthExt(11, "at-11", "rt-11"),
 	}, up.URL, nil, store)
 
-	for i := 0; i < 4; i++ {
+	loader := p.sched.Loader().(noopLoader)
+	latchAccount := func(id int64) {
+		for _, a := range loader.accs[10] {
+			if a.ID == id {
+				fp, err := scheduler.CandidateFingerprint(a)
+				require.NoError(t, err)
+				require.True(t, p.sched.TryLatch(id, fp, a.IdentityRevision))
+			}
+		}
+	}
+	for i := 0; i < 2; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
 			`{"model":"gpt-image-2","prompt":"x"}`))
 		req.Header.Set("Authorization", "Bearer ck-1")
 		rec := httptest.NewRecorder()
 		p.HandleImagesGenerations(rec, req)
 		require.Equal(t, 200, rec.Code, "请求 %d body=%s", i, rec.Body.String())
+		// 隔离本轮命中账号，次轮独立选到另一账号。
+		used := int64(10)
+		if c.auth(i) == "Bearer at-11" {
+			used = 11
+		}
+		latchAccount(used)
 	}
 	got := map[string]bool{}
 	for _, a := range c.authsSnapshot() {
@@ -342,10 +358,10 @@ func TestImagesCodex403Passthrough(t *testing.T) {
 	require.NoError(t, p.rec.Close(context.Background()))
 }
 
-// TestImagesCodexStreamEnvelope4xx 流式首事件前 4xx → 信封透传（T3 复审
-// P1-1 修复回归——适配层 GenerateImageStream 缺 translateError 时 *HTTPError
+// TestImagesCodexStreamEnvelope4xx 流式首事件前 4xx → 信封透传（复审
+// 修复回归——适配层 GenerateImageStream 缺 translateError 时 *HTTPError
 // 裸抛：状态归 0 走连接级 → 客户端收占位文案、body 丢失；修复后 403 + 上游
-// 原始 body 透传，与 T2 非流式同口径）。4xx 确定性错误不 failover、信封不
+// 原始 body 透传，与非流式同口径）。4xx 确定性错误不 failover、信封不
 // 上报回调。
 func TestImagesCodexStreamEnvelope4xx(t *testing.T) {
 	up, c := newCodexImageUpstream(t, codexUpStep{status: 403, body: `{"error":{"message":"no image permission for account"}}`})
@@ -446,9 +462,9 @@ func TestImagesCodex401Rotate(t *testing.T) {
 	require.NoError(t, p.rec.Close(context.Background()))
 }
 
-// TestImagesCodexStreamSSE 流式（stream=true）生产接线全链路（T3——替换 501
+// TestImagesCodexStreamSSE 流式（stream=true）生产接线全链路（替换 501
 // 骨架）：真实适配层 GenerateImageStream → 合成事件流（keepalive + 逐张
-// completed，usage 仅末事件）→ 网关 SSE 透传（completed 帧 wire 形态 P2-1：
+// completed，usage 仅末事件）→ 网关 SSE 透传（completed 帧 wire 形态：
 // b64_json + usage 四字段 JSON tag 直透）→ 流终计费（张数 = data 长 2、
 // image tokens 平铺、ImageCost per-image 分量、倍率整单）。
 func TestImagesCodexStreamSSE(t *testing.T) {
@@ -471,7 +487,7 @@ func TestImagesCodexStreamSSE(t *testing.T) {
 	require.Equal(t, "no-cache", rec.Header().Get("Cache-Control"), "三件套 2/3")
 	require.Equal(t, "no", rec.Header().Get("X-Accel-Buffering"), "三件套 3/3")
 	// wire 形态：两帧 completed——首帧 b64_json 无 usage，末帧带 usage 平铺四字段
-	// （codex-sdk ImageUsage JSON tag 直透——P3-2 等价）。
+	// （codex-sdk ImageUsage JSON tag 直透——等价）。
 	want := "event: image_generation.completed\ndata: {\"b64_json\":\"QUJD\"}\n\n" +
 		"event: image_generation.completed\ndata: {\"b64_json\":\"REVG\",\"usage\":{\"input_tokens\":2,\"input_image_tokens\":1,\"output_tokens\":3,\"output_image_tokens\":2}}\n\n"
 	require.Equal(t, want, rec.Body.String(), "completed 帧 wire 形态（usage 仅末事件）")
@@ -495,7 +511,7 @@ func TestImagesCodexStreamSSE(t *testing.T) {
 }
 
 // TestImagesCodexAdapterMissing501 适配层未装配（SetCodex 未调用）→ 501 显式
-// 拒绝（防 nil 误走凭据缺失 502）——原 Task B 骨架语义保留。
+// 拒绝（防 nil 误走凭据缺失 502）——原 骨架语义保留。
 func TestImagesCodexAdapterMissing501(t *testing.T) {
 	up, c := newCodexImageUpstream(t, codexUpStep{status: 200, body: codexTestImageResponse})
 	defer up.Close()
@@ -508,24 +524,26 @@ func TestImagesCodexAdapterMissing501(t *testing.T) {
 	}
 	accs := map[int64][]*domain.Account{10: {{
 		ID: 10, TemplateID: tpl.ID, Template: tpl, UpstreamKey: "",
-		Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4, Ext: codexOAuthExt(10, "at-10", "rt-10"),
+		Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4, Ext: codexOAuthExt(10, "at-10", "rt-10"),
 	}}}
 	rec := usage.New(usage.UsageConfig{BatchSize: 100, FlushInterval: time.Hour, QuotaFlushInterval: time.Hour}, store, nil)
-	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil)
+	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil, nil, nil)
 	require.NoError(t, re.Reload(context.Background()))
-	sched := scheduler.New(scheduler.Config{DefaultMaxConcurrency: 4, SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil)
+	sched := scheduler.New(scheduler.Config{SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
+	publishTestRoutes(t, sched)
+
 	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{
 		"ck-1": activeKey(1, 1, 10),
-	}}, noopUserLoader{}, nil, true)
+	}}, noopUserLoader{}, nil, nil, true)
 	require.NoError(t, auth.Reload(context.Background()))
 	hc := &http.Client{Transport: http.DefaultTransport}
 	clients := aiclient.NewFactory(hc, aiclient.Config{UpstreamTimeout: 5 * time.Second, UpstreamStreamTimeout: 30 * time.Second})
 	p := New(Config{
 		MaxBodySize: 1 << 20, FailoverAttempts: 2,
 		UpstreamTimeout: 5 * time.Second, UpstreamStreamTimeout: 30 * time.Second, UsageCapture: true,
-	}, sched, credential.New(), rec, clients, auth, nil, nil, usage.NewErrLogWorker(usage.ErrLogConfig{QueueSize: 4096, FlushInterval: time.Hour}, store, nil))
-	// 不调 SetCodex —— 未装配形态
+	}, sched, credential.New(), rec, clients, auth, nil, nil, usage.NewErrLogWorker(usage.ErrLogConfig{QueueSize: 4096, FlushInterval: time.Hour}, store, nil), Deps{})
+	// Deps 零值 —— 未装配形态
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
 		`{"model":"gpt-image-2","prompt":"x"}`))
@@ -595,7 +613,7 @@ func TestImagesCodexJSONEdits(t *testing.T) {
 	require.NoError(t, p.rec.Close(context.Background()))
 }
 
-// TestImagesCodexEmptyRT 凭据不完整（oauth 缺 refresh_token）：P2-3 构造前
+// TestImagesCodexEmptyRT 凭据不完整（oauth 缺 refresh_token）：构造前
 // 校验——上报失效（账号凭据不完整）不 panic；上游零请求；客户端 failover
 // 耗尽 5xx。
 func TestImagesCodexEmptyRT(t *testing.T) {
@@ -628,7 +646,7 @@ func TestImagesCodexEmptyRT(t *testing.T) {
 }
 
 // TestImagesCodexParamsLocal400 本地参数拒绝（post-Select）：缺 prompt → 400 +
-// err_logs 审计（P2-1 语义）；上游零请求。
+// err_logs 审计（语义）；上游零请求。
 func TestImagesCodexParamsLocal400(t *testing.T) {
 	up, c := newCodexImageUpstream(t, codexUpStep{status: 200, body: codexTestImageResponse})
 	defer up.Close()
@@ -653,19 +671,18 @@ func TestImagesCodexParamsLocal400(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, store.logs[0].StatusCode)
 }
 
-// TestImagesCodexMixedGroupFailoverReset P1-1 回归（评审实证）：混合类型组
+// TestImagesCodexMixedGroupFailoverReset 回归（评审实证）：混合类型组
 // （同组 codex-oauth + api_key 模板均服务 images 格式、同模型）codex 尝试失败
-// （5xx 可重试）→ failover 换 api_key 账号——调用器必须复位到直连 caller。
+// （429 可重试）→ failover 换 api_key 账号——调用器必须复位到直连 caller。
 // 评审前泄漏：caller 单向赋值（codex 分支不复位），api_key 尝试被错误路由到
 // codexImagesCaller → sel.Ext=nil → CredentialFromExt 空凭据 → 502 + 健康
 // api_key 账号 MarkResult(连接级/5xx 分流) 错误率污染 + 无谓失效上报（account 0）。
 //
-// 确定性说明：weightedSeq 构造 shuffle 后 cursor 按序取 seq[1], seq[0],
-// seq[1], seq[0]…——两请求内无论洗牌序，codex 先序至少一次触发 failover 路径
-// （codex 在上游 500 → api_key 200），api_key 直连每请求恰一次触达（恒 2 次）；
+// 确定性说明：plan 车道 Primary 序 [codex, api_key]（loader 列表序），codex
+// 先派 → 429 可重试 → 转移 api_key 直连成功；两请求恒 codex 先、api_key 后，
 // 修复前任一序必有一次 502，修复后恒 200。
 func TestImagesCodexMixedGroupFailoverReset(t *testing.T) {
-	codexUp, codexCap := newCodexImageUpstream(t, codexUpStep{status: 500, body: `{"error":"boom"}`})
+	codexUp, codexCap := newCodexImageUpstream(t, codexUpStep{status: 429, body: `{"error":"slow down"}`})
 	defer codexUp.Close()
 	apiUp, apiCap := fakeImagesUpstream(t, "/v1/images/generations")
 	defer apiUp.Close()
@@ -686,21 +703,23 @@ func TestImagesCodexMixedGroupFailoverReset(t *testing.T) {
 	accs := map[int64][]*domain.Account{10: {
 		{
 			ID: 10, TemplateID: tplCodex.ID, Template: tplCodex, UpstreamKey: "",
-			Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4, Ext: codexOAuthExt(10, "at-10", "rt-10"),
+			Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4, Ext: codexOAuthExt(10, "at-10", "rt-10"),
 		},
 		{
 			ID: 11, TemplateID: tplAPI.ID, Template: tplAPI, UpstreamKey: "sk-upstream",
-			Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4,
+			Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4,
 		},
 	}}
 	rec := usage.New(usage.UsageConfig{BatchSize: 100, FlushInterval: time.Hour, QuotaFlushInterval: time.Hour}, &captureLogStore{}, nil)
-	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil)
+	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil, nil, nil)
 	require.NoError(t, re.Reload(context.Background()))
-	sched := scheduler.New(scheduler.Config{DefaultMaxConcurrency: 4, SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil)
+	sched := scheduler.New(scheduler.Config{SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
+	publishTestRoutes(t, sched)
+
 	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{
 		"ck-1": activeKey(1, 1, 10),
-	}}, noopUserLoader{}, nil, true)
+	}}, noopUserLoader{}, nil, nil, true)
 	require.NoError(t, auth.Reload(context.Background()))
 	hc := &http.Client{Transport: http.DefaultTransport}
 	clients := aiclient.NewFactory(hc, aiclient.Config{UpstreamTimeout: 5 * time.Second, UpstreamStreamTimeout: 30 * time.Second})
@@ -708,13 +727,11 @@ func TestImagesCodexMixedGroupFailoverReset(t *testing.T) {
 	errlogW := usage.NewErrLogWorker(usage.ErrLogConfig{QueueSize: 4096, FlushInterval: time.Hour}, store, nil)
 	fs := &fakeFailureStore{}
 	failure := sdkbridge.NewFailureHandler(sdkbridge.FailureDeps{Store: fs, Failer: sched, Log: nil})
-	codex := sdkbridge.NewCodex(failure)
-	codex.SetTransport(newProxyOfficialRewriteTransportWithAssert(t, codexUp.URL))
+	codex := sdkbridge.NewCodex(failure, newProxyOfficialRewriteTransportWithAssert(t, codexUp.URL), sdkbridge.RotationDeps{})
 	p := New(Config{
 		MaxBodySize: 1 << 20, FailoverAttempts: 2,
 		UpstreamTimeout: 5 * time.Second, UpstreamStreamTimeout: 30 * time.Second, UsageCapture: true,
-	}, sched, credential.New(), rec, clients, auth, nil, nil, errlogW)
-	p.SetCodex(codex)
+	}, sched, credential.New(), rec, clients, auth, nil, nil, errlogW, Deps{Codex: codex})
 
 	for i := 0; i < 2; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(
@@ -732,7 +749,7 @@ func TestImagesCodexMixedGroupFailoverReset(t *testing.T) {
 	require.NoError(t, p.rec.Close(context.Background()))
 }
 
-// TestImageParamsJSONSinglePass A-P2-9 单遍解析等价回归：json.Unmarshal 单遍
+// TestImageParamsJSONSinglePass 单遍解析等价回归：json.Unmarshal 单遍
 // 替代 7×gjson.GetBytes 重扫（MB 级 base64 data URL body 每请求 ~8 遍全文档
 // 扫描 → 1 遍）——同输入同输出：缺字段默认、类型不合忽略（gjson Type 判定
 // 语义）、edits images 提取；MB 级 body 解析正确。

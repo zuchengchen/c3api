@@ -7,70 +7,98 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 
 	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/repository"
-	"github.com/is7qin/c3api/internal/sdkbridge"
 	"github.com/is7qin/c3api/pkg/logx"
 )
 
-// CodexUsageSnapshotter codex 额度快照数据源（*sdkbridge.Codex 满足——装配侧
-// 注入；接口化供测试注入，与 priceFetcher/local 同形态——依赖方向 service →
-// sdkbridge 不反转）。
-type CodexUsageSnapshotter interface {
-	GetUsageSnapshot(ctx context.Context, cred *domain.AccountCredential) (*domain.CodexUsageSnapshot, error)
-}
+// 本文件只留网关聚合 + 凭据组装 + 失效冻结判定三个纯 helper：codex 额度快照的
+// fan-out 编排（含上游调用与错误分类）已整体搬到 handler 层（AdminAPI 经
+// 构造注入的 CodexUsageProber 直调适配器）——service 不再持有快照数据源，
+// 不再 import sdkbridge。
 
-// SetUsageSnapshotter 装配 codex 额度快照数据源（main：codexAdapter 构造后调
-// 用；nil = 未装配——AccountUsage 对 codex 账号返回 nil 快照，不 panic）。
-func (s *Service) SetUsageSnapshotter(u CodexUsageSnapshotter) { s.usageSnapshots = u }
-
-// AccountUsage 账号 codex 额度快照（纯编排零基础设施——用户裁决 2026-08-18：
-// 缓存/并发节流/失败冷却全在 sdkbridge，service 只做凭据取 + 类型判定 + 调
-// 用；错误分类透传——ErrAuthExpired/ErrUpstream（sdkbridge 哨兵）供 task 2
-// upstream_error 标记映射）。
-//
-// 数据流：store.GetAccountExt 取 ext 行（api-key 无 ext 行 → ErrNotFound →
-// nil 快照零 sdkbridge 调用）→ CredentialFromExt 派生 cred（codex-oauth/
-// codex-pat → 非 nil cred）→ sdkbridge.GetUsageSnapshot(ctx, cred)。
-func (s *Service) AccountUsage(ctx context.Context, accountID int64) (*domain.CodexUsageSnapshot, error) {
-	e, err := s.store.GetAccountExt(ctx, accountID)
-	if err != nil {
-		if errors.Is(err, repository.ErrNotFound) {
-			return nil, nil // api-key（无 ext 行）→ nil 快照零 sdkbridge 调用
+// AccountUsageCredential 账号 codex 凭据组装（纯数据面零上游调用）：
+// **单次 owner-scoped `store.GetOwnedAccountExt`**——归属谓词 AND 进同一条 SQL
+// （越域 / 账号缺失 / 无 ext 行 ⇒ nil/nil；§2.5 禁止「先按 id 取行、再应用层比归属」）
+// → CredentialFromExt 派生 cred（codex-oauth/codex-pat 列组）→ 非 codex
+// 凭据（全空）→ nil/nil。调用方（handler fan-out）凭 nil/non-nil 分流：
+// nil = 无上游能力（null 快照），non-nil = 调 prober。
+func (s *Service) AccountUsageCredential(ctx context.Context, accountID int64) (*domain.AccountCredential, error) {
+	// 作用域门：账号不可见（越域或缺失）⇒ 不读 ext、不返回凭据。
+	e, err := s.store.GetOwnedAccountExt(ctx, accountID)
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		mapped := mapRepoErr(err)
+		// 非 ErrNotFound store 故障 → Warn + 透错（handler 侧记 null/null，
+		// 不误标上游问题；ctx 取消为请求已死信号，不记 Warn）。
+		if ctx.Err() == nil && s.log != nil {
+			s.log.Warn("accounts usage: account upstream lookup failed", logx.Int64("account_id", accountID), logx.Error(mapped))
 		}
-		return nil, mapRepoErr(err)
+		return nil, mapped
+	}
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, nil // 越域 / 账号缺失 / api-key（无 ext 行）→ 无上游能力
 	}
 	cred := domain.CredentialFromExt(e)
 	if cred.OAuthToken == "" && cred.OAuthRefreshToken == "" && cred.PATKey == "" {
-		return nil, nil // 非 codex 凭据（防御——ext 行仅 codex 类型可写）→ nil 快照
+		return nil, nil // 非 codex 凭据（防御——ext 行仅 codex 类型可写）→ 无上游能力
 	}
-	if s.usageSnapshots == nil {
-		return nil, nil // 未装配（测试/单实例形态）→ nil 快照
-	}
-	return s.usageSnapshots.GetUsageSnapshot(ctx, &cred)
+	return &cred, nil
 }
 
-// AccountsUsage 账号 usage 批量视图（/api/admin/accounts/usage 查询面——统一
-// usage API spec 2026-08-18）：repo 单查询聚合 + 按 ids 顺序组装全量 items
-// （无记录账号补零——gateway 全 0，前端免补零）+ upstream 装配（task 3
-// AccountUsage：api-key 无凭据 → nil 快照/nil 标记；codex 成功 → 快照/nil；
-// codex 失败 → nil/枚举标记——ErrAuthExpired → auth_expired，其余 →
-// upstream_unavailable）。
+// AccountUsageFrozen 失效冻结判定：账号是否处于运行时失效（failed_at 置位）——
+// SDK/rule 判死并已从调度摘除的账号。调用方（handler usage 装配）据此**冻结**
+// 上游额度拉取：失效账号的额度查询无意义，且对其拨号会反复触发 SDK 凭据刷新
+// 判死上报（token revoked 循环 → C 无限增长）。与 Enabled=false（管理面手动
+// 禁用）语义分离——手动禁用的账号仍可查额度，只有 failed_at 冻结（Q1 裁决）。
 //
-// 失败语义：repo 聚合失败 → 整批失败（gateway 数据面不可用）；upstream 逐
-// 账号装配失败 → 仅记 upstream_error 标记不整批失败（单账号快照挂不影响
-// 其余账号 gateway 栏返回）。批内装配 errgroup 有界并发（8——与 sdkbridge
-// usageFetchSem 容量对齐：上游并发仍由 sdkbridge 恒保 ≤8，此处仅并行化编排
-// 的 DB 往返/调用分发——调度属编排面，缓存/节流仍全在 sdkbridge）；结果按
-// account_ids 顺序组装（goroutine 按 index 写 out，保序）。非 sdkbridge 错误
-// （store 故障——GetAccountExt 面）→ 记日志 + 该账号 null/null（不误标上游
-// 问题，T2-2）。ids 去重/≤100 已由 handler 校验（service 兜底不再重复——
-// 防御性校验由调用方边界承担，对齐既有批量端点惯例）。
-func (s *Service) AccountsUsage(ctx context.Context, ids []int64, from, to time.Time) ([]domain.AccountUsage, error) {
+// 返回 (frozen, failureSource, err)：frozen=true 时 failureSource 为
+// account.failure_source（domain.FailureSourceSDK/Rule，空 = 未记来源的旧路径），
+// 供调用方按来源决定 upstream_error 标记（Q2：sdk → 凭据失效；rule → 不标）。
+// 账号缺 id（ErrNotFound）→ (false, "", nil)（无对象可冻结）；其余 store 故障透传。
+func (s *Service) AccountUsageFrozen(ctx context.Context, accountID int64) (bool, string, error) {
+	a, err := s.store.GetAccount(ctx, accountID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return false, "", nil
+		}
+		return false, "", err
+	}
+	if a.FailedAt == nil {
+		return false, "", nil
+	}
+	if a.FailureSource != nil {
+		return true, *a.FailureSource, nil
+	}
+	return true, "", nil
+}
+
+// AccountsGatewayUsage 账号网关用量批量聚合（/api/admin/accounts/usage 查询面
+// 的 gateway 栏）：先过**整批作用域前置校验**（供应商面：ids 必须**全部**归属
+// JWT 本人，任一越域 ⇒ ErrNotFound/404，**不补零**、不泄漏存在性——§2.5「批量面
+// 任一 id 越出作用域 ⇒ 整事务失败」），再过 domain.Admit（KindUsageAgg——raw 成本
+// 上限 90d + usage_logs 覆盖率），再 repo 单查询聚合 + 按 ids 顺序组装全量 items
+// （无记录账号补零——gateway 全 0，前端免补零）。repo 聚合失败 → 整批失败
+// （gateway 数据面不可用）。upstream 栏由调用方（handler fan-out）另行装配。
+//
+// 越域校验与聚合是两次查询，但**两次都带 owner 谓词**（前置校验 + ScanUsageAgg 的
+// AND），故校验后发生的转属不会让聚合读到新归属的他人数据；最坏情形是同一批内
+// 出现零行补齐（不泄漏任何他人数值）。
+func (s *Service) AccountsGatewayUsage(ctx context.Context, ids []int64, from, to time.Time) ([]domain.AccountUsage, error) {
+	// 整批作用域前置校验（管理面缺省作用域 ⇒ 恒放行，既有语义不变）。
+	if _, missing, err := s.store.FindMissingOwnedAccountID(ctx, ids); err != nil {
+		return nil, mapRepoErr(err)
+	} else if missing {
+		return nil, fmt.Errorf("%w: account_ids contains an account outside the current scope", ErrNotFound)
+	}
+	// KindUsageAgg 无分组、只有原始行一种候选存储（Storages[0]），故执行方法
+	// 单一；窗口取 Exec（判定与执行同源）。该处旧实现只校验 from < to（handler
+	// 层），全区间 GROUP BY 无 LIMIT ⇒ 本判定补掉该成本洞（spec §4.5）。
+	if _, err := s.admitStats(domain.KindUsageAgg, time.UTC, from, to); err != nil {
+		return nil, err
+	}
 	aggs, err := s.store.ScanUsageAgg(ctx, ids, from, to)
 	if err != nil {
 		return nil, err
@@ -83,31 +111,5 @@ func (s *Service) AccountsUsage(ctx context.Context, ids []int64, from, to time.
 		}
 		out = append(out, item)
 	}
-	var g errgroup.Group
-	g.SetLimit(8) // 批内并行度（与 sdkbridge usageFetchSem 语义对齐）
-	for i := range out {
-		i := i
-		g.Go(func() error {
-			snap, err := s.AccountUsage(ctx, out[i].AccountID)
-			switch {
-			case err == nil:
-				out[i].Upstream = snap
-			case errors.Is(err, sdkbridge.ErrAuthExpired):
-				e := domain.UpstreamErrorAuthExpired
-				out[i].UpstreamError = &e
-			case errors.Is(err, sdkbridge.ErrUpstream):
-				e := domain.UpstreamErrorUpstreamUnavailable
-				out[i].UpstreamError = &e
-			default:
-				// 非 sdkbridge 错误（store 故障——GetAccountExt 面）→ 不误标
-				// 上游问题：该账号 null/null（批内其余账号正常）。ctx 取消为
-				// 请求已死信号，不记 Warn（非故障）。
-				if ctx.Err() == nil && s.log != nil {
-					s.log.Warn("accounts usage: account upstream lookup failed", logx.Int64("account_id", out[i].AccountID), logx.Error(err))
-				}
-			}
-			return nil
-		})
-	}
-	return out, g.Wait()
+	return out, nil
 }

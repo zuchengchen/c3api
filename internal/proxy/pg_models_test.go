@@ -9,9 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -26,8 +24,12 @@ import (
 	"github.com/is7qin/c3api/internal/repository"
 	"github.com/is7qin/c3api/internal/rule"
 	"github.com/is7qin/c3api/internal/scheduler"
+	"github.com/is7qin/c3api/internal/testsupport/pgtest"
 	"github.com/is7qin/c3api/internal/usage"
 	"github.com/is7qin/c3api/pkg/aiclient"
+
+	// Registers pgtest's repository-dependent hooks.
+	_ "github.com/is7qin/c3api/internal/testsupport/pgtest/pgrepo"
 )
 
 // GET /v1/models 真实 PG 集成（与 pg_responses_special_test.go 同款约定）：
@@ -35,32 +37,17 @@ import (
 //	TEST_DATABASE_URL=postgres://postgres:c3api@127.0.0.1:15432/c3api_test \
 //	  go test ./internal/proxy/ -run TestPGModels -v
 //
-// 未设置 TEST_DATABASE_URL → t.Skip。独立 schema（proxy_models_test）：与同包
-// 其它 PG 测试并行跑均不互踩。
+// 未设置 TEST_DATABASE_URL → t.Skip。每测试克隆一个私有数据库（pgtest.Clone，
+// 隔离粒度 = database）：与同包其它 PG 测试并行跑均不互踩。
 
-const modelsPGTestSchema = "proxy_models_test"
-
-// modelsPGTestDB 打开独立 schema 的测试库并迁移建表。
+// modelsPGTestDB 打开测试私有 clone 的测试库并迁移建表。
 func modelsPGTestDB(t *testing.T) *repository.Repository {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping real-PostgreSQL test")
-	}
-	if strings.Contains(dsn, "?") {
-		dsn += "&search_path=" + modelsPGTestSchema
-	} else {
-		dsn += "?search_path=" + modelsPGTestSchema
-	}
-	ctx := context.Background()
-	pool, err := repository.OpenPG(ctx, dsn, 5)
-	require.NoError(t, err)
-	t.Cleanup(pool.Close)
+	dsn := pgtest.Clone(t)
+	pool := pgtest.OpenPool(t, dsn)
 	db := stdlib.OpenDBFromPool(pool)
 	t.Cleanup(func() { _ = db.Close() })
-	_, err = db.ExecContext(ctx, `DROP SCHEMA IF EXISTS `+modelsPGTestSchema+` CASCADE; CREATE SCHEMA `+modelsPGTestSchema+`;`)
-	require.NoError(t, err)
-	repos, err := repository.New(entsql.OpenDB(dialect.Postgres, db), true)
+	repos, err := repository.New(entsql.OpenDB(dialect.Postgres, db), false)
 	require.NoError(t, err)
 	return repos
 }
@@ -117,8 +104,8 @@ func modelsPGFixture(t *testing.T) modelsFixture {
 	})
 	require.NoError(t, err)
 	for _, a := range []*domain.Account{
-		{Name: "a-models-a", TemplateID: tplA.ID, UpstreamKey: "sk-1", Weight: 1, MaxConcurrency: 4},
-		{Name: "a-models-b", TemplateID: tplB.ID, UpstreamKey: "sk-2", Weight: 1, MaxConcurrency: 4},
+		{Name: "a-models-a", TemplateID: tplA.ID, UpstreamKey: "sk-1", MaxConcurrency: 4, Enabled: true},
+		{Name: "a-models-b", TemplateID: tplB.ID, UpstreamKey: "sk-2", MaxConcurrency: 4, Enabled: true},
 	} {
 		acc, err := repos.Accounts.CreateAccount(ctx, a)
 		require.NoError(t, err)
@@ -136,12 +123,14 @@ func modelsPGFixture(t *testing.T) modelsFixture {
 	// key 绑定后软删组 g3：鉴权快照仍含 k-ghost（行保留），调度器快照不含 g3。
 	require.NoError(t, repos.Groups.DeleteGroup(ctx, g3.ID))
 
-	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil)
+	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil, nil, nil)
 	require.NoError(t, re.Reload(ctx)) // 空表写种子（同 newTestProxyTplTimeoutRec）
 	sched := scheduler.New(scheduler.Config{
-		DefaultMaxConcurrency: 4, SyncInterval: time.Hour,
-	}, repos.Groups, re, nil)
+		SyncInterval: time.Hour,
+	}, repos.Groups, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
+	publishTestRoutes(t, sched)
+
 	return modelsFixture{repos: repos, sched: sched, gid: g1.ID, gid2: g2.ID, userID: u.ID}
 }
 
@@ -166,13 +155,13 @@ func newPGModelsTestProxy(t *testing.T, sched *scheduler.Scheduler, auth *Auth, 
 		UpstreamStreamTimeout: 30 * time.Second,
 	})
 	errlogW := usage.NewErrLogWorker(usage.ErrLogConfig{QueueSize: 4096, FlushInterval: time.Hour}, noopErrLogStore{}, nil)
-	return New(cfg, sched, credential.New(), rec, clients, auth, nil, bill, errlogW)
+	return New(cfg, sched, credential.New(), rec, clients, auth, nil, bill, errlogW, Deps{})
 }
 
 // modelsAuth 从真实 PG keys/users 构建并首刷鉴权快照（NewAuth 构造不再自载）。
 func modelsAuth(t *testing.T, repos *repository.Repository) *Auth {
 	t.Helper()
-	a := NewAuth(repos.Keys, repos.Users, nil, true)
+	a := NewAuth(repos.Keys, repos.Users, nil, nil, true)
 	require.NoError(t, a.Reload(context.Background()))
 	return a
 }
@@ -272,7 +261,7 @@ func TestPGModelsBillingDisabledGate(t *testing.T) {
 	require.NoError(t, balances.Reload(context.Background()))
 	bal, ok := balances.BalanceOf(fx.userID)
 	require.True(t, ok, "种子用户必须进余额快照")
-	require.Zero(t, bal, "余额 0：若误走余额预检（bal<0 且倍率非 0）必 402")
+	require.Zero(t, bal, "余额 0：若误走余额预检（bal≤0 且倍率非 0）必 402")
 	bill := &BillingHooks{Balances: balances}
 	p := newPGModelsTestProxy(t, fx.sched, modelsAuth(t, fx.repos), bill)
 
@@ -311,15 +300,19 @@ func TestPGModelsReloadReflectsChanges(t *testing.T) {
 	require.NoError(t, err)
 	accC, err := fx.repos.Accounts.CreateAccount(ctx, &domain.Account{
 		Name: "a-models-c", TemplateID: tplC.ID, UpstreamKey: "sk-3",
-		Weight: 1, MaxConcurrency: 4,
+		MaxConcurrency: 4, Enabled: true,
 	})
 	require.NoError(t, err)
 	require.NoError(t, fx.repos.Accounts.SetAccountGroups(ctx, accC.ID, []int64{fx.gid}))
 	require.NoError(t, fx.sched.InvalidateAllSync())
+	publishTestRoutes(t, fx.sched)
+
 	require.Equal(t, []string{"claude-3.5-sonnet", "dall-e-3", "gpt-4o", "gpt-5"}, list())
 
 	// 删：账号摘除组归属 → reload 后模型消失
 	require.NoError(t, fx.repos.Accounts.SetAccountGroups(ctx, accC.ID, []int64{}))
 	require.NoError(t, fx.sched.InvalidateAllSync())
+	publishTestRoutes(t, fx.sched)
+
 	require.Equal(t, []string{"claude-3.5-sonnet", "dall-e-3", "gpt-4o"}, list())
 }

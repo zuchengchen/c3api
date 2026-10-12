@@ -119,7 +119,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 账号用量聚合（统一 usage API——批量 ≤100 条；from/to 缺省 = 当天） */
+        /** 账号用量聚合（统一 usage API——批量 ≤100 条；窗口 from/to 或 window 恰择一） */
         get: operations["GetAccountsUsage"];
         put?: never;
         post?: never;
@@ -157,23 +157,6 @@ export interface paths {
         put?: never;
         /** 批量更新账号（fields 为任意字段子集） */
         post: operations["PostAccountsBatchUpdate"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/accounts/batch-reset-cooldown": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** 批量重置账号冷却（事务，全成或全败；status→active + cooldown_until=now） */
-        post: operations["PostAccountsBatchResetCooldown"];
         delete?: never;
         options?: never;
         head?: never;
@@ -224,12 +207,16 @@ export interface paths {
             cookie?: never;
         };
         get: operations["GetAccountsId"];
-        put: operations["PutAccountsId"];
+        put?: never;
         post?: never;
         delete: operations["DeleteAccountsId"];
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * 部分更新账号（三态：缺省=不变；可空标量 null=清空、""=400；不可空标量 null=400；有值=落值）
+         * @description 账号写面唯一更新入口（一个端点覆盖倍率 + 缓存域 + 启停 + 普通字段 + 身份字段全部组合，一次调用）。 前置条件 If-Match 可选：缺席 = 不做检查；命中 = 生效；陈旧 → 412；语法非法（W/、多值、*、非整数）→ 400。
+         */
+        patch: operations["PatchAccountsId"];
         trace?: never;
     };
     "/accounts/{id}/groups": {
@@ -245,6 +232,32 @@ export interface paths {
         get: operations["GetAccountsIdGroups"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/accounts/{id}/recover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 失效恢复（fenced）：清 failed_at/last_error/failure_source + revision CAS +1 → 新代际置 PROBING 待探针
+         * @description 运行时失效（rule 判死/SDK fatal）后管理员确认恢复的唯一入口：CAS
+         *     expected_revision 命中才清失效三字段并 +1，随后对新 revision 写通配
+         *     PROBING（探针环接管：READY 前不吃正常流量）。expected_revision 过期 →
+         *     409（前端须重读账号后重试）；本端点不启用被禁用的账号（enabled 独立，
+         *     经 PATCH /accounts/{id} 修改）。
+         */
+        post: operations["PostAccountsIdRecover"];
         delete?: never;
         options?: never;
         head?: never;
@@ -391,6 +404,25 @@ export interface paths {
         get: operations["GetUsersIdGroups"];
         /** 设置用户的授予分组（platform_admin；替换语义：未列出即撤销，空数组 = 清空） */
         put: operations["PutUsersIdGroups"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/users/{id}/balance-logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        /** 某用户的余额变动记录（platform_admin 专属；永久余额的非 usage 变动：注册默认/管理面创建/管理面调整/兑换码；分页） */
+        get: operations["GetUsersIdBalanceLogs"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -964,6 +996,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/user/stats/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 统计能力（本部署能查多久——与 /api/admin/stats/capabilities 同一投影）
+         * @description 用户面变体（与 `/stats/ttft` ↔ `/api/user/stats/ttft` 同一惯例）：同一份
+         *     服务端投影（KIND 矩阵 × 保留期），**不是第二份数据**。存在的理由 = 用户台
+         *     同样需要按部署上限裁剪选择器与 TTFT 窗口，而 `/api/admin/*` 只接受
+         *     platform_admin 凭据——普通用户拿不到。内容全为 per-deployment 常量，无
+         *     任何账号/租户数据；这些数字本就随 400 机读字段
+         *     （`limit_seconds`/`retention_days`）逐请求可见。
+         */
+        get: operations["GetUserStatsCapabilities"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/user/redemptions": {
         parameters: {
             query?: never;
@@ -1095,7 +1152,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 趋势聚合（cube/原始行——按 timezone 路由） */
+        /** 趋势聚合（cube/原始行——按请求时区判定） */
         get: operations["GetStatsTrend"];
         put?: never;
         post?: never;
@@ -1148,6 +1205,131 @@ export interface paths {
         };
         /** TTFT 聚合（sketch 或 exact） */
         get: operations["GetStatsTTFT"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/stats/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 统计能力（本部署能查多久——per-deployment 常量）
+         * @description 无参数、只读，可按部署缓存。返回本部署的统计查询能力：每个读形状
+         *     （kind）的候选存储、成本上限秒数（cost_cap_seconds）与覆盖天数
+         *     （coverage_days）。**零硬编码**——它是服务端 KIND 矩阵与保留期配置的
+         *     机械投影，故与真实判定不会漂移。
+         *
+         *     语义：`cost_cap_seconds = 0` 表示无上限（keyset 分页读路径）；
+         *     `coverage_days = 0` 表示该表未启用分区保留（覆盖守卫关闭，即无覆盖
+         *     下限）。成本上限是**保留期无关的纯常量**（扫 10 天日志的成本与保留了
+         *     多少天日志无关），覆盖天数取自实际要读的表（读多表取最保守者），故两者
+         *     互相独立：保留期调短只动 coverage_days，不动 cost_cap_seconds。
+         *
+         *     本端点只报告**按部署恒定**的事实，**不报告"这个时区能否用 cube"**：
+         *     后者是逐请求判定（依赖窗口位置），由 400 响应的机读字段
+         *     （reason/storage/limit_seconds/effective_from/effective_to/retention_days）
+         *     与 200 响应的 X-Stats-* 回显头承担——不把逐请求事实伪装成部署常量。
+         */
+        get: operations["GetStatsCapabilities"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/routing/flow": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 路由 flow 聚合（完整链边；按 terminal_at 归属窗口）
+         * @description 结构 RouteClass → (ordinal, lane) → Account → Outcome；retry 边指向
+         *     下一 ordinal，terminal 边即该链 Final。守恒：完整链才入 rollup，故
+         *     first_dispatch_chains（ordinal=1）恒等于 terminal_chains。三个丢失
+         *     计数是独立观测口径（本进程 quality 观测面），不得混为上游失败：
+         *     incomplete_chain_dropped = 本进程已观察 cleanup 缺 terminal；
+         *     flow_overflow_dropped_chains = 故障预算淘汰链；
+         *     process_crash_loss_unobservable 恒 true（硬崩缺口不可量化）。
+         *     窗口跨度上限 90 天（精确，超限 400）。
+         *     lanes 只是完整边集的**一页**（offset/limit 切片，仍按 (ordinal,lane)
+         *     分组）；守恒计数与 total_edges/stale_generation_present 恒在**完整边集**上聚合，不受分页影响。
+         *     旧代际信号是**精确布尔** stale_generation_present（窗口内存在
+         *     min_generation != plan_generation 的边行），不再是链次占比：合并层一行
+         *     聚合多代际的链，链次加权谓词只能给出上界（"当前代际"是移动靶，无法预存）。
+         *     sankey 是给图形用的有界边集：每 (ordinal,lane) 层按 chain_count 保留
+         *     top-N 账号（accounts），其余折叠进「其他」节点——层内 chain_count 求和
+         *     守恒，故图形不会因折叠而失真。分页与折叠是两件独立的事：表格翻页不
+         *     改变 sankey，sankey 也不随翻页变化。
+         */
+        get: operations["GetRoutingFlow"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/routing/frontier": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 质量-成本前沿（rollup 质量 × 当前计划候选目录连接）
+         * @description 候选按窗口聚合：Wilson95 成功区间 + TTFT 区间 + 输入侧单位采购价
+         *     （与 compiler 同数学核，毫分/1M 输入侧 token）。Pareto 支配只在 known 且 cost_known 候选间
+         *     扫描；unknown/成本不可知/样本不足者如实呈现但不上前沿。输出确定性
+         *     排序（前沿 → success_lcb 降序 → 成本升序 → 指纹升序）**先排序再切片**，
+         *     故 offset/limit 分页不改变前沿判定；total_candidates 为排序后总条数。
+         *     窗口跨度上限 90 天（精确，超限 400）。
+         */
+        get: operations["GetRoutingFrontier"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/routing/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 当前发布路由计划解释（只读投影，无历史 generation 参数）
+         * @description 当前发布 RoutingView 的防御性投影：generation + 全身份确定性路由序
+         *     （与发布字节守卫同序）+ primary/explore/degraded 候选发布序（序是
+         *     语义，不重排）+ explore 权重/累积表 + 候选静态身份。空视图 =
+         *     generation 0 空计划（routes 为 []），不是错误。
+         *     search/offset/limit 作用于**路由**列表（先过滤后切片）；route 给定则
+         *     只返回该条路由（供单路由取候选页）。candidates_offset/candidates_limit
+         *     作用于**每个返回路由**的候选目录；candidates_limit=0 = 不返回候选，
+         *     供路由选择器取轻量列表（避免 limit × candidates_limit 的无谓放大）。
+         *     observed_from/observed_to 成对给出时，routes 只保留半开窗口 [from,to)
+         *     内 routing_flow_fact 有记录的路由（窗口 ≤ 90d 且不早于观测保留 cutoff，
+         *     否则 400；只给一端 → 400）；route 给定时绕过窗口过滤，只按目录返回该条。
+         */
+        get: operations["GetRoutingPlan"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1223,12 +1405,810 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/user/supplier/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 供应商收益概览（可提领/冻结/累计/生效分成率与冻结小时/最晚解冻时刻/桶行数） */
+        get: operations["GetSupplierOverview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/earnings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 区间收益明细（分页；走报表索引 ②，窗口 = 保留期） */
+        get: operations["GetSupplierEarnings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/chunks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 冻结中明细（未解冻桶） */
+        get: operations["GetSupplierChunks"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/settlements": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 我的结算单（分页） */
+        get: operations["GetSupplierSettlements"];
+        put?: never;
+        /** 申请结算（条件扣 available + 期间链 + request_key 幂等） */
+        post: operations["PostSupplierSettlement"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/accounts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 账号列表（分页/筛选/排序，含运行时视图；作用域 = JWT 归属） */
+        get: operations["GetSupplierAccounts"];
+        put?: never;
+        /** 创建账号（归属恒为 JWT 本人；携带他人 supplier_user_id ⇒ 400） */
+        post: operations["PostSupplierAccounts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/accounts/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 账号用量聚合（统一 usage API——批量 ≤100 条；窗口 from/to 或 window 恰择一） */
+        get: operations["GetSupplierAccountsUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/accounts/batch-update": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 批量更新账号（fields 为任意字段子集；字段层与管理面零差异化） */
+        post: operations["PostSupplierAccountsBatchUpdate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/accounts/batch-delete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 批量删除账号（事务，全成或全败；任一 id 越域 ⇒ 整事务失败） */
+        post: operations["PostSupplierAccountsBatchDelete"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/accounts/batch-import-codex-oauth": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 批量导入 codex-oauth 凭据（幂等组合键 codex_email + codex_account_id；行级失败不毁整批） */
+        post: operations["PostSupplierAccountsBatchImportCodexOauth"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/accounts/batch-import-codex-pat": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 批量导入 codex-pat 凭据（幂等组合键 codex_email + codex_account_id；行级失败不毁整批） */
+        post: operations["PostSupplierAccountsBatchImportCodexPat"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/accounts/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        /** 账号（越域 id ⇒ 404，不泄漏存在性） */
+        get: operations["GetSupplierAccountsId"];
+        put?: never;
+        post?: never;
+        /** 删除账号（越域 id ⇒ 404） */
+        delete: operations["DeleteSupplierAccountsId"];
+        options?: never;
+        head?: never;
+        /**
+         * 部分更新账号（三态语义与管理面一致：缺省=不变；可空标量 null=清空、""=400；不可空标量 null=400；有值=落值）
+         * @description 复用管理面账号写面唯一更新入口（同一 AccountConfigPatch/validateAccountPatch/ accountFieldSpecs——**无供应商专属字段清单**）。前置条件 If-Match 可选：缺席 = 不做检查；命中 = 生效；陈旧 → 412；语法非法 → 400。
+         */
+        patch: operations["PatchSupplierAccountsId"];
+        trace?: never;
+    };
+    "/api/user/supplier/accounts/{id}/ext": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        /** 读取账号类型化鉴权扩展（仅 codex-oauth/codex-pat 账号有 ext 行） */
+        get: operations["GetSupplierAccountsIdExt"];
+        /** 幂等写入账号类型化鉴权扩展（Create/Update 合一；全列更新含 NULL 清空） */
+        put: operations["PutSupplierAccountsIdExt"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/accounts/{id}/groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        /** 读取账号的全部分组 id（编辑回显；不随账号列表返回） */
+        get: operations["GetSupplierAccountsIdGroups"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/accounts/{id}/recover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 失效恢复（fenced）：清 failed_at/last_error/failure_source + revision CAS +1 → 新代际置 PROBING 待探针
+         * @description 复用管理面恢复入口：CAS expected_revision 命中才清失效三字段并 +1，随后对新
+         *     revision 写通配 PROBING（探针环接管）。expected_revision 过期 → 409；本端点
+         *     不启用被禁用的账号（enabled 独立，经 PATCH /api/user/supplier/accounts/{id} 修改）。
+         */
+        post: operations["PostSupplierAccountsIdRecover"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 分组候选列表（分页/筛选/排序；只读——组写面不在供应商面） */
+        get: operations["GetSupplierGroups"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/templates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 模板列表（分页/筛选/排序；只读——模板写面不在供应商面） */
+        get: operations["GetSupplierTemplates"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/supplier/templates/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        /** 模板（只读） */
+        get: operations["GetSupplierTemplatesId"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/supplier/settlements": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 结算单列表（按 status / kind 过滤；pending 是工作台） */
+        get: operations["GetAdminSupplierSettlements"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/supplier/settlements/{id}/approve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** pending → approved（CAS） */
+        post: operations["PostAdminSupplierSettlementsIdApprove"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/supplier/settlements/{id}/reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** pending|approved → rejected（退还 available；paying 不可 reject） */
+        post: operations["PostAdminSupplierSettlementsIdReject"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/supplier/settlements/{id}/claim": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** approved → paying（认领 CAS；付款风控门 + 固定收款快照 + payment_key） */
+        post: operations["PostAdminSupplierSettlementsIdClaim"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/supplier/settlements/{id}/confirm-failed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** paying → approved（仅接受「确定未支付」的核验结果；留证） */
+        post: operations["PostAdminSupplierSettlementsIdConfirmFailed"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/supplier/settlements/{id}/paid": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 仅 paying → paid（lifetime_paid 累加；不重做风控门） */
+        post: operations["PostAdminSupplierSettlementsIdPaid"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/supplier/settlements/admin-request": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 代申请（kind=admin_request；复用同一通道，目标须已有余额行） */
+        post: operations["PostAdminSupplierSettlementsAdminRequest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/supplier/balances": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 余额列表（含最晚 available_at / bucket_rows） */
+        get: operations["GetAdminSupplierBalances"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/supplier/balances/{uid}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** 仅 share_bp / freeze_hours（不接受金额） */
+        patch: operations["PatchAdminSupplierBalancesUid"];
+        trace?: never;
+    };
+    "/api/user/management-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 我的管理 key 列表（软删过滤；含明文 mk-，与客户端 key 一致） */
+        get: operations["GetUserManagementKeys"];
+        put?: never;
+        /** 创建管理 key（以自身身份鉴权管理面；返回明文 mk-） */
+        post: operations["PostUserManagementKeys"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/user/management-keys/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** 更新管理 key（name/status；仅本人；disabled 即时 401 可再启用） */
+        put: operations["PutUserManagementKeysId"];
+        post?: never;
+        /** 删除管理 key（仅本人；软删 + 本实例快照即时移除） */
+        delete: operations["DeleteUserManagementKeysId"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        SupplierOverview: {
+            /**
+             * Format: int64
+             * @description 可提领（结算申请条件扣）
+             */
+            available: number;
+            /**
+             * Format: int64
+             * @description Σ 未解冻桶 amount
+             */
+            frozen_amount: number;
+            /**
+             * Format: int64
+             * @description 累计已入账（只增，永久）
+             */
+            lifetime_credited: number;
+            /**
+             * Format: int64
+             * @description 累计已付（只增，永久）
+             */
+            lifetime_paid: number;
+            /** @description 生效分成率（bp；10000 = 100%） */
+            share_bp: number;
+            /** @description 生效冻结小时（0 = 不冻结） */
+            freeze_hours: number;
+            /**
+             * Format: date-time
+             * @description 在途桶最晚解冻时刻（无桶 = null；运维可见性 §2.4）
+             */
+            latest_available_at?: string | null;
+            /**
+             * Format: int64
+             * @description 未解冻桶行数
+             */
+            bucket_rows: number;
+        };
+        SupplierChunk: {
+            /** Format: date-time */
+            available_at: string;
+            /** Format: int64 */
+            amount: number;
+        };
+        SupplierChunkList: {
+            items: components["schemas"]["SupplierChunk"][];
+            /** Format: int64 */
+            total: number;
+        };
+        SupplierEarning: {
+            /** Format: date-time */
+            created_at: string;
+            /**
+             * Format: int64
+             * @description 计价额（毫分）
+             */
+            cost: number;
+            /**
+             * Format: int64
+             * @description 收益额（毫分）
+             */
+            earn_millis: number;
+            model?: string;
+        };
+        SupplierEarningList: {
+            items: components["schemas"]["SupplierEarning"][];
+            /** Format: int64 */
+            total: number;
+        };
+        SupplierSettlement: {
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            supplier_user_id: number;
+            /** @enum {string} */
+            kind: "supplier_request" | "admin_request";
+            /** Format: int64 */
+            amount_millis: number;
+            /** Format: date-time */
+            period_start: string;
+            /** Format: date-time */
+            period_end: string;
+            /** @enum {string} */
+            status: "pending" | "approved" | "paying" | "paid" | "rejected";
+            /** Format: int64 */
+            revision: number;
+            request_key: string;
+            /** Format: date-time */
+            requested_at: string;
+            /** Format: int64 */
+            requested_operator: number;
+            /** Format: date-time */
+            reviewed_at?: string | null;
+            /** Format: int64 */
+            reviewer_user_id?: number | null;
+            /** Format: int64 */
+            payout_operator_user_id?: number | null;
+            /** Format: date-time */
+            payout_started_at?: string | null;
+            external_ref?: string | null;
+            /** Format: date-time */
+            paid_at?: string | null;
+            /** Format: int64 */
+            paid_operator_user_id?: number | null;
+            payout_failure_reason?: string | null;
+            /** Format: date-time */
+            payout_failed_at?: string | null;
+            /** @description 首次 claim 生成、全局唯一、永久固定的付款键（重试/恢复复用不换键） */
+            payment_key?: string | null;
+            /** @description 固定收款目标快照（结构化 JSON） */
+            payee_snapshot?: string | null;
+            /** @description 风险核对记录（结构化 JSON） */
+            risk_review?: string | null;
+            note?: string | null;
+            reject_reason?: string | null;
+        };
+        SupplierSettlementList: {
+            items: components["schemas"]["SupplierSettlement"][];
+            /** Format: int64 */
+            total: number;
+        };
+        ApplySettlementBody: {
+            /**
+             * Format: int64
+             * @description 申请金额（> 0；受 available 条件扣约束）
+             */
+            amount_millis: number;
+            /** @description 业务幂等键（客户端生成、重试复用；作用域 = 操作者 × key） */
+            request_key: string;
+            note?: string;
+        };
+        /** @description 状态迁移 CAS 令牌（陈旧 ⇒ 409；缺席 ⇒ 400） */
+        SettlementTransitionBody: {
+            /** Format: int64 */
+            expected_revision: number;
+        };
+        SettlementRejectBody: {
+            /** Format: int64 */
+            expected_revision: number;
+            reason?: string | null;
+        };
+        /** @description 认领付款；金额必须等于单据金额 + 结构化收款目标快照固定 + 风险核对证据（服务端派生 operator_id/decided_at/expires_at） */
+        SettlementClaimBody: {
+            /** Format: int64 */
+            expected_revision: number;
+            /**
+             * Format: int64
+             * @description 认领金额，必须 == 单据 amount_millis（不符 ⇒ 400）
+             */
+            amount_millis: number;
+            payee_snapshot: components["schemas"]["SettlementPayeeSnapshot"];
+            risk_evidence: components["schemas"]["SettlementRiskEvidence"];
+        };
+        /** @description 收款目标快照（结构化；副作用前固定、重试复用、不一致拒绝） */
+        SettlementPayeeSnapshot: {
+            /** @description 收款人/开户名 */
+            payee_name: string;
+            /** @description 收款账号 */
+            account: string;
+            /** @description 金额单位/币种 */
+            unit: string;
+        };
+        /** @description 风险核对证据（结构化；reference/摘要非空 + 绑定 approved revision；服务端派生 operator_id/decided_at/scope/decision/expires_at） */
+        SettlementRiskEvidence: {
+            /** @description 证据 reference（非空） */
+            reference: string;
+            /** @description 核对摘要（非空） */
+            summary: string;
+            /**
+             * Format: int64
+             * @description 必须 == expected_revision（锁内当前 approved revision）
+             */
+            approved_revision: number;
+        };
+        /** @description paying→approved；仅接受结构化「确定未支付」+「旧执行已停止」核验（未知 ⇒ 失败闭合保留 paying） */
+        SettlementConfirmFailedBody: {
+            /** Format: int64 */
+            expected_revision: number;
+            /** @description 确定未支付的原因（网络失败不算） */
+            reason: string;
+            /** @description 渠道/人工已核验「确定未支付」 */
+            confirmed_not_paid: boolean;
+            /** @description 核验证据 reference（非空） */
+            evidence: string;
+            /** @description 已确认旧外部执行已停止（回收/等待/具名确认） */
+            old_execution_stopped: boolean;
+        };
+        /** @description 仅 paying→paid；必须提供非空银行/渠道回单号（未核验不得确认） */
+        SettlementPaidBody: {
+            /** Format: int64 */
+            expected_revision: number;
+            /** @description 银行/渠道回单号（非空） */
+            external_ref: string;
+        };
+        AdminRequestSettlementBody: {
+            /**
+             * Format: int64
+             * @description 目标供应商（须已有余额行，否则 404）
+             */
+            supplier_user_id: number;
+            /**
+             * Format: int64
+             * @description 金额（> 0）
+             */
+            amount_millis: number;
+            /** @description 业务幂等键 */
+            request_key: string;
+            note?: string;
+        };
+        SupplierBalance: {
+            /** Format: int64 */
+            supplier_user_id: number;
+            /** Format: int64 */
+            available: number;
+            /** Format: int64 */
+            lifetime_credited: number;
+            /** Format: int64 */
+            lifetime_paid: number;
+            share_bp?: number | null;
+            freeze_hours?: number | null;
+            /** Format: date-time */
+            latest_available_at?: string | null;
+            /** Format: int64 */
+            bucket_rows: number;
+        };
+        SupplierBalanceList: {
+            items: components["schemas"]["SupplierBalance"][];
+            /** Format: int64 */
+            total: number;
+        };
+        /** @description PATCH 逐供应商配置（仅 share_bp/freeze_hours；缺席 = 不变；null = 清空回继承） */
+        SupplierBalancePatchBody: {
+            share_bp?: number | null;
+            freeze_hours?: number | null;
+        };
         ErrorResponse: {
             error: string;
+            /**
+             * @description 统计窗口被拒的机读原因（仅统计端点可能携带）。取值词表取自规划层原因与
+             *     拒绝原因的**全量映射表**（唯一来源），本版实际会发出的有五个：
+             *     raw_horizon/cube_horizon = 起点早于所要读表的保留截止；
+             *     window_too_long = 请求跨度超过该形状的成本上限；window_invalid =
+             *     必填/倒序/`window` 时长串不可解析等参数本身非法；window_ambiguous =
+             *     `from`/`to`/`window` 三者的"恰择一"未被满足（两态都给、只给一端、
+             *     或两态都不给）。offset/dst/span_below_grid 是"该窗口无法用卷积表精确
+             *     表达、已降级到原始行"的派生原因（只用于降级告警日志，不作为拒绝原因
+             *     发出）。
+             * @enum {string}
+             */
+            reason?: "offset" | "dst" | "span_below_grid" | "raw_horizon" | "cube_horizon" | "window_too_long" | "window_invalid" | "window_ambiguous";
+            /**
+             * @description 判定所依据的实际存储（`window_invalid`/`window_ambiguous` 不携带）
+             * @enum {string}
+             */
+            storage?: "cube" | "raw";
+            /**
+             * Format: int64
+             * @description 成本上限秒数（`window_too_long` 携带；0 = 无上限）
+             */
+            limit_seconds?: number;
+            /**
+             * Format: date-time
+             * @description 判定后的生效窗口下界（`window_invalid`/`window_ambiguous` 不携带）
+             */
+            effective_from?: string;
+            /**
+             * Format: date-time
+             * @description 判定后的生效窗口上界（`window_invalid`/`window_ambiguous` 不携带）
+             */
+            effective_to?: string;
+            /** @description 覆盖判定所依据的最保守保留天数（`*_horizon` 携带） */
+            retention_days?: number;
+        };
+        StatsCapabilities: {
+            /** @description 卷积表桶网格单位（秒；恒 3600 = 1 小时） */
+            bucket_grid_seconds: number;
+            /** @description 键 = 读形状标识（trend/entity_trend/summary/days/top/ttft_sketch/ttft_exact/usage_agg/usage_list/errlog_list） */
+            kinds: {
+                [key: string]: components["schemas"]["StatsKindCapability"];
+            };
+        };
+        StatsKindCapability: {
+            /**
+             * @description 读形状的分组模式：`zoned` = 按请求时区分组（桶界随时区变）；`none` =
+             *     数值与请求时区无关。刻意不写 enum：enum 会为一个取值是 `none` 的字段
+             *     生成名为 `None` 的常量，与既有 `ErrorType` 枚举的 `None` 撞名，触发
+             *     oapi-codegen 把该枚举九个常量全部改名（无关生成的额外改动）。
+             */
+            grouping: string;
+            /** @description 候选存储（按偏好序） */
+            storages: ("cube" | "raw")[];
+            /** @description 每候选存储的最大跨度秒数（保留期无关的纯常量；0 = 无上限） */
+            cost_cap_seconds: {
+                [key: string]: number;
+            };
+            /** @description 每候选存储实际读表的保留天数（读多表取最保守者；0 = 该表未启用分区保留，覆盖守卫关闭） */
+            coverage_days: {
+                [key: string]: number;
+            };
         };
         DeletedResponse: {
             deleted: boolean;
@@ -1236,12 +2216,10 @@ export interface components {
         /** @enum {string} */
         RequestFormat: "openai-chat" | "openai-responses" | "openai-responses-ws" | "openai-images" | "openai-search" | "anthropic";
         /** @enum {string} */
-        AccountStatus: "active" | "unhealthy" | "429" | "disabled";
-        /** @enum {string} */
         ErrorType: "none" | "429" | "4xx" | "5xx" | "network" | "auth" | "no_account" | "abort" | "billing";
         TemplateCreate: {
             name: string;
-            /** @description credential-type conditional: codex-oauth/codex-pat must be empty (non-empty forbidden, SDK default endpoint); api_key/responses-special optional bare root without /v1 (non-empty overrides, empty uses default or fails to route) */
+            /** @description credential-type conditional: codex-oauth/codex-pat must be empty (non-empty forbidden, SDK default endpoint); api_key/responses-special may include a protocol prefix such as /zen but must not end in /v1 (the gateway appends /v1; non-empty overrides, empty uses default or fails to route) */
             base_url?: string;
             /**
              * @default api_key
@@ -1266,7 +2244,7 @@ export interface components {
             /** Format: int64 */
             ID: number;
             Name: string;
-            /** @description credential-type conditional: codex-oauth/codex-pat always empty (non-empty forbidden); api_key/responses-special bare root override (non-empty) or empty (default/route failure) */
+            /** @description credential-type conditional: codex-oauth/codex-pat always empty (non-empty forbidden); api_key/responses-special may include a protocol prefix such as /zen but must not end in /v1 (non-empty override, or empty for default/route failure) */
             BaseURL: string;
             /**
              * @description 模板号池类型；生态三类型只支持 resp / resp-ws / images / search 格式
@@ -1291,18 +2269,8 @@ export interface components {
              */
             DeletedAt?: string | null;
         };
-        AccountCreate: {
-            name: string;
-            /** Format: int64 */
-            template_id: number;
-            /** @description credential-type conditional: if template is codex-oauth/codex-pat must be empty/null (non-empty forbidden, inherits SDK default); if api_key/responses-special non-empty overrides template base_url, null/empty inherits template */
-            base_url?: string | null;
-            upstream_key: string;
-            status?: components["schemas"]["AccountStatus"];
-            weight?: number;
-            max_concurrency?: number;
-            group_ids?: number[];
-        };
+        /** @description 创建体 = 唯一字段模型 + 创建必填（name/template_id）；upstream_key 依模板凭据类型条件必填（service 校验）。 */
+        AccountCreate: WithRequired<components["schemas"]["AccountConfigPatch"], "name" | "template_id">;
         Account: {
             /** Format: int64 */
             ID?: number;
@@ -1313,14 +2281,41 @@ export interface components {
             /** @description credential-type conditional: if template is codex-oauth/codex-pat must be null (non-empty forbidden); if api_key/responses-special non-empty overrides template */
             BaseURL?: string | null;
             UpstreamKey?: string;
-            Status?: components["schemas"]["AccountStatus"];
-            /** Format: date-time */
-            CooldownUntil?: string | null;
-            Weight?: number;
             MaxConcurrency?: number;
             LastError?: string | null;
             /** Format: date-time */
             LastUsedAt?: string | null;
+            /** @description 管理面启停（写面 PATCH /accounts/{id} 的 enabled 字段；与运行时失效语义分离） */
+            Enabled?: boolean;
+            /**
+             * Format: date-time
+             * @description 运行时失效时刻（rule 判死/SDK fatal；null = 未失效；恢复唯一入口 POST /accounts/{id}/recover）
+             */
+            FailedAt?: string | null;
+            /** @description 失效来源（rule/sdk 等；随 recover 清除） */
+            FailureSource?: string | null;
+            /**
+             * Format: int64
+             * @description 配置代际 C（客户端 CAS 令牌 + DB 变更水位）：每次写面落库无条件 +1；PATCH 以 If-Match 作前置条件（陈旧 → 412），recover 以 body expected_revision（陈旧 → 409）
+             */
+            LifecycleRevision?: number;
+            /**
+             * Format: int64
+             * @description 身份代际 K：仅身份类字段（template_id/base_url/upstream_key 及可轮换凭据）按值变更时 +1；SDK 自动 token 刷新不推进
+             */
+            IdentityRevision?: number;
+            /**
+             * Format: double
+             * @description 采购成本倍率（正常值，1 = ×1，0 = 免费，上限 10 = ×10；API 边界与 basis points 换算——存储 25000 ↔ 显示 2.5；写面 PATCH /accounts/{id} 的 upstream_cost_multiplier 字段）
+             */
+            UpstreamCostMultiplier?: number;
+            /** @description 共享缓存域（null = 账号私有域；软亲和一致性哈希的域标识；写面 PATCH /accounts/{id} 的 cache_domain 字段） */
+            CacheDomain?: string | null;
+            /**
+             * Format: int64
+             * @description 供应商归属（null = 平台自有；非空 = 归属该 supplier uid；只读回显，写面 PATCH /accounts/{id} 的 supplier_user_id）
+             */
+            supplier_user_id?: number | null;
             /** Format: date-time */
             CreatedAt?: string;
             /** Format: date-time */
@@ -1337,6 +2332,13 @@ export interface components {
             /** Format: double */
             err_rate?: number;
             err_count?: number;
+        };
+        AccountRecoverBody: {
+            /**
+             * Format: int64
+             * @description CAS 期望代际（= 读到的 LifecycleRevision）；过期 → 409
+             */
+            expected_revision: number;
         };
         /** @description 账号 codex 额度快照（sdkbridge；每块可选——上游没返回就不出字段；金额为字符串不解析保精度） */
         CodexUsageSnapshot: {
@@ -1433,21 +2435,15 @@ export interface components {
             codex_oauth_expires_at?: string | null;
             /** @description 凭据：pat */
             codex_pat_key?: string | null;
-            /** @description 管理标识：codex 账号登录邮箱（导入时由人工/上游提供，非自动生成——NewCodexIdentity 只生成身份四元组；可空） */
+            /** @description 管理标识：codex 账号登录邮箱（导入时由人工/上游提供，非自动生成——NewCodexIdentity 只生成 installation_id；可空） */
             codex_email?: string | null;
-            /** @description 上游账号/空间标识（Task B 导入必填；本 task 仅声明） */
+            /** @description 上游账号/空间标识；可留空——导入/单账号保存时自动识别（OAuth token claims 离线解析 / PAT whoami 查询）；识别失败：导入行拒绝、单账号保存留空且下次保存重试 */
             codex_account_id?: string | null;
         };
-        /** @description codex 账号身份四元组（account_ext.codex_identity jsonb 契约形态；对象字段请求语义：null 与空串同 = 未提供） */
+        /** @description codex 账号持久身份（account_ext.codex_identity jsonb 契约形态；对象字段请求语义：null 与空串同 = 未提供）。仅 installation_id——会话级 session/thread/window 已退役为运行时槽状态，不再持久化/暴露。 */
         CodexIdentity: {
             /** @description 身份：账号级唯一（UUIDv4；响应恒有——首次写入自动生成；空/缺省 → service 自动生成） */
             installation_id?: string;
-            /** @description 身份：会话级（UUIDv7；恒等 == thread_id；service 自动生成/沿用；响应 nil → null） */
-            session_id?: string | null;
-            /** @description 身份：会话级（UUIDv7；恒等 == session_id；响应 nil → null） */
-            thread_id?: string | null;
-            /** @description 身份：会话级派生 {thread_id}:0（导入时生成后恒定不变——恒 0，无透传无解析；上游不校验 n；响应 nil → null） */
-            window_id?: string | null;
         };
         /** @description 批量导入 codex-oauth 单行（组合幂等键 codex_email + codex_account_id；token+refresh 成对必填） */
         CodexOAuthImportItem: {
@@ -1463,8 +2459,6 @@ export interface components {
             codex_oauth_expires_at?: string;
             /** @description 可选；缺省 25（导入面裁决——非账号表默认 8）；<1 → 归 25 */
             max_concurrency?: number;
-            /** @description 可选；缺省 100；负值 → 行级 failed */
-            weight?: number;
         };
         /** @description 批量导入 codex-pat 单行（组合幂等键同上） */
         CodexPATImportItem: {
@@ -1476,8 +2470,6 @@ export interface components {
             codex_pat_key: string;
             /** @description 可选；缺省 25（导入面裁决）；<1 → 归 25 */
             max_concurrency?: number;
-            /** @description 可选；缺省 100；负值 → 行级 failed */
-            weight?: number;
         };
         /** @description 批量导入 codex-oauth 请求体（items 1-100 原始条数——空/超限 → 400；template_id 必填——缺失 → 400 / 不存在 → 404；**credential_type 必须 == codex-oauth——错配 → 400 整批拒绝**；group_id 可选——不存在 → 行级 failed） */
         CodexOAuthImportBody: {
@@ -1492,6 +2484,20 @@ export interface components {
              * @description 可选：新建账号归组（缺省不归组；不存在 → 行级 failed——FK 违反归行级不整批 400）
              */
             group_id?: number | null;
+            /** @description 可选：新建账号的管理面启停（缺省 true = 启用；仅新建行生效） */
+            enabled?: boolean;
+            /** @description 可选：新建账号的共享缓存域（缺省/空串 = 账号私有域；非空须为合法小写域名 ≤253——非法 → 400 整批拒绝） */
+            cache_domain?: string;
+            /**
+             * Format: double
+             * @description 可选：新建账号的采购成本倍率（缺省 ×1；0–10，0 = 免费；越界 → 400 整批拒绝）
+             */
+            upstream_cost_multiplier?: number;
+            /**
+             * Format: int64
+             * @description 保留：供应商面出现 ⇒ 400（归属恒为 JWT 本人；导入不分配归属）
+             */
+            supplier_user_id?: number | null;
         };
         /** @description 批量导入 codex-pat 请求体（items 1-100 原始条数——空/超限 → 400；template_id 必填——缺失 → 400 / 不存在 → 404；**credential_type 必须 == codex-pat——错配 → 400 整批拒绝**；group_id 可选——不存在 → 行级 failed） */
         CodexPATImportBody: {
@@ -1506,6 +2512,20 @@ export interface components {
              * @description 可选：新建账号归组（不存在 → 行级 failed）
              */
             group_id?: number | null;
+            /** @description 可选：新建账号的管理面启停（缺省 true = 启用；仅新建行生效） */
+            enabled?: boolean;
+            /** @description 可选：新建账号的共享缓存域（缺省/空串 = 账号私有域；非空须为合法小写域名 ≤253——非法 → 400 整批拒绝） */
+            cache_domain?: string;
+            /**
+             * Format: double
+             * @description 可选：新建账号的采购成本倍率（缺省 ×1；0–10，0 = 免费；越界 → 400 整批拒绝）
+             */
+            upstream_cost_multiplier?: number;
+            /**
+             * Format: int64
+             * @description 保留：供应商面出现 ⇒ 400（归属恒为 JWT 本人；导入不分配归属）
+             */
+            supplier_user_id?: number | null;
         };
         /** @description 行级失败条目（index = items 原始下标——行级定位契约） */
         ImportFailedItem: {
@@ -1540,7 +2560,7 @@ export interface components {
         /** @enum {string} */
         GroupVisibility: "public" | "private";
         /**
-         * @description 分组级协议转换方向（只补差，W5 网关 internal/protoconv 消费）：chat_to_resp = 客户端 chat → 模板 resp；mess_to_resp = anthropic messages → resp；resp_to_mess = resp → anthropic messages；chat_to_mess = chat → anthropic messages。off 不在枚举内——不转换 = 空数组（见 protocol_convert 字段说明）
+         * @description 分组级协议转换方向（只补差，网关 internal/protoconv 消费）：chat_to_resp = 客户端 chat → 模板 resp；mess_to_resp = anthropic messages → resp；resp_to_mess = resp → anthropic messages；chat_to_mess = chat → anthropic messages。off 不在枚举内——不转换 = 空数组（见 protocol_convert 字段说明）
          * @enum {string}
          */
         GroupProtocolConvert: "chat_to_resp" | "mess_to_resp" | "resp_to_mess" | "chat_to_mess";
@@ -1583,6 +2603,8 @@ export interface components {
             UserID?: number;
             /** Format: int64 */
             GroupID?: number;
+            /** @description 归属分组名（只读投影；组非存活/未加载 → 空串，前端回退 `#<GroupID>`） */
+            GroupName?: string;
             Name?: string;
             /** @description key 明文（长期可查看/复制；DB 泄露即暴露——自托管权衡，用户裁决） */
             key?: string;
@@ -1629,6 +2651,11 @@ export interface components {
              * @description 累计最终计费金额上限（毫分，1 USD = 100,000 毫分）；0 = 不限
              */
             quota?: number;
+            /**
+             * Format: int64
+             * @description 切换归属分组（可选；缺省 = 不改组。可选性同创建——public 或已授予 private；缺失/软删 → 404，未授予 → 400，<=0 → 400）
+             */
+            group_id?: number;
         };
         KeyListResponse: {
             /** Format: int64 */
@@ -1642,6 +2669,8 @@ export interface components {
             UserID?: number;
             /** Format: int64 */
             GroupID?: number;
+            /** @description 归属分组名（只读投影；组非存活/未加载 → 空串） */
+            GroupName?: string;
             Name?: string;
             Status?: components["schemas"]["KeyStatus"];
             MaxConcurrency?: number;
@@ -1668,7 +2697,38 @@ export interface components {
             rows: components["schemas"]["AdminKey"][];
         };
         /** @enum {string} */
-        UserRole: "platform_admin" | "user";
+        ManagementKeyStatus: "active" | "disabled";
+        ManagementKey: {
+            /** Format: int64 */
+            id?: number;
+            /**
+             * Format: int64
+             * @description owner 用户 id
+             */
+            user_id?: number;
+            /** @description 备注/标识（非唯一） */
+            name?: string;
+            /** @description 管理 key 明文（前缀 mk-；长期可查看/复制——自托管权衡） */
+            key_raw?: string;
+            status?: components["schemas"]["ManagementKeyStatus"];
+            /** Format: date-time */
+            created_at?: string;
+            /** Format: date-time */
+            updated_at?: string;
+        };
+        ManagementKeyCreate: {
+            /** @description 备注/标识（非唯一，非空） */
+            name: string;
+        };
+        ManagementKeyUpdate: {
+            name?: string;
+            status?: components["schemas"]["ManagementKeyStatus"];
+        };
+        ManagementKeyListResponse: {
+            rows: components["schemas"]["ManagementKey"][];
+        };
+        /** @enum {string} */
+        UserRole: "platform_admin" | "user" | "supplier";
         /** @enum {string} */
         UserStatus: "active" | "disabled";
         User: {
@@ -1800,6 +2860,8 @@ export interface components {
         };
         GroupCreate: {
             name: string;
+            /** @description 分组描述（可选）。POST：缺省/null = 空；PUT：缺省/null = 保持原值，显式空串 = 清空 */
+            description?: string | null;
             visibility?: components["schemas"]["GroupVisibility"];
             /**
              * Format: double
@@ -1833,11 +2895,17 @@ export interface components {
             };
             /**
              * @description 动作集（指针即意图：键缺省/null = 该维度透传不改）。全空对象 {} 合法 =
-             *     纯透传规则：命中后状态/冷却/权重零改动、响应码与文案双透传上游原样返回、
+             *     纯透传规则：命中后零惩罚、响应码与文案双透传上游原样返回、
              *     不计惩罚（不投递状态事件）。可用键：
-             *     - status：命中后账号目标状态，active/unhealthy/429/disabled 之一
-             *     - cooldown：冷却时长，Go time.ParseDuration 可解析且 > 0（如 "30s"、"5h"）
-             *     - weight：调度权重 ∈ [0,100]
+             *     - throttle：typed 限流动作（与 fail_account 互斥；
+             *       response_code/custom_message 塑形可并存）——
+             *       {scope: account|account_route, mode: retry_after|open, duration_ms?, use_reset}；
+             *       scope=account 作用该账号全部 RouteClass，account_route 作用单 RouteClass
+             *       （匹配时事件须携带账号+路由定位）；mode=retry_after 要求 use_reset=true
+             *       （上游 Reset 头优先，duration_ms 可选为回退）；mode=open 要求 use_reset=false
+             *       且 duration_ms > 0（固定摘除窗口）
+             *     - fail_account：true = 命中即判死（终态失效：failed_at + failure_source=rule，CAS fenced，
+             *       恢复唯一入口 /accounts/{id}/recover）；与 throttle 互斥
              *     - response_code：缺省/null = 透传上游状态码；设置 = 覆写为指定码（400-599）
              *     - custom_message：缺省/null = 透传上游错误文案；设置 = 覆写为固定文案（禁止空串）
              *     错误响应面无任何规则命中时默认归一为 502 "upstream rejected request"
@@ -1875,11 +2943,17 @@ export interface components {
              * @description 动作集（指针即意图：键缺省/null = 该维度透传不改）。PUT 部分更新语义：
              *     键缺省（null/省略）= 保持原值；显式提供时整体替换该对象（显式 {} = 清空），
              *     并对合并后的完整 when/then 重新校验。全空对象 {} 合法 = 纯透传规则：
-             *     命中后状态/冷却/权重零改动、响应码与文案双透传上游原样返回、不计惩罚
+             *     命中后零惩罚、响应码与文案双透传上游原样返回、不计惩罚
              *     （不投递状态事件）。可用键：
-             *     - status：命中后账号目标状态，active/unhealthy/429/disabled 之一
-             *     - cooldown：冷却时长，Go time.ParseDuration 可解析且 > 0（如 "30s"、"5h"）
-             *     - weight：调度权重 ∈ [0,100]
+             *     - throttle：typed 限流动作（与 fail_account 互斥；
+             *       response_code/custom_message 塑形可并存）——
+             *       {scope: account|account_route, mode: retry_after|open, duration_ms?, use_reset}；
+             *       scope=account 作用该账号全部 RouteClass，account_route 作用单 RouteClass
+             *       （匹配时事件须携带账号+路由定位）；mode=retry_after 要求 use_reset=true
+             *       （上游 Reset 头优先，duration_ms 可选为回退）；mode=open 要求 use_reset=false
+             *       且 duration_ms > 0（固定摘除窗口）
+             *     - fail_account：true = 命中即判死（终态失效：failed_at + failure_source=rule，CAS fenced，
+             *       恢复唯一入口 /accounts/{id}/recover）；与 throttle 互斥
              *     - response_code：缺省/null = 透传上游状态码；设置 = 覆写为指定码（400-599）
              *     - custom_message：缺省/null = 透传上游错误文案；设置 = 覆写为固定文案（禁止空串）
              *     错误响应面无任何规则命中时默认归一为 502 "upstream rejected request"
@@ -1899,7 +2973,7 @@ export interface components {
             When: {
                 [key: string]: unknown;
             };
-            /** @description 动作集（只读回显；字段集与语义同 RuleCreate.then——status/cooldown/weight/response_code/custom_message；全空 {} = 纯透传规则：命中后码/文双透、零惩罚） */
+            /** @description 动作集（只读回显；字段集与语义同 RuleCreate.then——throttle/fail_account/response_code/custom_message；全空 {} = 纯透传规则：命中后码/文双透、零惩罚） */
             Then: {
                 [key: string]: unknown;
             };
@@ -1922,6 +2996,8 @@ export interface components {
             /** Format: int64 */
             ID?: number;
             Name?: string;
+            /** @description 分组描述（空串 = 无描述） */
+            Description?: string;
             Visibility?: components["schemas"]["GroupVisibility"];
             /**
              * Format: double
@@ -1952,7 +3028,7 @@ export interface components {
         };
         TemplatePatch: {
             name?: string;
-            /** @description credential-type conditional: codex-oauth/codex-pat must be empty (non-empty forbidden); api_key/responses-special optional bare root override */
+            /** @description credential-type conditional: codex-oauth/codex-pat must be empty (non-empty forbidden); api_key/responses-special optional override, protocol prefix allowed, must not end in /v1 */
             base_url?: string;
             supported_formats?: ("openai-chat" | "openai-responses" | "openai-responses-ws" | "openai-images" | "openai-search" | "anthropic")[];
             models?: string[];
@@ -1963,18 +3039,21 @@ export interface components {
                 [key: string]: components["schemas"]["ModelMappingEntry"];
             };
         };
-        AccountPatch: {
+        /** @description 账号写面唯一字段模型（创建 / PATCH / 批量共用）。三态：字段缺席 = 不变（永不清空）； 可空标量 null = 清空；集合 null = 不变、[] = 清空；不可空标量 null = 400； 可空标量 "" = 400（空串哨兵已取消——清空只有一个拼法 null）。 */
+        AccountConfigPatch: {
             name?: string;
             /** Format: int64 */
             template_id?: number;
-            /** @description credential-type conditional batch: if any effective target is codex-oauth/codex-pat must be empty/null (non-empty forbidden); otherwise batch tristate: empty string=clear to inherit, null/omitted=unchanged, non-empty=override */
             base_url?: string | null;
             upstream_key?: string;
-            /** @enum {string} */
-            status?: "active" | "unhealthy" | "429" | "disabled";
-            weight?: number;
             max_concurrency?: number;
             group_ids?: number[];
+            enabled?: boolean;
+            cache_domain?: string | null;
+            /** Format: double */
+            upstream_cost_multiplier?: number;
+            /** Format: int64 */
+            supplier_user_id?: number | null;
         };
         GroupPatch: {
             name?: string;
@@ -1982,7 +3061,19 @@ export interface components {
         };
         BatchUpdateAccountsBody: {
             ids: number[];
-            fields: components["schemas"]["AccountPatch"];
+            fields: components["schemas"]["AccountConfigPatch"];
+        };
+        /** @description 账号批量更新响应（独立 schema——不与 templates/groups 共用的 BatchUpdateResponse 合并） */
+        AccountBatchUpdateResponse: {
+            updated: number;
+            items: components["schemas"]["AccountRevision"][];
+        };
+        /** @description 单账号更新后的配置代际（C = 客户端 CAS 令牌；与路由观测面的 identity_revision 不同） */
+        AccountRevision: {
+            /** Format: int64 */
+            account_id: number;
+            /** Format: int64 */
+            lifecycle_revision: number;
         };
         BatchUpdateGroupsBody: {
             ids: number[];
@@ -1993,12 +3084,6 @@ export interface components {
         };
         BatchUpdateResponse: {
             updated: number;
-        };
-        BatchResetCooldownBody: {
-            ids: number[];
-        };
-        BatchResetCooldownResponse: {
-            reset: number;
         };
         /** @enum {string} */
         RedemptionType: "balance" | "concurrency" | "temp_balance";
@@ -2033,7 +3118,7 @@ export interface components {
             Status: components["schemas"]["RedemptionStatus"];
             /**
              * Format: int64
-             * @description 0 = 系统（静态 admin token）；>0 = platform_admin 用户 id
+             * @description platform_admin 用户 id（adminAuth 鉴权路径恒注入 owner id）；0 = 系统/无归属
              */
             CreatedBy: number;
             /** Format: date-time */
@@ -2138,6 +3223,39 @@ export interface components {
             /** Format: int64 */
             total: number;
             rows: components["schemas"]["AdminTempBalanceRow"][];
+        };
+        /** @enum {string} */
+        BalanceLogSource: "signup_default" | "admin_create" | "admin_adjust" | "redemption";
+        BalanceLog: {
+            /** Format: int64 */
+            ID: number;
+            /** Format: int64 */
+            UserID: number;
+            /**
+             * Format: double
+             * @description 变动额 USD（有符号：正=增加/负=减少；1 USD = 100,000 毫分）
+             */
+            Amount: number;
+            /**
+             * Format: double
+             * @description 变更后余额 USD（毫分快照 /1e5）
+             */
+            BalanceAfter: number;
+            Source: components["schemas"]["BalanceLogSource"];
+            /**
+             * Format: int64
+             * @description 0 = 系统/用户自助；>0 = platform_admin 用户 id
+             */
+            OperatorID: number;
+            /** @description 附加说明（兑换→兑换码文本；其余可空） */
+            Note?: string | null;
+            /** Format: date-time */
+            CreatedAt: string;
+        };
+        BalanceLogListResponse: {
+            /** Format: int64 */
+            total: number;
+            rows: components["schemas"]["BalanceLog"][];
         };
         GenerateRequest: {
             type: components["schemas"]["RedemptionType"];
@@ -2703,6 +3821,282 @@ export interface components {
             /** @enum {string} */
             Source: "exact" | "sketch";
         };
+        /** @description 桑基图边集（已按 (ordinal,lane,account,outcome,is_terminal) 聚合） */
+        RoutingFlowGraph: {
+            edges: components["schemas"]["RoutingFlowGraphEdge"][];
+            /** @description 每层保留的账号数 N（实际生效值） */
+            account_limit: number;
+            /**
+             * Format: int64
+             * @description 各 (ordinal
+             */
+            folded_accounts: number;
+            /** @description folded_accounts > 0 的冗余布尔，便于消费方直读 */
+            folded: boolean;
+        };
+        /** @description 一条桑基边；account_id=0 且 folded=true 表示「其他」聚合节点 */
+        RoutingFlowGraphEdge: {
+            /** @description 链内第几次尝试（1 = 首发） */
+            ordinal: number;
+            /** @description 通道（primary/explore/degraded） */
+            lane: string;
+            /**
+             * Format: int64
+             * @description 本跳账号；0 = 「其他」聚合节点
+             */
+            account_id: number;
+            /** @description true = 该边是折叠后的「其他」聚合（account_id 恒 0） */
+            folded: boolean;
+            /** @description 本边结局（success/429/4xx/5xx/network…） */
+            outcome: string;
+            /** @description true = 该链 Final */
+            is_terminal: boolean;
+            /**
+             * Format: int64
+             * @description 同身份链数（SUM）
+             */
+            chain_count: number;
+            /** @description 到达链的 transition_reason 去重集（升序） */
+            transition_reasons: string[];
+            /** @description 到达链的 previous_outcome 去重集（升序） */
+            previous_outcomes: string[];
+            /** @description 到达链的 previous_account_id 去重集（升序）；折叠节点为空 */
+            previous_accounts: number[];
+        };
+        /** @description 一条聚合边（合并层行；最早代际为同边多代折叠的最小值） */
+        RoutingFlowEdge: {
+            /** @description 链内第几次尝试（1 = 首发） */
+            ordinal: number;
+            /** @description 通道（primary/explore/degraded） */
+            lane: string;
+            /** Format: int64 */
+            account_id: number;
+            /**
+             * Format: int64
+             * @description 前驱账号（首发边 null）
+             */
+            previous_account_id: number | null;
+            /** @description 前驱结局（首发边空串） */
+            previous_outcome: string;
+            /** @description 迁移原因（failover 等；首发边空串） */
+            transition_reason: string;
+            /** @description 本边结局（success/429/4xx/5xx/network…） */
+            outcome: string;
+            /** @description true = 该链 Final */
+            is_terminal: boolean;
+            /**
+             * Format: int64
+             * @description 本边链最早计划代际（同边多代折叠的最小值）
+             */
+            min_generation: number;
+            /**
+             * Format: int64
+             * @description 同身份链数（SUM）
+             */
+            chain_count: number;
+        };
+        /** @description (ordinal, lane) 分组；组间按 (ordinal, lane) 全序，组内保持仓储确定性行序 */
+        RoutingFlowLane: {
+            ordinal: number;
+            lane: string;
+            edges: components["schemas"]["RoutingFlowEdge"][];
+        };
+        RoutingFlowResponse: {
+            route_class_id: string;
+            /**
+             * Format: int64
+             * @description 当前发布计划 generation（边行各自 generation 不混入）
+             */
+            plan_generation: number;
+            /** @description 边表的当前页（offset/limit 切片后仍按 (ordinal,lane) 分组，组内保持仓储确定性行序） */
+            lanes: components["schemas"]["RoutingFlowLane"][];
+            /**
+             * Format: int64
+             * @description 窗口内完整边行数（行单位，驱动前端翻页器；不受 offset/limit 影响）
+             */
+            total_edges: number;
+            /** @description 完整边集内是否存在 min_generation != plan_generation 的边行（行级谓词，精确——无高估无低估；不受 offset/limit 影响）。精确性前提：generation 随发布单调不减，故存量行恒有 min_generation ≤ plan_generation；未来代际竞态不在目标场景内） */
+            stale_generation_present: boolean;
+            sankey: components["schemas"]["RoutingFlowGraph"];
+            /**
+             * Format: int64
+             * @description Attempt1 = ordinal=1 链数和（守恒左端；完整边集聚合，不受分页影响）
+             */
+            first_dispatch_chains: number;
+            /**
+             * Format: int64
+             * @description 保留 terminal 链数和（守恒右端，恒等于 first_dispatch_chains；完整边集聚合）
+             */
+            terminal_chains: number;
+            /**
+             * Format: int64
+             * @description 本进程已观察 cleanup 缺 terminal 的链（非上游失败）
+             */
+            incomplete_chain_dropped: number;
+            /**
+             * Format: int64
+             * @description 故障预算淘汰链（容量/入队拒绝；非上游失败）
+             */
+            flow_overflow_dropped_chains: number;
+            /** @description 硬崩丢失不可量化标记，恒 true */
+            process_crash_loss_unobservable: boolean;
+        };
+        RoutingFrontierCandidate: {
+            candidate_fingerprint: string;
+            /** @description 指纹在当前发布计划该路由候选目录内；false = 只呈现观测事实 */
+            known: boolean;
+            /**
+             * Format: int64
+             * @description unknown 候选为 0
+             */
+            account_id: number;
+            /** Format: int64 */
+            template_id: number;
+            /**
+             * Format: int64
+             * @description 候选内容代际 K（identity_revision）——非客户端 CAS 令牌 C（lifecycle_revision）；C 只围栏管理员写入
+             */
+            identity_revision: number;
+            quality_class_id: string;
+            mapped_model: string;
+            /** Format: int64 */
+            attempts: number;
+            /** Format: int64 */
+            successes: number;
+            /**
+             * Format: double
+             * @description Wilson95 下界
+             */
+            success_lcb: number;
+            /**
+             * Format: double
+             * @description Wilson95 上界
+             */
+            success_ucb: number;
+            /**
+             * Format: double
+             * @description TTFT 对数区间下界（ttft_known=false 时无意义）
+             */
+            ttft_lcb: number;
+            /** Format: double */
+            ttft_ucb: number;
+            /** @description 样本量足以给出区间 */
+            ttft_known: boolean;
+            /**
+             * Format: int64
+             * @description 输入侧单位采购价（毫分/1M 输入侧 token，1 USD = 100,000 毫分，与 compiler 同式；cost_known=false 时无意义）
+             */
+            input_unit_cost: number;
+            /** @description known + 有成功样本 + 价格可解析 */
+            cost_known: boolean;
+            /** @description 样本 <30（与 explore 同门槛） */
+            insufficient: boolean;
+            /** @description Pareto 非支配（仅 known 且 cost_known 间扫描） */
+            on_frontier: boolean;
+        };
+        RoutingFrontierResponse: {
+            route_class_id: string;
+            /** Format: int64 */
+            plan_generation: number;
+            /** @description 排序后的一页候选 */
+            candidates: components["schemas"]["RoutingFrontierCandidate"][];
+            /**
+             * Format: int64
+             * @description 排序后候选总条数（分页用；不受 offset/limit 影响）
+             */
+            total_candidates: number;
+        };
+        /** @description 路由全身份（group+format+model+operation+route class） */
+        RoutingPlanRef: {
+            /** Format: int64 */
+            group_id: number;
+            format: string;
+            model: string;
+            operation_tag: string;
+            route_class_id: string;
+        };
+        /** @description explore 决策表（发布序 + 权重 + 累积轮盘；序是语义不重排） */
+        RoutingPlanExplore: {
+            ids: number[];
+            /** @description account_id（十进制字符串键）→ 权重 */
+            weights: {
+                [key: string]: number;
+            };
+            cumulative: number[];
+            /** Format: int64 */
+            total: number;
+            fallback: number[];
+        };
+        /** @description 候选静态身份（缺叶子引用时 identity-only，其余字段零值） */
+        RoutingPlanCandidate: {
+            /** Format: int64 */
+            account_id: number;
+            /** Format: int64 */
+            template_id: number;
+            /**
+             * Format: int64
+             * @description 候选内容代际 K（identity_revision）——与编译器事实、wire 同源；非客户端 CAS 令牌 C
+             */
+            identity_revision: number;
+            /** @description 采购倍率 basis points（10000 = ×1） */
+            upstream_cost_multiplier_bp: number;
+            /** @description 真实候选指纹 hex（不可导出 = 空串） */
+            fingerprint: string;
+            /** @description rollup join 身份指纹 hex（compiler 合成规则同源） */
+            identity_fingerprint: string;
+            mapped_model: string;
+            quality_class_id: string;
+        };
+        RoutingPlanRoute: {
+            ref: components["schemas"]["RoutingPlanRef"];
+            /** @description primary 候选发布序 */
+            primary: number[];
+            explore: components["schemas"]["RoutingPlanExplore"];
+            /** @description degraded 候选发布序 */
+            degraded: number[];
+            /** @description 通道账号并集（升序 AccountID）的当前页；candidates_limit=0 时为空数组 */
+            candidates: components["schemas"]["RoutingPlanCandidate"][];
+            /**
+             * Format: int64
+             * @description 该路由候选总数（分页用；不受 candidates_offset/candidates_limit 影响）
+             */
+            candidates_total: number;
+            incident: components["schemas"]["RoutingPlanIncident"];
+        };
+        /** @description 路由 expose-only 事故标记（detect+surface：不改通道、不节流、不探针；零值 = 无事故） */
+        RoutingPlanIncident: {
+            active: boolean;
+            /** @description "domain"|"model"|"both"（inactive 时为空串） */
+            kind: string;
+            /** @description 可比候选数（current/baseline attempts≥30 且 TTFT≥30） */
+            comparable: number;
+            /** @description 退化候选数（Wilson 成功区间不重叠） */
+            degraded: number;
+            /** @description 可比去重 failure-domain 数 */
+            domains: number;
+            /**
+             * Format: int64
+             * @description 证据分钟 M（unix 秒；窗口边界可由 M 推导）
+             */
+            evaluated_minute: number;
+        };
+        /** @description 当前发布计划快照（无历史 generation 查询面；空视图 = generation 0 + routes []） */
+        RoutingPlanResponse: {
+            /** Format: int64 */
+            generation: number;
+            /**
+             * Format: int64
+             * @description 未过滤的当前计划路由总数（区分「空计划」与「窗口内无流量」）
+             */
+            plan_total_routes: number;
+            /**
+             * Format: int64
+             * @description 过滤后（search ∩ observed 窗口；route 给定时恒为 1）的路由总数（分页用）
+             */
+            total_routes: number;
+            /** @description 全身份确定性路由序（与发布字节守卫同序） */
+            routes: components["schemas"]["RoutingPlanRoute"][];
+        };
         WorkerStatus: {
             name: string;
             /** @description 各 worker 异构观测字段；完整字段清单见本 schema 上方 yaml 注释（与各 worker Stats() 实现同步维护） */
@@ -2854,7 +4248,7 @@ export interface components {
             err_rate: number;
             err_count: number;
         };
-        /** @description 告警面（billing 游标消费者 lag 族观测，F2 ledger-cursor；注入面读取，未装配 = 全零） */
+        /** @description 告警面（billing 游标消费者 lag 族观测，ledger-cursor；注入面读取，未装配 = 全零） */
         OverviewAlerts: {
             /**
              * Format: int64
@@ -2914,19 +4308,57 @@ export interface components {
         };
     };
     parameters: {
+        /** @description 每页条数（上限 200，超限裁剪到 200） */
+        ListLimit: number;
+        ListOffset: number;
+        ListName: string;
+        ListSort: string;
+        ListOrder: "asc" | "desc";
+        AccountTemplateId: number;
+        /** @description 管理面启停过滤：true = 仅启用，false = 仅禁用；缺省 = 不过滤（与运行时失效 failed_at 无关） */
+        AccountEnabled: boolean;
+        /** @description 绝对窗口下界（含，RFC3339）。窗口两形态**恰择一**（from+to，或 window 单独）：与 window 同给 / 只给一端 / 都不给 → 400 `reason=window_ambiguous`。给出 from/to 时不做时区改写；服务端按判定把两端向后取整到整点（生效窗口见响应头 X-Stats-Effective-From/To） */
+        StatsFrom: string;
+        /** @description 绝对窗口上界（不含，RFC3339）。与 from 同生共死：只给一端 → 400 `reason=window_ambiguous`；from 不早于 to → 400 `reason=window_invalid` */
+        StatsTo: string;
+        /**
+         * @description 相对窗口（时长串，Go `time.ParseDuration` 形态，如 `24h`/`168h`/`2160h`）。
+         *     给出它时**必须**省略 `from`/`to`（同时给出 → 400 `reason=window_ambiguous`）。
+         *     服务端自持时钟：`to` = 当前时刻向上取整到 UTC 整点、`from` = `to` − `window`
+         *     ⇒ 两端恒整点，命中卷积表的精确分支（零对齐位移、零桶丢失），这就是 UI 预设
+         *     走这条形态的理由。
+         *
+         *     **只收时长，不收日历天**：`d` 不是 `time.ParseDuration` 的单位，`7d` → 400
+         *     （`reason=window_invalid`）。理由：`24h` 与"一个日历天"在 DST 切换日不相等，
+         *     而本 API 的唯一对齐基准是固定 1h 网格；另立 `AddDate` 日历语义会引入第二套
+         *     窗口长度语义。预设即网格整倍数：24h / 168h / 720h / 2160h。
+         */
+        StatsWindow: string;
         /**
          * @description IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-         *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-         *     其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-         *     等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-         *     客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-         *     （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-         *     窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+         *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+         *     绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+         *     但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+         *     「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+         *
+         *     窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+         *     卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+         *     取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+         *     分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+         *     8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+         *     截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
          */
         StatsTimezone: string;
     };
     requestBodies: never;
-    headers: never;
+    headers: {
+        /** @description 本次读取真正使用的窗口下界（RFC3339，UTC） */
+        StatsEffectiveFrom: string;
+        /** @description 本次读取真正使用的窗口上界（RFC3339，UTC，半开区间） */
+        StatsEffectiveTo: string;
+        /** @description 本次读取实际使用的存储（cube = 预聚合卷积表；raw = 原始明细行） */
+        StatsStorage: "cube" | "raw";
+    };
     pathItems: never;
 }
 export type $defs = Record<string, never>;
@@ -2934,11 +4366,12 @@ export interface operations {
     GetTemplates: {
         parameters: {
             query?: {
-                limit?: number;
-                offset?: number;
-                name?: string;
-                sort?: string;
-                order?: "asc" | "desc";
+                /** @description 每页条数（上限 200，超限裁剪到 200） */
+                limit?: components["parameters"]["ListLimit"];
+                offset?: components["parameters"]["ListOffset"];
+                name?: components["parameters"]["ListName"];
+                sort?: components["parameters"]["ListSort"];
+                order?: components["parameters"]["ListOrder"];
             };
             header?: never;
             path?: never;
@@ -3159,13 +4592,15 @@ export interface operations {
     GetAccounts: {
         parameters: {
             query?: {
-                limit?: number;
-                offset?: number;
-                name?: string;
-                sort?: string;
-                order?: "asc" | "desc";
-                status?: string;
-                template_id?: number;
+                /** @description 每页条数（上限 200，超限裁剪到 200） */
+                limit?: components["parameters"]["ListLimit"];
+                offset?: components["parameters"]["ListOffset"];
+                name?: components["parameters"]["ListName"];
+                sort?: components["parameters"]["ListSort"];
+                order?: components["parameters"]["ListOrder"];
+                template_id?: components["parameters"]["AccountTemplateId"];
+                /** @description 管理面启停过滤：true = 仅启用，false = 仅禁用；缺省 = 不过滤（与运行时失效 failed_at 无关） */
+                enabled?: components["parameters"]["AccountEnabled"];
             };
             header?: never;
             path?: never;
@@ -3214,16 +4649,36 @@ export interface operations {
         parameters: {
             query: {
                 account_ids: string;
-                from?: string;
-                to?: string;
+                /** @description 绝对窗口下界（含，RFC3339）。窗口两形态**恰择一**（from+to，或 window 单独）：与 window 同给 / 只给一端 / 都不给 → 400 `reason=window_ambiguous`。给出 from/to 时不做时区改写；服务端按判定把两端向后取整到整点（生效窗口见响应头 X-Stats-Effective-From/To） */
+                from?: components["parameters"]["StatsFrom"];
+                /** @description 绝对窗口上界（不含，RFC3339）。与 from 同生共死：只给一端 → 400 `reason=window_ambiguous`；from 不早于 to → 400 `reason=window_invalid` */
+                to?: components["parameters"]["StatsTo"];
+                /**
+                 * @description 相对窗口（时长串，Go `time.ParseDuration` 形态，如 `24h`/`168h`/`2160h`）。
+                 *     给出它时**必须**省略 `from`/`to`（同时给出 → 400 `reason=window_ambiguous`）。
+                 *     服务端自持时钟：`to` = 当前时刻向上取整到 UTC 整点、`from` = `to` − `window`
+                 *     ⇒ 两端恒整点，命中卷积表的精确分支（零对齐位移、零桶丢失），这就是 UI 预设
+                 *     走这条形态的理由。
+                 *
+                 *     **只收时长，不收日历天**：`d` 不是 `time.ParseDuration` 的单位，`7d` → 400
+                 *     （`reason=window_invalid`）。理由：`24h` 与"一个日历天"在 DST 切换日不相等，
+                 *     而本 API 的唯一对齐基准是固定 1h 网格；另立 `AddDate` 日历语义会引入第二套
+                 *     窗口长度语义。预设即网格整倍数：24h / 168h / 720h / 2160h。
+                 */
+                window?: components["parameters"]["StatsWindow"];
                 /**
                  * @description IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-                 *     其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-                 *     等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-                 *     客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-                 *     （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-                 *     窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+                 *     绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+                 *     但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+                 *     「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+                 *
+                 *     窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+                 *     卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+                 *     取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+                 *     分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+                 *     8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+                 *     截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
                  */
                 timezone?: components["parameters"]["StatsTimezone"];
             };
@@ -3289,32 +4744,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["BatchUpdateResponse"];
-                };
-            };
-            default: components["responses"]["Error"];
-        };
-    };
-    PostAccountsBatchResetCooldown: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["BatchResetCooldownBody"];
-            };
-        };
-        responses: {
-            /** @description 重置成功 */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["BatchResetCooldownResponse"];
+                    "application/json": components["schemas"]["AccountBatchUpdateResponse"];
                 };
             };
             default: components["responses"]["Error"];
@@ -3393,33 +4823,6 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    PutAccountsId: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: number;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AccountCreate"];
-            };
-        };
-        responses: {
-            /** @description 更新后账号 */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Account"];
-                };
-            };
-            default: components["responses"]["Error"];
-        };
-    };
     DeleteAccountsId: {
         parameters: {
             query?: never;
@@ -3443,6 +4846,44 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    PatchAccountsId: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string;
+            };
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AccountConfigPatch"];
+            };
+        };
+        responses: {
+            /** @description 更新后账号（含新 lifecycle_revision） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Account"];
+                };
+            };
+            /** @description If-Match 陈旧（当前 lifecycle_revision 与前置条件不符） */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
     GetAccountsIdGroups: {
         parameters: {
             query?: never;
@@ -3461,6 +4902,33 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AccountGroupsResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostAccountsIdRecover: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AccountRecoverBody"];
+            };
+        };
+        responses: {
+            /** @description 恢复后的账号（含新 LifecycleRevision） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Account"];
                 };
             };
             default: components["responses"]["Error"];
@@ -3519,11 +4987,12 @@ export interface operations {
     GetGroups: {
         parameters: {
             query?: {
-                limit?: number;
-                offset?: number;
-                name?: string;
-                sort?: string;
-                order?: "asc" | "desc";
+                /** @description 每页条数（上限 200，超限裁剪到 200） */
+                limit?: components["parameters"]["ListLimit"];
+                offset?: components["parameters"]["ListOffset"];
+                name?: components["parameters"]["ListName"];
+                sort?: components["parameters"]["ListSort"];
+                order?: components["parameters"]["ListOrder"];
             };
             header?: never;
             path?: never;
@@ -3699,6 +5168,8 @@ export interface operations {
                 email?: string;
                 sort?: string;
                 order?: "asc" | "desc";
+                role?: "platform_admin" | "user" | "supplier";
+                supplier_surface?: boolean;
             };
             header?: never;
             path?: never;
@@ -3815,6 +5286,32 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["UserGroupsResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetUsersIdBalanceLogs: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 余额变动记录列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BalanceLogListResponse"];
                 };
             };
             default: components["responses"]["Error"];
@@ -4845,19 +6342,37 @@ export interface operations {
     };
     GetUserStats: {
         parameters: {
-            query: {
-                from: string;
-                to: string;
+            query?: {
+                from?: string;
+                to?: string;
+                /**
+                 * @description 相对窗口（时长串，Go `time.ParseDuration` 形态，如 `24h`/`168h`/`2160h`）。
+                 *     给出它时**必须**省略 `from`/`to`（同时给出 → 400 `reason=window_ambiguous`）。
+                 *     服务端自持时钟：`to` = 当前时刻向上取整到 UTC 整点、`from` = `to` − `window`
+                 *     ⇒ 两端恒整点，命中卷积表的精确分支（零对齐位移、零桶丢失），这就是 UI 预设
+                 *     走这条形态的理由。
+                 *
+                 *     **只收时长，不收日历天**：`d` 不是 `time.ParseDuration` 的单位，`7d` → 400
+                 *     （`reason=window_invalid`）。理由：`24h` 与"一个日历天"在 DST 切换日不相等，
+                 *     而本 API 的唯一对齐基准是固定 1h 网格；另立 `AddDate` 日历语义会引入第二套
+                 *     窗口长度语义。预设即网格整倍数：24h / 168h / 720h / 2160h。
+                 */
+                window?: components["parameters"]["StatsWindow"];
                 granularity?: "hour" | "day";
                 model?: string;
                 /**
                  * @description IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-                 *     其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-                 *     等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-                 *     客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-                 *     （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-                 *     窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+                 *     绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+                 *     但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+                 *     「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+                 *
+                 *     窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+                 *     卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+                 *     取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+                 *     分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+                 *     8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+                 *     截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
                  */
                 timezone?: components["parameters"]["StatsTimezone"];
             };
@@ -4867,9 +6382,12 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 统计趋势点数组 */
+            /** @description 统计趋势点数组（生效窗口与实际存储见响应头 X-Stats-*——裸数组体不能加字段） */
             200: {
                 headers: {
+                    "X-Stats-Effective-From": components["headers"]["StatsEffectiveFrom"];
+                    "X-Stats-Effective-To": components["headers"]["StatsEffectiveTo"];
+                    "X-Stats-Storage": components["headers"]["StatsStorage"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -4881,18 +6399,36 @@ export interface operations {
     };
     GetUserStatsTTFT: {
         parameters: {
-            query: {
-                from: string;
-                to: string;
+            query?: {
+                from?: string;
+                to?: string;
+                /**
+                 * @description 相对窗口（时长串，Go `time.ParseDuration` 形态，如 `24h`/`168h`/`2160h`）。
+                 *     给出它时**必须**省略 `from`/`to`（同时给出 → 400 `reason=window_ambiguous`）。
+                 *     服务端自持时钟：`to` = 当前时刻向上取整到 UTC 整点、`from` = `to` − `window`
+                 *     ⇒ 两端恒整点，命中卷积表的精确分支（零对齐位移、零桶丢失），这就是 UI 预设
+                 *     走这条形态的理由。
+                 *
+                 *     **只收时长，不收日历天**：`d` 不是 `time.ParseDuration` 的单位，`7d` → 400
+                 *     （`reason=window_invalid`）。理由：`24h` 与"一个日历天"在 DST 切换日不相等，
+                 *     而本 API 的唯一对齐基准是固定 1h 网格；另立 `AddDate` 日历语义会引入第二套
+                 *     窗口长度语义。预设即网格整倍数：24h / 168h / 720h / 2160h。
+                 */
+                window?: components["parameters"]["StatsWindow"];
                 model?: string;
                 /**
                  * @description IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-                 *     其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-                 *     等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-                 *     客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-                 *     （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-                 *     窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+                 *     绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+                 *     但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+                 *     「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+                 *
+                 *     窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+                 *     卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+                 *     取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+                 *     分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+                 *     8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+                 *     截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
                  */
                 timezone?: components["parameters"]["StatsTimezone"];
             };
@@ -4909,6 +6445,27 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["StatTTFTSummary"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetUserStatsCapabilities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 能力投影（kinds 键 = 读形状标识） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatsCapabilities"];
                 };
             };
             default: components["responses"]["Error"];
@@ -5176,20 +6733,38 @@ export interface operations {
     };
     GetStatsTrend: {
         parameters: {
-            query: {
-                from: string;
-                to: string;
+            query?: {
+                from?: string;
+                to?: string;
+                /**
+                 * @description 相对窗口（时长串，Go `time.ParseDuration` 形态，如 `24h`/`168h`/`2160h`）。
+                 *     给出它时**必须**省略 `from`/`to`（同时给出 → 400 `reason=window_ambiguous`）。
+                 *     服务端自持时钟：`to` = 当前时刻向上取整到 UTC 整点、`from` = `to` − `window`
+                 *     ⇒ 两端恒整点，命中卷积表的精确分支（零对齐位移、零桶丢失），这就是 UI 预设
+                 *     走这条形态的理由。
+                 *
+                 *     **只收时长，不收日历天**：`d` 不是 `time.ParseDuration` 的单位，`7d` → 400
+                 *     （`reason=window_invalid`）。理由：`24h` 与"一个日历天"在 DST 切换日不相等，
+                 *     而本 API 的唯一对齐基准是固定 1h 网格；另立 `AddDate` 日历语义会引入第二套
+                 *     窗口长度语义。预设即网格整倍数：24h / 168h / 720h / 2160h。
+                 */
+                window?: components["parameters"]["StatsWindow"];
                 granularity?: "hour" | "day";
                 group_id?: number;
                 model?: string;
                 /**
                  * @description IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-                 *     其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-                 *     等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-                 *     客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-                 *     （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-                 *     窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+                 *     绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+                 *     但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+                 *     「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+                 *
+                 *     窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+                 *     卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+                 *     取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+                 *     分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+                 *     8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+                 *     截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
                  */
                 timezone?: components["parameters"]["StatsTimezone"];
             };
@@ -5199,9 +6774,12 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 统计趋势点数组 */
+            /** @description 统计趋势点数组（生效窗口与实际存储见响应头 X-Stats-*——裸数组体不能加字段） */
             200: {
                 headers: {
+                    "X-Stats-Effective-From": components["headers"]["StatsEffectiveFrom"];
+                    "X-Stats-Effective-To": components["headers"]["StatsEffectiveTo"];
+                    "X-Stats-Storage": components["headers"]["StatsStorage"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -5221,12 +6799,17 @@ export interface operations {
                 limit?: number;
                 /**
                  * @description IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-                 *     其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-                 *     等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-                 *     客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-                 *     （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-                 *     窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+                 *     绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+                 *     但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+                 *     「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+                 *
+                 *     窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+                 *     卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+                 *     取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+                 *     分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+                 *     8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+                 *     截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
                  */
                 timezone?: components["parameters"]["StatsTimezone"];
             };
@@ -5253,18 +6836,36 @@ export interface operations {
             query: {
                 entity: "account" | "user" | "key";
                 id: number;
-                from: string;
-                to: string;
+                from?: string;
+                to?: string;
+                /**
+                 * @description 相对窗口（时长串，Go `time.ParseDuration` 形态，如 `24h`/`168h`/`2160h`）。
+                 *     给出它时**必须**省略 `from`/`to`（同时给出 → 400 `reason=window_ambiguous`）。
+                 *     服务端自持时钟：`to` = 当前时刻向上取整到 UTC 整点、`from` = `to` − `window`
+                 *     ⇒ 两端恒整点，命中卷积表的精确分支（零对齐位移、零桶丢失），这就是 UI 预设
+                 *     走这条形态的理由。
+                 *
+                 *     **只收时长，不收日历天**：`d` 不是 `time.ParseDuration` 的单位，`7d` → 400
+                 *     （`reason=window_invalid`）。理由：`24h` 与"一个日历天"在 DST 切换日不相等，
+                 *     而本 API 的唯一对齐基准是固定 1h 网格；另立 `AddDate` 日历语义会引入第二套
+                 *     窗口长度语义。预设即网格整倍数：24h / 168h / 720h / 2160h。
+                 */
+                window?: components["parameters"]["StatsWindow"];
                 granularity: "hour" | "day";
                 model?: string;
                 /**
                  * @description IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-                 *     其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-                 *     等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-                 *     客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-                 *     （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-                 *     窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+                 *     绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+                 *     但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+                 *     「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+                 *
+                 *     窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+                 *     卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+                 *     取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+                 *     分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+                 *     8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+                 *     截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
                  */
                 timezone?: components["parameters"]["StatsTimezone"];
             };
@@ -5274,9 +6875,12 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 实体趋势点数组 */
+            /** @description 实体趋势点数组（生效窗口与实际存储见响应头 X-Stats-*） */
             200: {
                 headers: {
+                    "X-Stats-Effective-From": components["headers"]["StatsEffectiveFrom"];
+                    "X-Stats-Effective-To": components["headers"]["StatsEffectiveTo"];
+                    "X-Stats-Storage": components["headers"]["StatsStorage"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -5288,20 +6892,38 @@ export interface operations {
     };
     GetStatsTTFT: {
         parameters: {
-            query: {
-                from: string;
-                to: string;
+            query?: {
+                from?: string;
+                to?: string;
+                /**
+                 * @description 相对窗口（时长串，Go `time.ParseDuration` 形态，如 `24h`/`168h`/`2160h`）。
+                 *     给出它时**必须**省略 `from`/`to`（同时给出 → 400 `reason=window_ambiguous`）。
+                 *     服务端自持时钟：`to` = 当前时刻向上取整到 UTC 整点、`from` = `to` − `window`
+                 *     ⇒ 两端恒整点，命中卷积表的精确分支（零对齐位移、零桶丢失），这就是 UI 预设
+                 *     走这条形态的理由。
+                 *
+                 *     **只收时长，不收日历天**：`d` 不是 `time.ParseDuration` 的单位，`7d` → 400
+                 *     （`reason=window_invalid`）。理由：`24h` 与"一个日历天"在 DST 切换日不相等，
+                 *     而本 API 的唯一对齐基准是固定 1h 网格；另立 `AddDate` 日历语义会引入第二套
+                 *     窗口长度语义。预设即网格整倍数：24h / 168h / 720h / 2160h。
+                 */
+                window?: components["parameters"]["StatsWindow"];
                 entity?: "account" | "user" | "key";
                 id?: number;
                 model?: string;
                 /**
                  * @description IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-                 *     其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-                 *     等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-                 *     客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-                 *     （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-                 *     窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+                 *     绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+                 *     但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+                 *     「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+                 *
+                 *     窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+                 *     卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+                 *     取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+                 *     分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+                 *     8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+                 *     截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
                  */
                 timezone?: components["parameters"]["StatsTimezone"];
             };
@@ -5323,6 +6945,112 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    GetStatsCapabilities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 能力投影（kinds 键 = 读形状标识） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatsCapabilities"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetRoutingFlow: {
+        parameters: {
+            query: {
+                route: string;
+                from: string;
+                to: string;
+                offset?: number;
+                limit?: number;
+                accounts?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description flow 聚合（lanes 边分组 + 守恒计数 + 丢失三口径） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RoutingFlowResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetRoutingFrontier: {
+        parameters: {
+            query: {
+                route: string;
+                from: string;
+                to: string;
+                offset?: number;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 前沿候选列表（已排序 + 钳制；空为 []） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RoutingFrontierResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetRoutingPlan: {
+        parameters: {
+            query?: {
+                search?: string;
+                route?: string;
+                observed_from?: string;
+                observed_to?: string;
+                offset?: number;
+                limit?: number;
+                candidates_offset?: number;
+                candidates_limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 当前发布计划快照（routes 为过滤 + 切片后的一页） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RoutingPlanResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
     GetAdminOverview: {
         parameters: {
             query?: {
@@ -5330,12 +7058,17 @@ export interface operations {
                 group_id?: number;
                 /**
                  * @description IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-                 *     其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-                 *     等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-                 *     客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-                 *     （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-                 *     窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+                 *     绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+                 *     但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+                 *     「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+                 *
+                 *     窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+                 *     卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+                 *     取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+                 *     分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+                 *     8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+                 *     截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
                  */
                 timezone?: components["parameters"]["StatsTimezone"];
             };
@@ -5401,4 +7134,932 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    GetSupplierOverview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 供应商收益概览 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupplierOverview"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetSupplierEarnings: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 收益明细列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupplierEarningList"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetSupplierChunks: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 冻结桶列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupplierChunkList"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetSupplierSettlements: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 结算单列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupplierSettlementList"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostSupplierSettlement: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApplySettlementBody"];
+            };
+        };
+        responses: {
+            /** @description 创建的结算单 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupplierSettlement"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetSupplierAccounts: {
+        parameters: {
+            query?: {
+                /** @description 每页条数（上限 200，超限裁剪到 200） */
+                limit?: components["parameters"]["ListLimit"];
+                offset?: components["parameters"]["ListOffset"];
+                name?: components["parameters"]["ListName"];
+                sort?: components["parameters"]["ListSort"];
+                order?: components["parameters"]["ListOrder"];
+                template_id?: components["parameters"]["AccountTemplateId"];
+                /** @description 管理面启停过滤：true = 仅启用，false = 仅禁用；缺省 = 不过滤（与运行时失效 failed_at 无关） */
+                enabled?: components["parameters"]["AccountEnabled"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 账号视图列表（仅本人归属） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountListResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostSupplierAccounts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AccountCreate"];
+            };
+        };
+        responses: {
+            /** @description 创建后的账号 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Account"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetSupplierAccountsUsage: {
+        parameters: {
+            query: {
+                account_ids: string;
+                /** @description 绝对窗口下界（含，RFC3339）。窗口两形态**恰择一**（from+to，或 window 单独）：与 window 同给 / 只给一端 / 都不给 → 400 `reason=window_ambiguous`。给出 from/to 时不做时区改写；服务端按判定把两端向后取整到整点（生效窗口见响应头 X-Stats-Effective-From/To） */
+                from?: components["parameters"]["StatsFrom"];
+                /** @description 绝对窗口上界（不含，RFC3339）。与 from 同生共死：只给一端 → 400 `reason=window_ambiguous`；from 不早于 to → 400 `reason=window_invalid` */
+                to?: components["parameters"]["StatsTo"];
+                /**
+                 * @description 相对窗口（时长串，Go `time.ParseDuration` 形态，如 `24h`/`168h`/`2160h`）。
+                 *     给出它时**必须**省略 `from`/`to`（同时给出 → 400 `reason=window_ambiguous`）。
+                 *     服务端自持时钟：`to` = 当前时刻向上取整到 UTC 整点、`from` = `to` − `window`
+                 *     ⇒ 两端恒整点，命中卷积表的精确分支（零对齐位移、零桶丢失），这就是 UI 预设
+                 *     走这条形态的理由。
+                 *
+                 *     **只收时长，不收日历天**：`d` 不是 `time.ParseDuration` 的单位，`7d` → 400
+                 *     （`reason=window_invalid`）。理由：`24h` 与"一个日历天"在 DST 切换日不相等，
+                 *     而本 API 的唯一对齐基准是固定 1h 网格；另立 `AddDate` 日历语义会引入第二套
+                 *     窗口长度语义。预设即网格整倍数：24h / 168h / 720h / 2160h。
+                 */
+                window?: components["parameters"]["StatsWindow"];
+                /**
+                 * @description IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
+                 *     仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+                 *     绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+                 *     但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+                 *     「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+                 *
+                 *     窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+                 *     卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+                 *     取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+                 *     分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+                 *     8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+                 *     截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
+                 */
+                timezone?: components["parameters"]["StatsTimezone"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 账号 usage items（恒 = account_ids 去重后全量——无记录账号 gateway 全 0） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountsUsageResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostSupplierAccountsBatchUpdate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BatchUpdateAccountsBody"];
+            };
+        };
+        responses: {
+            /** @description 更新成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountBatchUpdateResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostSupplierAccountsBatchDelete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BatchDeleteBody"];
+            };
+        };
+        responses: {
+            /** @description 删除成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchDeleteResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostSupplierAccountsBatchImportCodexOauth: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodexOAuthImportBody"];
+            };
+        };
+        responses: {
+            /** @description 导入结果（imported 新建 / updated 键存在更新凭据 / failed 行级 index+error——有失败行也 200） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportResult"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostSupplierAccountsBatchImportCodexPat: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodexPATImportBody"];
+            };
+        };
+        responses: {
+            /** @description 导入结果（imported 新建 / updated 键存在更新凭据 / failed 行级 index+error——有失败行也 200） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportResult"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetSupplierAccountsId: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 账号 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Account"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    DeleteSupplierAccountsId: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 删除成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeletedResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PatchSupplierAccountsId: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: string;
+            };
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AccountConfigPatch"];
+            };
+        };
+        responses: {
+            /** @description 更新后账号（含新 lifecycle_revision） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Account"];
+                };
+            };
+            /** @description If-Match 陈旧（当前 lifecycle_revision 与前置条件不符） */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetSupplierAccountsIdExt: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 账号 ext 配置 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountExt"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PutSupplierAccountsIdExt: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AccountExt"];
+            };
+        };
+        responses: {
+            /** @description 写入后的 ext 配置 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountExt"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetSupplierAccountsIdGroups: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 分组 id 列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountGroupsResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostSupplierAccountsIdRecover: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AccountRecoverBody"];
+            };
+        };
+        responses: {
+            /** @description 恢复后的账号（含新 LifecycleRevision） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Account"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetSupplierGroups: {
+        parameters: {
+            query?: {
+                /** @description 每页条数（上限 200，超限裁剪到 200） */
+                limit?: components["parameters"]["ListLimit"];
+                offset?: components["parameters"]["ListOffset"];
+                name?: components["parameters"]["ListName"];
+                sort?: components["parameters"]["ListSort"];
+                order?: components["parameters"]["ListOrder"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 分组列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GroupListResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetSupplierTemplates: {
+        parameters: {
+            query?: {
+                /** @description 每页条数（上限 200，超限裁剪到 200） */
+                limit?: components["parameters"]["ListLimit"];
+                offset?: components["parameters"]["ListOffset"];
+                name?: components["parameters"]["ListName"];
+                sort?: components["parameters"]["ListSort"];
+                order?: components["parameters"]["ListOrder"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 模板列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TemplateListResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetSupplierTemplatesId: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 模板 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Template"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetAdminSupplierSettlements: {
+        parameters: {
+            query?: {
+                status?: "pending" | "approved" | "paying" | "paid" | "rejected";
+                kind?: "supplier_request" | "admin_request";
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 结算单列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupplierSettlementList"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostAdminSupplierSettlementsIdApprove: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SettlementTransitionBody"];
+            };
+        };
+        responses: {
+            /** @description 更新后的结算单 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupplierSettlement"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostAdminSupplierSettlementsIdReject: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SettlementRejectBody"];
+            };
+        };
+        responses: {
+            /** @description 更新后的结算单 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupplierSettlement"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostAdminSupplierSettlementsIdClaim: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SettlementClaimBody"];
+            };
+        };
+        responses: {
+            /** @description 更新后的结算单 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupplierSettlement"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostAdminSupplierSettlementsIdConfirmFailed: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SettlementConfirmFailedBody"];
+            };
+        };
+        responses: {
+            /** @description 更新后的结算单 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupplierSettlement"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostAdminSupplierSettlementsIdPaid: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SettlementPaidBody"];
+            };
+        };
+        responses: {
+            /** @description 更新后的结算单 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupplierSettlement"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostAdminSupplierSettlementsAdminRequest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminRequestSettlementBody"];
+            };
+        };
+        responses: {
+            /** @description 创建的结算单 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupplierSettlement"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetAdminSupplierBalances: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 余额列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupplierBalanceList"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PatchAdminSupplierBalancesUid: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                uid: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SupplierBalancePatchBody"];
+            };
+        };
+        responses: {
+            /** @description 更新后的余额行 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupplierBalance"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    GetUserManagementKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 管理 key 列表 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementKeyListResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PostUserManagementKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ManagementKeyCreate"];
+            };
+        };
+        responses: {
+            /** @description 创建后的管理 key（含明文） */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementKey"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    PutUserManagementKeysId: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ManagementKeyUpdate"];
+            };
+        };
+        responses: {
+            /** @description 更新后的管理 key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementKey"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    DeleteUserManagementKeysId: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 删除成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeletedResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
 }
+type WithRequired<T, K extends keyof T> = T & {
+    [P in K]-?: T[P];
+};

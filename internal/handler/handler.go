@@ -7,14 +7,14 @@
 package handler
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"time"
 
 	"github.com/is7qin/c3api/internal/handler/httpface"
+	"github.com/is7qin/c3api/internal/pricing"
 	"github.com/is7qin/c3api/internal/service"
+	"github.com/is7qin/c3api/pkg/logx"
 )
 
 // AdminAPI 实现生成的 ServerInterface（契约层唯一实现）。
@@ -23,6 +23,16 @@ import (
 type AdminAPI struct {
 	svc *service.Service
 	ops OpsOptions // 运维观测装配（GetOpsWorkers 用；变参注入，零值 = 端点返回空）
+	// usageSnap codex 额度快照数据源（service 侧回填删除后，调用方
+	// （GetAccountsUsage fan-out）经构造直调适配器；nil = 未装配 → codex
+	// 账号返回 null 快照，不 panic，与旧 nil 回填语义一致）。
+	usageSnap CodexUsageProber
+	// pricingSync 价格手动同步/预览编排面（service 侧回填删除后，
+	// sync/preview 端点经构造直调 worker；nil = 未装配 → 端点 500，不 panic，
+	// 与旧 nil-fetcher 降级语义一致）。
+	pricingSync *pricing.SyncWorker
+	// log fan-out 未知上游错误 Warn（nil = 静默；生产经 OpsOptions 注入）。
+	log *logx.Logger
 	// overview/users-top 聚合面缓存（spec 2026-08-14 TTL：30s/2s——dashboard
 	// 轮询频率下无陈旧感；键含参数、请求时区与本地日界；无 singleflight）。
 	overviewCache *ttlCache
@@ -46,6 +56,9 @@ func New(svc *service.Service, ops ...OpsOptions) *AdminAPI {
 	return &AdminAPI{
 		svc:           svc,
 		ops:           o,
+		usageSnap:     o.UsageSnap,
+		pricingSync:   o.PricingSync,
+		log:           o.Log,
 		overviewCache: newTTLCache(30 * time.Second),
 		usersTopCache: newTTLCache(2 * time.Second),
 		now:           time.Now,
@@ -63,42 +76,6 @@ func (h *AdminAPI) Router() http.Handler {
 		},
 	})
 }
-
-// RoutesMux 兼容保留：cmd/server/main.go 仍以 Handle("/api/admin/*") 挂载，
-// 后续任务改接 Router 后可删除。
-func (h *AdminAPI) RoutesMux() http.Handler {
-	return h.Router()
-}
-
-// decode 严格解码（管理面全部 JSON 入参共用）：未知字段 → 错误（拼错字段名
-// 从 200 静默不生效变 400 显式，与 config ErrorUnused fail-fast 哲学一致——
-// spec 2026-08-17 边界收敛）；二次 Decode 拒尾随数据（io.EOF 才算完）。
-func decode(r *http.Request, v any) error {
-	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
-		return err
-	}
-	if err := dec.Decode(&struct{}{}); err != io.EOF {
-		if err == nil {
-			return errors.New("unexpected trailing data after JSON body")
-		}
-		return err
-	}
-	return nil
-}
-
-// deref 返回指针指向的值；nil 时返回零值。
-func deref[T any](p *T) T {
-	if p == nil {
-		var zero T
-		return zero
-	}
-	return *p
-}
-
-// ptr 返回指向 v 的指针（响应契约字段赋值用）。
-func ptr[T any](v T) *T { return &v }
 
 // normalizeIDs 校验批量 ids 1–100 条且去重（返回去重后列表，条数按去重后计）。
 func normalizeIDs(ids []int64) ([]int64, error) {

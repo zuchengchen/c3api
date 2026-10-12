@@ -17,22 +17,31 @@ import (
 
 // invCall 一次 Invalidator 调用记录。
 type invCall struct {
-	kind string // users / templates / accounts / multipliers
+	kind string // users / templates / accounts / multipliers / settings
 	gids []int64
 	key  bool
 }
 
-// invRecorder 记录 Mark 调用的测试假件（O2 接线矩阵断言：各实体走各自的
+// invRecorder 记录 Mark 调用的测试假件（接线矩阵断言：各实体走各自的
 // 重载方式标记；兼作旧的 "invalidate: func() { invalidated++ }" 计数替代）。
 type invRecorder struct {
 	mu    sync.Mutex
 	calls []invCall
+	// onSettings Settings() mark 时同步回调（顺序不变量断言：回调内读
+	// settings 快照必须已见新值——reloadSettings 先于 inv.Settings）。
+	onSettings func()
 }
 
 func (r *invRecorder) Users()     { r.record("users", nil, false) }
 func (r *invRecorder) Templates() { r.record("templates", nil, false) }
 func (r *invRecorder) Multipliers() {
 	r.record("multipliers", nil, false)
+}
+func (r *invRecorder) Settings() {
+	r.record("settings", nil, false)
+	if r.onSettings != nil {
+		r.onSettings()
+	}
 }
 func (r *invRecorder) Accounts(gids []int64, keyChanged bool) {
 	r.record("accounts", gids, keyChanged)
@@ -74,7 +83,7 @@ func (r *invRecorder) countKind(kind string) int {
 	return n
 }
 
-// --- O2 接线矩阵逐实体断言（评审 M-1） ---
+// --- 接线矩阵逐实体断言 ---
 
 func TestInvalidatorMatrix(t *testing.T) {
 	ctx := context.Background()
@@ -84,7 +93,7 @@ func TestInvalidatorMatrix(t *testing.T) {
 		rec := &invRecorder{}
 		svc := &Service{store: fs, inv: rec, log: nil}
 		u, err := svc.CreateUser(ctx, "u1@example.com", "pw12345678", domain.RoleUser,
-			domain.UserStatusActive, 8, 1000)
+			domain.UserStatusActive, 8, 1000, 0)
 		require.NoError(t, err)
 		require.Equal(t, 1, rec.countKind("users"), "创建用户 → Users()")
 		// patch 形态（条件写）：旧值条件 = 创建快照（MaxConcurrency 8 / Balance 1000）
@@ -95,7 +104,7 @@ func TestInvalidatorMatrix(t *testing.T) {
 			ID: u.ID, Role: &role, Status: &st,
 			MaxConcurrency: &mc, OldMaxConcurrency: &oldMC,
 			Balance: &bal, OldBalance: &oldBal,
-		})
+		}, 0)
 		require.NoError(t, err)
 		require.Equal(t, 2, rec.countKind("users"), "更新用户 → Users()")
 		require.Zero(t, rec.countKind("templates"))
@@ -124,14 +133,15 @@ func TestInvalidatorMatrix(t *testing.T) {
 			SupportedFormats: []domain.RequestFormat{domain.FormatOpenAIChat},
 		})
 		require.NoError(t, err)
-		g1, err := svc.CreateGroup(ctx, "g1", domain.GroupVisibilityPublic, nil, nil)
+		g1, err := svc.CreateGroup(ctx, "g1", "", domain.GroupVisibilityPublic, nil, nil)
 		require.NoError(t, err)
-		g2, err := svc.CreateGroup(ctx, "g2", domain.GroupVisibilityPublic, nil, nil)
+		g2, err := svc.CreateGroup(ctx, "g2", "", domain.GroupVisibilityPublic, nil, nil)
 		require.NoError(t, err)
 
 		// 创建带组：gids = 新建分组；keyChanged=false（新 key 无既有客户端）
-		acc, err := svc.CreateAccount(ctx, &domain.Account{
-			Name: "a1", TemplateID: tpl.ID, UpstreamKey: "sk-1", GroupIDs: &[]int64{g1.ID, g2.ID},
+		acc, err := svc.CreateAccount(ctx, repository.AccountPatch{
+			Name: strPtr("a1"), TemplateID: int64Ptr(tpl.ID), UpstreamKey: strPtr("sk-1"),
+			GroupIDs: &[]int64{g1.ID, g2.ID},
 		})
 		require.NoError(t, err)
 		got := rec.last()
@@ -140,9 +150,9 @@ func TestInvalidatorMatrix(t *testing.T) {
 		require.False(t, got.key)
 
 		// 更新移组 g1→g2：旧组 ∪ 新组都重载；upstream_key 变更 → keyChanged
-		_, err = svc.UpdateAccount(ctx, &domain.Account{
-			ID: acc.ID, Name: "a1", TemplateID: tpl.ID, UpstreamKey: "sk-2", GroupIDs: &[]int64{g2.ID},
-		})
+		_, err = svc.PatchAccount(ctx, acc.ID, repository.AccountPatch{
+			UpstreamKey: strPtr("sk-2"), GroupIDs: &[]int64{g2.ID},
+		}, nil)
 		require.NoError(t, err)
 		got = rec.last()
 		require.Equal(t, "accounts", got.kind)
@@ -170,23 +180,26 @@ func TestInvalidatorMatrix(t *testing.T) {
 			SupportedFormats: []domain.RequestFormat{domain.FormatOpenAIChat},
 		})
 		require.NoError(t, err)
-		g1, err := svc.CreateGroup(ctx, "g1", domain.GroupVisibilityPublic, nil, nil)
+		g1, err := svc.CreateGroup(ctx, "g1", "", domain.GroupVisibilityPublic, nil, nil)
 		require.NoError(t, err)
-		g2, err := svc.CreateGroup(ctx, "g2", domain.GroupVisibilityPublic, nil, nil)
+		g2, err := svc.CreateGroup(ctx, "g2", "", domain.GroupVisibilityPublic, nil, nil)
 		require.NoError(t, err)
-		a1, err := svc.CreateAccount(ctx, &domain.Account{
-			Name: "a1", TemplateID: tpl.ID, UpstreamKey: "sk-1", GroupIDs: &[]int64{g1.ID},
+		a1, err := svc.CreateAccount(ctx, repository.AccountPatch{
+			Name: strPtr("a1"), TemplateID: int64Ptr(tpl.ID), UpstreamKey: strPtr("sk-1"),
+			GroupIDs: &[]int64{g1.ID},
 		})
 		require.NoError(t, err)
-		a2, err := svc.CreateAccount(ctx, &domain.Account{
-			Name: "a2", TemplateID: tpl.ID, UpstreamKey: "sk-1", GroupIDs: &[]int64{g1.ID},
+		a2, err := svc.CreateAccount(ctx, repository.AccountPatch{
+			Name: strPtr("a2"), TemplateID: int64Ptr(tpl.ID), UpstreamKey: strPtr("sk-1"),
+			GroupIDs: &[]int64{g1.ID},
 		})
 		require.NoError(t, err)
 
 		// 批量：两组旧组 g1 + 目标 g2 并集；upstream_key 提供 → keyChanged
 		key := "sk-batch"
-		require.NoError(t, svc.UpdateAccountsBatch(ctx, []int64{a1.ID, a2.ID},
-			repository.AccountPatch{GroupIDs: &[]int64{g2.ID}, UpstreamKey: &key}))
+		_, err = svc.UpdateAccountsBatch(ctx, []int64{a1.ID, a2.ID},
+			repository.AccountPatch{GroupIDs: &[]int64{g2.ID}, UpstreamKey: &key})
+		require.NoError(t, err)
 		got := rec.last()
 		require.Equal(t, "accounts", got.kind)
 		// 旧组（两账号 × g1）+ 目标组 g2 并集（重复由去抖器 map 去重）
@@ -204,7 +217,7 @@ func TestInvalidatorMatrix(t *testing.T) {
 		fs := newFakeStore()
 		rec := &invRecorder{}
 		svc := &Service{store: fs, inv: rec, log: nil}
-		g, err := svc.CreateGroup(ctx, "g", domain.GroupVisibilityPublic, nil, nil)
+		g, err := svc.CreateGroup(ctx, "g", "", domain.GroupVisibilityPublic, nil, nil)
 		require.NoError(t, err)
 		require.Equal(t, 1, rec.countKind("multipliers"), "创建组（倍率设定）→ Multipliers()")
 		_, err = svc.UpdateGroup(ctx, &domain.Group{ID: g.ID, Name: "g", PriceMultiplier: 20000, ProtocolConverts: nil})
@@ -216,14 +229,14 @@ func TestInvalidatorMatrix(t *testing.T) {
 		require.Zero(t, rec.countKind("accounts"))
 	})
 
-	t.Run("组授予 + 用户-组专属倍率 → Multipliers()（T3.5 按组）", func(t *testing.T) {
+	t.Run("组授予 + 用户-组专属倍率 → Multipliers()（按组）", func(t *testing.T) {
 		fs := newFakeStore()
 		rec := &invRecorder{}
 		svc := &Service{store: fs, inv: rec, log: nil}
 		u, err := svc.CreateUser(ctx, "am@example.com", "pw12345678", domain.RoleUser,
-			domain.UserStatusActive, 8, 1000)
+			domain.UserStatusActive, 8, 1000, 0)
 		require.NoError(t, err)
-		g, err := svc.CreateGroup(ctx, "g", domain.GroupVisibilityPublic, nil, nil)
+		g, err := svc.CreateGroup(ctx, "g", "", domain.GroupVisibilityPublic, nil, nil)
 		require.NoError(t, err)
 		before := rec.countKind("multipliers")
 		// 授予 + 设专属倍率（万分数 5000 = ×0.5）→ Multipliers()
@@ -242,11 +255,26 @@ func TestInvalidatorMatrix(t *testing.T) {
 		fs := newFakeStore()
 		rec := &invRecorder{}
 		svc := &Service{store: fs, inv: rec, log: nil}
-		g, err := svc.CreateGroup(ctx, "g", domain.GroupVisibilityPublic, nil, nil)
+		g, err := svc.CreateGroup(ctx, "g", "", domain.GroupVisibilityPublic, nil, nil)
 		require.NoError(t, err)
 		before := rec.total()
 		name := "renamed"
 		require.NoError(t, svc.UpdateGroupsBatch(ctx, []int64{g.ID}, repository.GroupPatch{Name: &name}))
 		require.Equal(t, before, rec.total(), "GroupPatch 无倍率字段 → 不触发失效（矩阵：仅倍率变更走 Multipliers）")
+	})
+
+	t.Run("UpdateSetting → Settings() 且快照先刷新（顺序不变量）", func(t *testing.T) {
+		fs := newFakeStore()
+		rec := &invRecorder{}
+		svc := &Service{store: fs, inv: rec, log: nil}
+		svc.reloadSettings(ctx)
+		require.Equal(t, "true", svc.settingValue("signup_enabled"), "无 DB 行 → 注册表默认 true")
+		var seenAtMark string
+		rec.onSettings = func() { seenAtMark = svc.settingValue("signup_enabled") }
+		_, err := svc.UpdateSetting(ctx, "signup_enabled", "false")
+		require.NoError(t, err)
+		require.Equal(t, 1, rec.countKind("settings"), "UpdateSetting → Settings() 一次")
+		require.Equal(t, "false", seenAtMark, "mark 时新值已入快照（reloadSettings 先于 inv.Settings）")
+		require.Equal(t, 1, rec.total(), "settings 变更不触发其他 Kind")
 	})
 }

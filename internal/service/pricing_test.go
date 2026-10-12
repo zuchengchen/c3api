@@ -18,7 +18,7 @@ import (
 
 func newPricingSvc(t *testing.T, fs *fakeStore) *Service {
 	t.Helper()
-	svc := New(fs, nil, NopInvalidator{}, nil, nil, nil, nil)
+	svc := New(Deps{Store: fs, Scheduler: nil, Invalidate: NopInvalidator{}, Publisher: nil, RuleReload: nil, Auth: nil, Log: nil, EmailCodeStore: testEmailCodes})
 	require.NoError(t, svc.ReloadPricingCtx(context.Background()))
 	return svc
 }
@@ -81,6 +81,58 @@ func TestResolvePricesWithVariant(t *testing.T) {
 	require.Equal(t, int64(150000), *rp.InputPerM)
 }
 
+// TestPricingChangeNotifiesCompiler 是缺陷 B 价格面的回归：定价写面
+// （Upsert/Delete/Variants/手动 sync）是编译道价格输入的唯一变更源——解析
+// 价格真实变化必须通知编译（装配期接 scheduler.RequestCompile）；同值写
+// （解析价格不变）必须静默，否则每次同值 PUT 都驱逐一次全量重编译。
+func TestPricingChangeNotifiesCompiler(t *testing.T) {
+	fs := newFakeStore()
+	var calls int
+	svc := New(Deps{Store: fs, Scheduler: nil, Invalidate: NopInvalidator{}, Publisher: nil, RuleReload: nil, Auth: nil, Log: nil, EmailCodeStore: testEmailCodes, CompileNotify: func() { calls++ }})
+	require.NoError(t, svc.ReloadPricingCtx(context.Background()))
+	ctx := context.Background()
+
+	_, err := svc.UpsertPriceEntry(ctx, &repository.PriceEntryManual{Model: "m", Mode: domain.PriceModeToken, InputPerM: int64Ptr(100), OutputPerM: int64Ptr(200)})
+	require.NoError(t, err)
+	require.Equal(t, 1, calls, "真实价格变化必须通知编译")
+
+	_, err = svc.UpsertPriceEntry(ctx, &repository.PriceEntryManual{Model: "m", Mode: domain.PriceModeToken, InputPerM: int64Ptr(100), OutputPerM: int64Ptr(200)})
+	require.NoError(t, err)
+	require.Equal(t, 1, calls, "同值 PUT（解析价格不变）必须静默")
+
+	_, err = svc.UpsertPriceEntry(ctx, &repository.PriceEntryManual{Model: "m", Mode: domain.PriceModeToken, InputPerM: int64Ptr(300), OutputPerM: int64Ptr(200)})
+	require.NoError(t, err)
+	require.Equal(t, 2, calls, "价格变更必须再次通知编译")
+
+	require.NoError(t, svc.DeletePriceEntry(ctx, "m"))
+	require.Equal(t, 3, calls, "价格删除必须通知编译")
+}
+
+// TestResolvedPricesByModel pins the compile-lane price source: full-snapshot
+// base resolution (tier "", promptTokens 0), tier-scoped variants excluded,
+// and nil before the snapshot is loaded.
+func TestResolvedPricesByModel(t *testing.T) {
+	fs := newFakeStore()
+	svc := New(Deps{Store: fs, Scheduler: nil, Invalidate: NopInvalidator{}, Publisher: nil, RuleReload: nil, Auth: nil, Log: nil, EmailCodeStore: testEmailCodes})
+	require.Nil(t, svc.ResolvedPricesByModel(time.Now()), "unloaded snapshot = nil (compile lane treats as no prices)")
+	_, err := fs.UpsertPriceEntriesFromLiteLLM(context.Background(), []*domain.PriceEntry{
+		{Model: "m", Mode: domain.PriceModeToken, InputPerM: int64Ptr(100000), OutputPerM: int64Ptr(200000), Source: domain.PricingSourceManual},
+	})
+	require.NoError(t, err)
+	_, err = fs.ReplacePriceVariants(context.Background(), "m", []*domain.PriceVariant{
+		{Model: "m", Seq: 1, ServiceTier: strPtr("priority"), SetInputPerM: int64Ptr(150000)},
+	})
+	require.NoError(t, err)
+	require.NoError(t, svc.ReloadPricingCtx(context.Background()))
+
+	prices := svc.ResolvedPricesByModel(time.Now())
+	require.Len(t, prices, 1)
+	rp, ok := prices["m"]
+	require.True(t, ok)
+	require.Equal(t, int64(100000), *rp.InputPerM, "base entry price: tier-scoped variant must not apply")
+	require.Equal(t, int64(200000), *rp.OutputPerM)
+}
+
 func TestReplacePriceVariants_MultBPValidation(t *testing.T) {
 	fs := newFakeStore()
 	svc := newPricingSvc(t, fs)
@@ -122,46 +174,47 @@ func TestReplacePriceVariants_CallSetPricePerCall(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidInput)
 }
 
-func TestSyncPricingGuardsManualVariants(t *testing.T) {
-	fs := newFakeStore()
-	// create manual entry + custom variants for model X
-	_, err := fs.UpsertPriceEntryManual(context.Background(), &repository.PriceEntryManual{Model: "guard-model", Mode: domain.PriceModeToken, InputPerM: int64Ptr(100000), OutputPerM: int64Ptr(200000)})
-	require.NoError(t, err)
-	mult := 5000
-	_, err = fs.ReplacePriceVariants(context.Background(), "guard-model", []*domain.PriceVariant{{Model: "guard-model", Seq: 99, MultBP: &mult}})
-	require.NoError(t, err)
-	// also create a litellm model that should be overwritten
-	_, err = fs.UpsertPriceEntriesFromLiteLLM(context.Background(), []*domain.PriceEntry{{Model: "litellm-model", Mode: domain.PriceModeToken, InputPerM: int64Ptr(100000), OutputPerM: int64Ptr(200000), Source: domain.PricingSourceLitellm}})
-	require.NoError(t, err)
-	svc := newPricingSvc(t, fs)
-	// settings needed for SyncPricingNow
-	_, err = fs.SetSetting(context.Background(), "price_source_url", domain.SettingTypeString, "http://example.com/prices.json")
-	require.NoError(t, err)
-	// fake fetcher emits variants for both models: guard-model's variants should be dropped, litellm-model's should be applied
-	fetcher := &fakePriceFetcher{res: &pricing.FetchResult{
-		PriceEntries: []*domain.PriceEntry{{Model: "guard-model", Mode: domain.PriceModeToken, InputPerM: int64Ptr(999), OutputPerM: int64Ptr(999), Source: domain.PricingSourceLitellm}},
-		Variants: []*domain.PriceVariant{
-			{Model: "guard-model", Seq: 1, MultBP: intPtr(20000)},
-			{Model: "litellm-model", Seq: 1, MultBP: intPtr(30000)},
-		},
-	}}
-	svc.SetPriceFetcher(fetcher)
-	_, err = svc.SyncPricingNow(context.Background())
-	require.NoError(t, err)
-	// guard-model variants must survive (seq 99), not replaced by fetcher's seq 1
-	vars, err := fs.ListPriceVariants(context.Background(), "guard-model")
-	require.NoError(t, err)
-	require.Len(t, vars, 1)
-	require.Equal(t, 99, vars[0].Seq)
-	require.Equal(t, 5000, *vars[0].MultBP)
-	// litellm-model variants should be applied
-	vars2, err := fs.ListPriceVariants(context.Background(), "litellm-model")
-	require.NoError(t, err)
-	require.Len(t, vars2, 1)
-	require.Equal(t, 1, vars2[0].Seq)
-	require.Equal(t, 30000, *vars2[0].MultBP)
-	// entry for guard-model must remain manual (not overwritten)
-	pe, err := fs.GetPriceEntry(context.Background(), "guard-model")
-	require.NoError(t, err)
-	require.Equal(t, domain.PricingSourceManual, pe.Source)
+// TestPricingWritePublishesPricingChange 定价跨实例失效：定价写面经统一
+// 出口 reloadPricingAndNotifyCompiler 发布 Change{Pricing:true}（编译通知装配
+// 与否均发布——跨实例传播不依赖变化检测）；ReloadPricingCtx（启动/FullRefresh
+// 路径）保持 publish-free。
+func TestPricingWritePublishesPricingChange(t *testing.T) {
+	ctx := context.Background()
+	manual := &repository.PriceEntryManual{Model: "m", Mode: domain.PriceModeToken, InputPerM: int64Ptr(100), OutputPerM: int64Ptr(200)}
+
+	t.Run("降级路径（compileNotify nil）仍发布", func(t *testing.T) {
+		svc, _, pr := newPubSvc()
+		_, err := svc.UpsertPriceEntry(ctx, manual)
+		require.NoError(t, err)
+		got := pr.last()
+		require.NotNil(t, got)
+		require.True(t, got.Pricing, "定价写面 → Pricing:true")
+		require.Equal(t, 1, pr.total(), "一次写面一条 NOTIFY")
+	})
+
+	t.Run("装配路径（compileNotify 非 nil）仍发布", func(t *testing.T) {
+		svc, _, pr := newPubSvc()
+		svc.compileNotify = func() {}
+		_, err := svc.UpsertPriceEntry(ctx, manual)
+		require.NoError(t, err)
+		got := pr.last()
+		require.NotNil(t, got)
+		require.True(t, got.Pricing, "装配路径同样发布（不依赖变化检测）")
+	})
+
+	t.Run("DeletePriceEntry 发布", func(t *testing.T) {
+		svc, _, pr := newPubSvc()
+		_, err := svc.UpsertPriceEntry(ctx, manual)
+		require.NoError(t, err)
+		require.NoError(t, svc.DeletePriceEntry(ctx, "m"))
+		got := pr.last()
+		require.NotNil(t, got)
+		require.True(t, got.Pricing, "删除写面 → Pricing:true")
+	})
+
+	t.Run("ReloadPricingCtx 不发布", func(t *testing.T) {
+		svc, _, pr := newPubSvc()
+		require.NoError(t, svc.ReloadPricingCtx(ctx))
+		require.Equal(t, 0, pr.total(), "启动/FullRefresh 路径保持 publish-free")
+	})
 }

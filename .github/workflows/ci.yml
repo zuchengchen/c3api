@@ -21,39 +21,54 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: vet
         run: go vet ./...
+      - name: no static admin token residue
+        # A6（spec 2026-10-09 §4.7）：静态管理 token 机制全量删除；对受跟踪文件
+        # 搜残留（排除 .omo/** 设计叙述；放行 CHANGELOG.md 历史条目；排除本文件自身
+        # ——它含搜索模式的字面量，否则会自匹配导致本步恒失败）。
+        run: |
+          set -euo pipefail
+          hits=$(git ls-files -z | xargs -0 rg -n --no-heading \
+            --glob '!.omo/**' --glob '!CHANGELOG.md' --glob '!.github/workflows/ci.yml' \
+            'ADMIN_TOKEN|adminToken|AdminToken|admin-token|admin\.token' || true)
+          if [ -n "$hits" ]; then
+            echo "$hits"
+            echo "::error::static admin token residue found (see above)"
+            exit 1
+          fi
       - name: build
         run: go build ./...
       - name: test
         env:
           TEST_DATABASE_URL: "postgres://postgres:c3api@localhost:5432/c3api_test?sslmode=disable"
-        # -p 1 包级串行：多包二进制并行 bootstrap 同一 c3api_test 库时，
-        # ent 迁移目录检查会撞上他包的 DROP/重建 → XX000 could-not-open-relation
-        # （定价功能给 internal/service 引入首个 PG 测试后暴露）。
-        run: go test -count=1 -p 1 ./...
+        # scripts/test.sh gives every PG test its own clone of one migrated
+        # template database (CREATE DATABASE ... TEMPLATE), so package test
+        # binaries run concurrently again — the old -p 1 serialisation is gone.
+        # It also gates the no-t.Parallel() discipline.
+        run: scripts/test.sh -count=1
         timeout-minutes: 30
 
   contract-gen:
     name: contract-gen
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: go generate (handler + ent)
         run: go generate ./internal/handler/ ./internal/ent/
       - name: no drift in api.gen.go / ent generated code
-        run: git diff --exit-code -- internal/handler/api.gen.go internal/handler/user/api.gen.go internal/ent
-      - uses: pnpm/action-setup@v4
+        run: git diff --exit-code -- internal/handler/api.gen.go internal/handler/user/api.gen.go internal/handler/supplier/api.gen.go internal/ent
+      - uses: pnpm/action-setup@v6
         with:
           version: 11.20.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm
@@ -71,11 +86,11 @@ jobs:
     name: web
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
         with:
           version: 11.20.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm

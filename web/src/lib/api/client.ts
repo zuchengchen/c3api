@@ -7,13 +7,27 @@
 import type { components } from './schema.d.ts'
 import { userAuth } from '@/lib/auth'
 
-// 类实现（brief 原为 type 别名，但 throw new ApiError(...) 需要运行时值）
+// 类实现（原设计为 type 别名，但 throw new ApiError(...) 需要运行时值）
 export class ApiError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  // 统计窗口拒绝的机读字段（spec §4.4(c)）：服务端在 400 体里把"哪个原因、
+  // 实际读哪套存储、上限/保留期、判定后的生效窗口"一并给出。非统计错误全为
+  // undefined（ErrorResponse 的这六个字段都是可选的）。带上它们的目的地是
+  // "错误位旁显示服务端实际查的窗口"——客户端不猜、不重算。
+  reason?: components['schemas']['ErrorResponse']['reason']
+  effectiveFrom?: string
+  effectiveTo?: string
+  limitSeconds?: number
+  retentionDays?: number
+  constructor(status: number, message: string, detail?: { [K in keyof components['schemas']['ErrorResponse']]?: components['schemas']['ErrorResponse'][K] }) {
     super(message)
     this.status = status
     this.name = 'ApiError'
+    this.reason = detail?.reason
+    this.effectiveFrom = detail?.effective_from
+    this.effectiveTo = detail?.effective_to
+    this.limitSeconds = detail?.limit_seconds
+    this.retentionDays = detail?.retention_days
   }
 }
 
@@ -27,8 +41,8 @@ export interface ListParams {
 }
 export type TemplateListParams = ListParams
 export interface AccountListParams extends ListParams {
-  status?: string
   template_id?: number
+  enabled?: boolean
 }
 export type GroupListParams = ListParams
 
@@ -52,9 +66,12 @@ export interface ErrLogParams extends UsageLogParams {
 // 用户端无 user_id 过滤（服务端强制本人），也无 account_id（用户级契约不含该参数）
 export type MyUsageLogParams = Omit<UsageLogParams, 'user_id' | 'account_id'>
 export type MyErrLogParams = Omit<ErrLogParams, 'user_id' | 'account_id'>
-export interface UserStatParams {
-  from: string
-  to: string
+// 统计窗口恰择一：绝对 from+to，或相对 window（时长串，如 24h/168h）。
+// 用重载而不是「可选 from 再加可选 window」：一个调用点不能类型上同时给出
+// 两者（服务端两态都给是 400 window_ambiguous）。
+type AbsoluteWindow = { from: string; to: string }
+type RelativeWindow = { window: string }
+export type UserStatParams = (AbsoluteWindow | RelativeWindow) & {
   granularity?: 'hour' | 'day'
   model?: string
   timezone?: string
@@ -93,8 +110,8 @@ export class ApiClient {
     const res = await fetch(url, { ...rest, headers })
     if (res.status === 401) throw new ApiUnauthorized()
     if (!res.ok) {
-      const body = await res.json().catch(() => null)
-      throw new ApiError(res.status, (body as { error?: string } | null)?.error ?? `HTTP ${res.status}`)
+      const body = (await res.json().catch(() => null)) as components['schemas']['ErrorResponse'] | null
+      throw new ApiError(res.status, body?.error ?? `HTTP ${res.status}`, body ?? undefined)
     }
     // DELETE /rules/{id} 等返回 204 无 body，不能 res.json()
     if (res.status === 204) return undefined as T
@@ -112,11 +129,20 @@ export class ApiClient {
   // —— 账号 ——
   listAccounts = (p?: AccountListParams) => this.request<components['schemas']['AccountListResponse']>('/accounts', { params: toQuery(p) })
   createAccount = (b: components['schemas']['AccountCreate']) => this.request<components['schemas']['Account']>('/accounts', { method: 'POST', body: JSON.stringify(b) })
-  updateAccount = (id: number, b: components['schemas']['AccountCreate']) => this.request<components['schemas']['Account']>(`/accounts/${id}`, { method: 'PUT', body: JSON.stringify(b) })
+  // 部分更新（三态：缺席 = 不变；可空标量 null = 清空、'' = 400；集合 null = 不变、[] = 清空；
+  // 不可空标量 null = 400）。ifMatch 缺席 = 不做前置条件检查；陈旧 → 412。
+  updateAccount = (id: number, b: components['schemas']['AccountConfigPatch'], ifMatch?: number) =>
+    this.request<components['schemas']['Account']>(`/accounts/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(b),
+      ...(ifMatch != null ? { headers: { 'If-Match': `"${ifMatch}"` } } : {}),
+    })
   deleteAccount = (id: number) => this.request<components['schemas']['DeletedResponse']>(`/accounts/${id}`, { method: 'DELETE' })
   deleteAccountsBatch = (ids: number[]) => this.request<components['schemas']['BatchDeleteResponse']>('/accounts/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) })
-  updateAccountsBatch = (ids: number[], fields: components['schemas']['AccountPatch']) => this.request<components['schemas']['BatchUpdateResponse']>('/accounts/batch-update', { method: 'POST', body: JSON.stringify({ ids, fields }) })
-  resetAccountsCooldown = (ids: number[]) => this.request<components['schemas']['BatchResetCooldownResponse']>('/accounts/batch-reset-cooldown', { method: 'POST', body: JSON.stringify({ ids }) })
+  updateAccountsBatch = (ids: number[], fields: components['schemas']['AccountConfigPatch']) => this.request<components['schemas']['AccountBatchUpdateResponse']>('/accounts/batch-update', { method: 'POST', body: JSON.stringify({ ids, fields }) })
+  // —— 失效恢复（/recover）：清 failed_at/last_error/failure_source；expected_revision 过期 → 409，
+  // 前端须重读账号后重试；响应回显新代际 Account ——
+  recoverAccount = (id: number, b: components['schemas']['AccountRecoverBody']) => this.request<components['schemas']['Account']>(`/accounts/${id}/recover`, { method: 'POST', body: JSON.stringify(b) })
   // —— 分组 ——
   listGroups = (p?: GroupListParams) => this.request<components['schemas']['GroupListResponse']>('/groups', { params: toQuery(p) })
   createGroup = (b: components['schemas']['GroupCreate']) => this.request<components['schemas']['Group']>('/groups', { method: 'POST', body: JSON.stringify(b) })
@@ -127,14 +153,17 @@ export class ApiClient {
   getAccountGroups = (id: number) => this.request<components['schemas']['AccountGroupsResponse']>(`/accounts/${id}/groups`)
   getAccountExt = (id: number) => this.request<components['schemas']['AccountExt']>(`/accounts/${id}/ext`)
   putAccountExt = (id: number, b: components['schemas']['AccountExt']) => this.request<components['schemas']['AccountExt']>(`/accounts/${id}/ext`, { method: 'PUT', body: JSON.stringify(b) })
-  // —— 账号用量聚合（0e77d2a）：批量 ≤100 条；from/to 缺省 = 当天（请求
-  //     timezone 时区当日零点 → now；显式 from/to 绝对时刻直透）。
+  // —— 账号用量聚合：窗口与 from/to 恰择一（无「缺省 = 当天」）。预设发
+  //     window 时长串（服务端自持 now 取整点）；自定义绝对区间发 from+to。
   // codex 账号附带上游额度快照（upstream）；api-key/无凭据账号恒 null。
-  listAccountsUsage = (accountIds: number[], p?: { from?: string; to?: string; timezone?: string }) =>
-    this.request<components['schemas']['AccountsUsageResponse']>('/accounts/usage', {
+  listAccountsUsage(accountIds: number[], p: AbsoluteWindow & { timezone?: string }): Promise<components['schemas']['AccountsUsageResponse']>
+  listAccountsUsage(accountIds: number[], p: RelativeWindow & { timezone?: string }): Promise<components['schemas']['AccountsUsageResponse']>
+  listAccountsUsage(accountIds: number[], p: (AbsoluteWindow | RelativeWindow) & { timezone?: string }) {
+    return this.request<components['schemas']['AccountsUsageResponse']>('/accounts/usage', {
       params: toQuery({ account_ids: accountIds.join(','), ...p }),
     })
-  // —— codex 凭据批量导入（Task B；行级失败归 failed——HTTP 恒 200）——
+  }
+  // —— codex 凭据批量导入（行级失败归 failed——HTTP 恒 200）——
   importCodexOauthAccounts = (b: components['schemas']['CodexOAuthImportBody']) => this.request<components['schemas']['ImportResult']>('/accounts/batch-import-codex-oauth', { method: 'POST', body: JSON.stringify(b) })
   importCodexPatAccounts = (b: components['schemas']['CodexPATImportBody']) => this.request<components['schemas']['ImportResult']>('/accounts/batch-import-codex-pat', { method: 'POST', body: JSON.stringify(b) })
   // —— 规则 ——
@@ -147,17 +176,30 @@ export class ApiClient {
   getUsageLogs = (p: UsageLogParams) => this.request<components['schemas']['LogsResponse']>('/usage_logs', { params: toQuery(p) })
   getErrLogs = (p: ErrLogParams) => this.request<components['schemas']['ErrLogsResponse']>('/err_logs', { params: toQuery(p) })
   // —— 统计 v2（全部可选 `timezone`：浏览器 IANA 名——服务端按该时区聚合桶界；
-  //     top/ttft 无时间分组仅校验；显式 from/to 恒绝对时刻）——
-  getStatsTrend = (p: { from: string; to: string; granularity: 'hour' | 'day'; group_id?: number; model?: string; timezone?: string }) =>
-    this.request<components['schemas']['StatTrendPoint'][]>('/stats/trend', { params: toQuery(p) })
+  //     top 无时间分组、from/to 仍必填，不接受 window）——
+  getStatsTrend(p: AbsoluteWindow & { granularity: 'hour' | 'day'; group_id?: number; model?: string; timezone?: string }): Promise<components['schemas']['StatTrendPoint'][]>
+  getStatsTrend(p: RelativeWindow & { granularity: 'hour' | 'day'; group_id?: number; model?: string; timezone?: string }): Promise<components['schemas']['StatTrendPoint'][]>
+  getStatsTrend(p: (AbsoluteWindow | RelativeWindow) & { granularity: 'hour' | 'day'; group_id?: number; model?: string; timezone?: string }) {
+    return this.request<components['schemas']['StatTrendPoint'][]>('/stats/trend', { params: toQuery(p) })
+  }
   getStatsTop = (p: { from: string; to: string; entity: 'account' | 'user' | 'key'; by: 'cost' | 'requests' | 'tokens'; limit?: number; timezone?: string }) =>
     this.request<components['schemas']['StatTopEntry'][]>('/stats/top', { params: toQuery(p) })
-  getStatsEntityTrend = (p: { entity: 'account' | 'user' | 'key'; id: number; from: string; to: string; granularity: 'hour' | 'day'; model?: string; timezone?: string }) =>
-    this.request<components['schemas']['StatTrendPoint'][]>('/stats/entity-trend', { params: toQuery(p) })
-  getStatsTTFT = (p: { from: string; to: string; entity?: 'account' | 'user' | 'key'; id?: number; model?: string; timezone?: string }) =>
-    this.request<components['schemas']['StatTTFTSummary']>('/stats/ttft', { params: toQuery(p) })
+  getStatsEntityTrend(p: AbsoluteWindow & { entity: 'account' | 'user' | 'key'; id: number; granularity: 'hour' | 'day'; model?: string; timezone?: string }): Promise<components['schemas']['StatTrendPoint'][]>
+  getStatsEntityTrend(p: RelativeWindow & { entity: 'account' | 'user' | 'key'; id: number; granularity: 'hour' | 'day'; model?: string; timezone?: string }): Promise<components['schemas']['StatTrendPoint'][]>
+  getStatsEntityTrend(p: (AbsoluteWindow | RelativeWindow) & { entity: 'account' | 'user' | 'key'; id: number; granularity: 'hour' | 'day'; model?: string; timezone?: string }) {
+    return this.request<components['schemas']['StatTrendPoint'][]>('/stats/entity-trend', { params: toQuery(p) })
+  }
+  getStatsTTFT(p: AbsoluteWindow & { entity?: 'account' | 'user' | 'key'; id?: number; model?: string; timezone?: string }): Promise<components['schemas']['StatTTFTSummary']>
+  getStatsTTFT(p: RelativeWindow & { entity?: 'account' | 'user' | 'key'; id?: number; model?: string; timezone?: string }): Promise<components['schemas']['StatTTFTSummary']>
+  getStatsTTFT(p: (AbsoluteWindow | RelativeWindow) & { entity?: 'account' | 'user' | 'key'; id?: number; model?: string; timezone?: string }) {
+    return this.request<components['schemas']['StatTTFTSummary']>('/stats/ttft', { params: toQuery(p) })
+  }
+  // 统计能力（本部署能查多久）：per-deployment 常量，无参数、只读。选择器裁剪与
+  // TTFT 窗口上限的唯一来源——调用方 staleTime 设为无限（"可按部署缓存"）。
+  getStatsCapabilities = () =>
+    this.request<components['schemas']['StatsCapabilities']>('/stats/capabilities')
   // —— 用户管理 ——
-  listUsers = (p?: { limit?: number; offset?: number; email?: string; sort?: string; order?: 'asc' | 'desc' }) => this.request<components['schemas']['UserListResponse']>('/users', { params: toQuery(p) })
+  listUsers = (p?: { limit?: number; offset?: number; email?: string; role?: components['schemas']['UserRole']; supplier_surface?: boolean; sort?: string; order?: 'asc' | 'desc' }) => this.request<components['schemas']['UserListResponse']>('/users', { params: toQuery(p) })
   createUser = (b: components['schemas']['UserCreate']) => this.request<components['schemas']['User']>('/users', { method: 'POST', body: JSON.stringify(b) })
   updateUser = (id: number, b: components['schemas']['UserUpdate']) => this.request<components['schemas']['User']>(`/users/${id}`, { method: 'PUT', body: JSON.stringify(b) })
   setGroupAssignments = (id: number, b: components['schemas']['GroupAssignmentsBody']) => this.request<components['schemas']['GroupAssignmentsResponse']>(`/groups/${id}/assignments`, { method: 'PUT', body: JSON.stringify(b) })
@@ -193,9 +235,21 @@ export class ApiClient {
   getUsersTop = (p?: { top?: number }) => this.request<components['schemas']['UsersTopResponse']>('/users-top', { params: toQuery(p) })
   // —— 运维观测（/api/admin/ops/workers；管理端专属，契约 ops tag 生成类型）——
   getOpsWorkers = () => this.request<components['schemas']['WorkersResponse']>('/ops/workers')
+  // —— 智能路由观测面（rollup 聚合 + 当前计划投影，只读）——
+  getRoutingFlow = (p: { route: string; from: string; to: string; offset?: number; limit?: number; accounts?: number }) =>
+    this.request<components['schemas']['RoutingFlowResponse']>('/routing/flow', { params: toQuery(p) })
+  getRoutingFrontier = (p: { route: string; from: string; to: string; offset?: number; limit?: number }) =>
+    this.request<components['schemas']['RoutingFrontierResponse']>('/routing/frontier', { params: toQuery(p) })
+  // observed_from/observed_to 成对给出时，routes 只保留半开窗口 [from,to) 内有流量的
+  // 已发布路由（单端 → 服务端 400）。gen:api 只重生 schema.d.ts，故手写 params 须同步。
+  getRoutingPlan = (p?: { search?: string; route?: string; observed_from?: string; observed_to?: string; offset?: number; limit?: number; candidates_offset?: number; candidates_limit?: number }) =>
+    this.request<components['schemas']['RoutingPlanResponse']>('/routing/plan', { params: toQuery(p) })
   // 管理侧临时额度全量分页（/api/admin/temp-balances；/app/users 查看入口消费）
   getAdminTempBalances = (p?: { page?: number; page_size?: number; user_id?: number; sort?: string; order?: 'asc' | 'desc' }) =>
     this.request<components['schemas']['AdminTempBalancesResponse']>('/temp-balances', { params: toQuery(p) })
+  // 某用户余额变动记录（/api/admin/users/{id}/balance-logs；/app/users 查看入口消费）
+  getUsersIdBalanceLogs = (id: number, p?: { limit?: number; offset?: number }) =>
+    this.request<components['schemas']['BalanceLogListResponse']>(`/users/${id}/balance-logs`, { params: toQuery(p) })
   // —— 用户端（userApi 专属；token 用 userAuth）——
   register = (b: components['schemas']['UserAuthRegister']) => this.request<components['schemas']['UserAuthResponse']>('/auth/register', { method: 'POST', body: JSON.stringify(b) })
   login = (b: components['schemas']['UserAuthLogin']) => this.request<components['schemas']['UserAuthResponse']>('/auth/login', { method: 'POST', body: JSON.stringify(b) })
@@ -208,9 +262,19 @@ export class ApiClient {
   rotateUserKey = (id: number) => this.request<components['schemas']['Key']>(`/keys/${id}/rotate`, { method: 'POST' })
   getMyUsageLogs = (p: MyUsageLogParams) => this.request<components['schemas']['UserLogsResponse']>('/usage_logs', { params: toQuery(p) })
   getMyErrLogs = (p: MyErrLogParams) => this.request<components['schemas']['UserErrLogsResponse']>('/err_logs', { params: toQuery(p) })
-  getMyStats = (p: UserStatParams) => this.request<components['schemas']['StatTrendPoint'][]>('/stats', { params: toQuery(p) })
-  getMyStatsTTFT = (p: { from: string; to: string; model?: string; timezone?: string }) =>
-    this.request<components['schemas']['StatTTFTSummary']>('/stats/ttft', { params: toQuery(p) })
+  getMyStats(p: UserStatParams): Promise<components['schemas']['StatTrendPoint'][]>
+  getMyStats(p: UserStatParams) {
+    return this.request<components['schemas']['StatTrendPoint'][]>('/stats', { params: toQuery(p) })
+  }
+  getMyStatsTTFT(p: AbsoluteWindow & { model?: string; timezone?: string }): Promise<components['schemas']['StatTTFTSummary']>
+  getMyStatsTTFT(p: RelativeWindow & { model?: string; timezone?: string }): Promise<components['schemas']['StatTTFTSummary']>
+  getMyStatsTTFT(p: (AbsoluteWindow | RelativeWindow) & { model?: string; timezone?: string }) {
+    return this.request<components['schemas']['StatTTFTSummary']>('/stats/ttft', { params: toQuery(p) })
+  }
+  // 用户面能力变体（同一份服务端投影）：/api/admin/* 只接受 platform_admin
+  // 凭据，普通用户只能走本端点（与 /stats/ttft ↔ /api/user/stats/ttft 同惯例）。
+  getMyStatsCapabilities = () =>
+    this.request<components['schemas']['StatsCapabilities']>('/stats/capabilities')
   redeem = (code: string) => this.request<components['schemas']['RedeemResponse']>('/redemptions', { method: 'POST', body: JSON.stringify({ code }) })
   listUserRedemptions = (p?: { page?: number; page_size?: number; sort?: string; order?: 'asc' | 'desc' }) => this.request<components['schemas']['RedemptionRecordListResponse']>('/redemptions', { params: toQuery(p) })
   getTempBalances = () => this.request<components['schemas']['TempBalancesResponse']>('/temp-balances')
@@ -224,6 +288,37 @@ export class ApiClient {
   sendMailChannelTest = (b: components['schemas']['MailChannelTestRequest']) => this.request<components['schemas']['MailChannelTestResponse']>('/mail/channel-test', { method: 'POST', body: JSON.stringify(b) })
   getMailTemplates = () => this.request<components['schemas']['MailTemplate'][]>('/mail/templates')
   putMailTemplate = (purpose: string, b: components['schemas']['MailTemplateUpdate']) => this.request<components['schemas']['MailTemplate']>(`/mail/templates/${purpose}`, { method: 'PUT', body: JSON.stringify(b) })
+  // —— 供应商面（supplierApi 专属；base '/api/user/supplier'；无 /api/user/supplier 前缀重复）——
+  // overview/earnings/chunks/settlements 为 supplier tag 生成的绝对路径资源；本实例 base
+  // 已含前缀，故此处只发相对片段（与 userApi 的 '/auth/me' 同款惯例）。
+  getSupplierOverview = () => this.request<components['schemas']['SupplierOverview']>('/overview')
+  getSupplierEarnings = (p?: { limit?: number; offset?: number }) => this.request<components['schemas']['SupplierEarningList']>('/earnings', { params: toQuery(p) })
+  getSupplierChunks = (p?: { limit?: number; offset?: number }) => this.request<components['schemas']['SupplierChunkList']>('/chunks', { params: toQuery(p) })
+  getSupplierSettlements = (p?: { limit?: number; offset?: number }) => this.request<components['schemas']['SupplierSettlementList']>('/settlements', { params: toQuery(p) })
+  applySupplierSettlement = (b: components['schemas']['ApplySettlementBody']) => this.request<components['schemas']['SupplierSettlement']>('/settlements', { method: 'POST', body: JSON.stringify(b) })
+  // —— 管理面结算审批（spec 2026-10-09 §6.3；base '/api/admin'）——
+  // 五态 CAS 迁移（approve/reject/claim/confirm-failed/paid）+ 代申请 + 余额列表/PATCH。
+  // 资金命令要求具名 JWT 操作者（I5）：静态 admin token ⇒ 403（服务端强卡，前端不感知）。
+  listAdminSupplierSettlements = (p?: { status?: components['schemas']['SupplierSettlement']['status']; kind?: components['schemas']['SupplierSettlement']['kind']; limit?: number; offset?: number }) =>
+    this.request<components['schemas']['SupplierSettlementList']>('/supplier/settlements', { params: toQuery(p) })
+  approveSettlement = (id: number, b: components['schemas']['SettlementTransitionBody']) => this.request<components['schemas']['SupplierSettlement']>(`/supplier/settlements/${id}/approve`, { method: 'POST', body: JSON.stringify(b) })
+  rejectSettlement = (id: number, b: components['schemas']['SettlementRejectBody']) => this.request<components['schemas']['SupplierSettlement']>(`/supplier/settlements/${id}/reject`, { method: 'POST', body: JSON.stringify(b) })
+  claimSettlement = (id: number, b: components['schemas']['SettlementClaimBody']) => this.request<components['schemas']['SupplierSettlement']>(`/supplier/settlements/${id}/claim`, { method: 'POST', body: JSON.stringify(b) })
+  confirmFailedSettlement = (id: number, b: components['schemas']['SettlementConfirmFailedBody']) => this.request<components['schemas']['SupplierSettlement']>(`/supplier/settlements/${id}/confirm-failed`, { method: 'POST', body: JSON.stringify(b) })
+  paidSettlement = (id: number, b: components['schemas']['SettlementPaidBody']) => this.request<components['schemas']['SupplierSettlement']>(`/supplier/settlements/${id}/paid`, { method: 'POST', body: JSON.stringify(b) })
+  adminRequestSettlement = (b: components['schemas']['AdminRequestSettlementBody']) => this.request<components['schemas']['SupplierSettlement']>('/supplier/settlements/admin-request', { method: 'POST', body: JSON.stringify(b) })
+  listSupplierBalances = (p?: { limit?: number; offset?: number }) => this.request<components['schemas']['SupplierBalanceList']>('/supplier/balances', { params: toQuery(p) })
+  patchSupplierBalance = (uid: number, b: components['schemas']['SupplierBalancePatchBody']) => this.request<components['schemas']['SupplierBalance']>(`/supplier/balances/${uid}`, { method: 'PATCH', body: JSON.stringify(b) })
+  // —— 管理 API key（mk-，spec 2026-10-09 统一化）：仅用户面使用（userApi），路径用**相对**
+  //    `/management-keys`（→ /api/user/management-keys）；key 以 owner 身份鉴权，owner 可见明文
+  //    key_raw（长期可复制）。
+  listManagementKeys = () => this.request<components['schemas']['ManagementKeyListResponse']>('/management-keys')
+  createManagementKey = (name: string) => this.request<components['schemas']['ManagementKey']>('/management-keys', {
+    method: 'POST',
+    body: JSON.stringify({ name } satisfies components['schemas']['ManagementKeyCreate']),
+  })
+  updateManagementKey = (id: number, b: components['schemas']['ManagementKeyUpdate']) => this.request<components['schemas']['ManagementKey']>(`/management-keys/${id}`, { method: 'PUT', body: JSON.stringify(b) })
+  deleteManagementKey = (id: number) => this.request<components['schemas']['DeletedResponse']>(`/management-keys/${id}`, { method: 'DELETE' })
 }
 
 export class ApiUnauthorized extends Error {
@@ -232,3 +327,11 @@ export class ApiUnauthorized extends Error {
 
 // 用户端实例：base '/api/user'，Authorization 走 userAuth（c3api_user_token）。
 export const userApi = new ApiClient(userAuth.getToken, '/api/user')
+
+// 管理端实例：base '/api/admin'（App.tsx 以 `api` 名再导出，保持既有导入点不变）。
+export const adminApi = new ApiClient(userAuth.getToken, '/api/admin')
+
+// 供应商面实例：base '/api/user/supplier'。**与账号页复用同一 ApiClient 类与同一批方法**
+// （listAccounts/createAccount/... 路径相对，切换 base 即切作用域）——这正是 spec
+// 2026-10-09 §6.1「账号页复用 + 只切 BaseURL」的前端落点：不复制页面、不建平行方法集。
+export const supplierApi = new ApiClient(userAuth.getToken, '/api/user/supplier')

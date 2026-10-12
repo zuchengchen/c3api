@@ -4,7 +4,7 @@
 
 package repository_test
 
-// 游标分页性能基准（评审 M1：≥1M 行基准并入正式测试——此前仅 tmp 测量未入库，
+// 游标分页性能基准（≥1M 行基准并入正式测试——此前仅 tmp 测量未入库，
 // 提交内 EXPLAIN 是 1 行分区无 ANALYZE，实测计划与声称的 pkey backward 不符）。
 // 真实 PG（TEST_DATABASE_URL）：当日分区灌 ≥1M 行（INSERT...SELECT 服务端生成，
 // 零客户端往返）→ ANALYZE → 断言 keyset 游标页毫秒级 + 计划形态（pkey Index
@@ -23,9 +23,11 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
+
+	"github.com/is7qin/c3api/internal/testsupport/pgtest"
 )
 
-// pgCursorPerfRows ≥1M 行基准规模（评审 M1 验收线）。
+// pgCursorPerfRows ≥1M 行基准规模（验收线）。
 const pgCursorPerfRows = 1_000_000
 
 // TestPGCursorPerfBounded 游标页性能基准（验收）：1M 行单日分区 + ANALYZE 后
@@ -36,7 +38,7 @@ const pgCursorPerfRows = 1_000_000
 func TestPGCursorPerfBounded(t *testing.T) {
 	_ = newPGRepos(t)
 	ctx := context.Background()
-	pool := pgTestPool(t)
+	pool := pgTestPool(t, pgtest.Clone(t))
 
 	now := time.Now().UTC()
 	today := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC)

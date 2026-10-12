@@ -35,7 +35,8 @@ c3api 处于 **beta**：功能齐全，但破坏性变更自由。
 | **模板与账号管理** | 模型模板、上游账号、分组、凭证，以及按模板的格式/模型白名单 |
 | **管理台** | React 前端内嵌进二进制（`/app`），另有 OpenAPI 契约定义的管理 API（`/api/admin`） |
 | **计费与用量** | 用户余额预检扣费、FEFO 临时额度、litellm 价格同步的按模型计费、按日分区的用量日志与统计——计费默认开启（`config.example.toml` billing.enabled=true） |
-| **规则引擎** | 可自定义的路由、限流与 429/错误退避规则，内置调度器 |
+| **智能路由** | 后台编译器把逐 attempt 的持久质量统计（Wilson 置信成功 + 对数 TTFT）、采购成本倍率、缓存域与运行时健康编译成不可变路由计划（Primary / Explore / Degraded 车道）；稳态保留 1–5% 探索份额持续采样非 Primary 候选；选号 plan-only（无计划外车道，冷启动计划未发布窗口 AI 流量 503），执行预编译计划并做跨账号去重的 replay-safe failover（1–8 次尝试）；请求携带 `prompt_cache_key` / `conversation_id` / `session_id` 时按缓存域软亲和。无手工权重 |
+| **规则引擎** | typed 的 `throttle`（瞬时运行时健康）与 `fail_account`（终态判死）动作，支持计数/比例窗口与响应塑形——取代旧硬编码退避，可经 `/api/admin/rules` 自定义 |
 | **多实例就绪** | 状态全在 PostgreSQL，`NOTIFY` 跨实例失效广播，Redis 心跳实例发现（集群规模自动感知）——水平扩容零配置 |
 | **单二进制** | Go 二进制内嵌前端，非 root 容器镜像，即插即用部署 |
 
@@ -58,7 +59,7 @@ c3api 处于 **beta**：功能齐全，但破坏性变更自由。
 **跑预构建镜像（pull）**——生产推荐：删除 `compose.yml` 里的 `build:` 块后 `up` 直接运行拉取的镜像：
 
 ```bash
-cp .env.example .env        # 填写 AUTH_JWT_SECRET（ADMIN_TOKEN 可选——见下文）
+cp .env.example .env        # 填写 AUTH_JWT_SECRET
 docker compose pull
 docker compose up -d
 ```
@@ -66,7 +67,7 @@ docker compose up -d
 **自建镜像（build）**——compose 本地构建（`image` 与 `build` 并存时 `build` 优先）：
 
 ```bash
-cp .env.example .env        # 填写 AUTH_JWT_SECRET（ADMIN_TOKEN 可选——见下文）
+cp .env.example .env        # 填写 AUTH_JWT_SECRET
 docker compose up -d --build
 ```
 
@@ -80,7 +81,8 @@ docker compose up -d --build
 
 ```bash
 # 0. 注入本地开发密钥（config.toml 留空值；占位符如 change-me 会被 Load 拒绝）
-export C3API_ADMIN_TOKEN=local-admin-token
+# 管理面鉴权：首个注册用户自动成为 platform_admin（bootstrap 后登录即可），
+# 或自签发管理 key（mk- 前缀）。
 export C3API_AUTH_JWT_SECRET=$(openssl rand -hex 16)
 
 # 1. 启动网关（默认 :18080）
@@ -110,12 +112,13 @@ cd web && pnpm install && pnpm run dev
                     │  │ proxy：鉴权 → 门禁 →      │  │
                     │  │         选号 → 转发       │  │
                     │  └──────────┬──────────────┘  │
-                    │   workers：billing / usage /  │
-                    │   errlog / scheduler / notify │
-                    │   retention / stats-agg /     │
-                    │   pricing-sync / rule-engine  │
-                    │   auth-sync / invalidate /    │
-                    │   discovery                   │
+                     │   workers：billing / usage /  │
+                     │   errlog / scheduler / notify │
+                     │   retention / stats-agg /     │
+                     │   pricing-sync / rule-engine  │
+                      │   quality-sync                │
+                      │   auth-sync / invalidate /    │
+                      │   discovery                   │
                     └───────┼───────────────┼──────┘
                             ▼               ▼
                   PostgreSQL 18（状态 + NOTIFY）│
@@ -125,7 +128,7 @@ cd web && pnpm install && pnpm run dev
 
 - **单二进制**：前端经 `go:embed` 内嵌，运行时 = 一个 `server` 进程 + 挂载的配置文件。
 - **网关无状态、状态在 DB**：共享状态全部在 PostgreSQL，实例间经 `c3api_invalidate` 通道 `NOTIFY` 协调；多实例预算分摊基数 N 经 Redis 心跳自动发现——加实例即扩容（无手工设置）。
-- **常驻 worker**：计费扣减、用量/统计落库、错误审计、分区保留、离线聚合、价格同步与规则调度均为长驻 worker，支持优雅停机排空。
+- **常驻 worker**：计费扣减、用量/统计落库、错误审计、分区保留、离线聚合、价格同步、实时质量同步（`quality-sync`）与规则调度均为长驻 worker，支持优雅停机排空；路由计划编译器不是独立 worker，它是 scheduler 内的串行编译道，成功/失败新鲜度经 scheduler 观测面上报。
 
 ## 性能
 
@@ -147,17 +150,16 @@ cd web && pnpm install && pnpm run dev
 
 | 变量 | 说明 |
 |---|---|
-| `C3API_ADMIN_TOKEN` | 管理端 token（可选；留空 = 不启用静态 token 鉴权，`/api/admin` 仅接受 `platform_admin` JWT） |
 | `C3API_AUTH_JWT_SECRET` | 用户鉴权 JWT 密钥（必填；跨重启与多实例须稳定） |
 | `C3API_DB_DSN` | PostgreSQL 连接串 |
 | `C3API_REDIS_ADDR` | Redis 地址（必填；如 `127.0.0.1:6379`——实例发现、短时效验证码等易失状态） |
 
-完整配置项（server / log / admin / auth / db / redis / proxy / upstream / limit / scheduler / usage / billing）见 `config.example.toml`。
+完整配置项（server / log / auth / db / redis / proxy / upstream / limit / scheduler / usage / billing）见 `config.example.toml`。
 
 - **仅全新部署（不适配迁移）**——表结构与配置跨版本不向后兼容：升级即全新创建数据库、从零重核对配置（见上方"状态：Beta"说明）。
 - **纯 env 部署**（如 K8s）：传 `-config ""` 完全跳过配置文件——flag 默认 config.toml，无文件即启动失败。
 - **配置仅启动时读取**，变更需滚动重启（无热更新）。
-- **非法配置启动即报错**（含字段名）：duration/间隔 ≤0 或 <1ms、未知键（拼写错误/已移除旧键）、必填密钥缺失、占位符（change-me、dev-admin-token 等）一律拒绝。
+- **非法配置启动即报错**（含字段名）：duration/间隔 ≤0 或 <1ms、未知键（拼写错误/已移除旧键）、必填密钥缺失、占位符（change-me、dev-jwt-secret-for-local 等）一律拒绝。
 
 ## 部署
 

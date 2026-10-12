@@ -53,14 +53,34 @@ func (w *ErrLogWorker) Stats() any {
 
 // RetentionWorkerStats 分区保留 worker 状态（runOnce 收尾原子写，零新增 DB）。
 type RetentionWorkerStats struct {
-	LastPatrolUnixMs                 int64 `json:"last_patrol_unix_ms"`                  // 最近一次巡检完成时刻（0 = 尚未巡检）
-	LastDroppedLogPartitions         int64 `json:"last_dropped_log_partitions"`          // 最近成功轮 usage_logs DROP 分区数（失败轮保留上轮值）
-	LastDroppedErrLogPartitions      int64 `json:"last_dropped_errlog_partitions"`       // 最近成功轮 err_logs DROP 分区数（失败轮保留上轮值）
-	LastDroppedStatsPartitions       int64 `json:"last_dropped_stats_partitions"`        // 最近成功轮 usage_stats DROP 分区数（失败轮保留上轮值）
-	LastDroppedEntityStatsPartitions int64 `json:"last_dropped_entity_stats_partitions"` // 最近成功轮 usage_entity_stats DROP 分区数（与 stats 同 StatsRetentionDays，失败轮保留上轮值）
-	LogRetentionDays                 int   `json:"log_retention_days"`
-	ErrLogRetentionDays              int   `json:"errlog_retention_days"`
-	StatsRetentionDays               int   `json:"stats_retention_days"`
+	LastPatrolUnixMs                 int64 `json:"last_patrol_unix_ms"`                     // 最近一次巡检完成时刻（0 = 尚未巡检）
+	LastDroppedLogPartitions         int64 `json:"last_dropped_log_partitions"`             // 最近成功轮 usage_logs DROP 分区数（失败轮保留上轮值）
+	LastDroppedErrLogPartitions      int64 `json:"last_dropped_errlog_partitions"`          // 最近成功轮 err_logs DROP 分区数（失败轮保留上轮值）
+	LastDroppedStatsPartitions       int64 `json:"last_dropped_stats_partitions"`           // 最近成功轮 usage_stats DROP 分区数（失败轮保留上轮值）
+	LastDroppedEntityStatsPartitions int64 `json:"last_dropped_entity_stats_partitions"`    // 最近成功轮 usage_entity_stats DROP 分区数（与 stats 同 StatsRetentionDays，失败轮保留上轮值）
+	LastDroppedRoutingQualityParts   int64 `json:"last_dropped_routing_quality_partitions"` // 最近成功轮 routing_quality_fact DROP 分区数（失败轮保留上轮值；0 也可能=无过期分区，是否失败看 Warn 日志）
+	LastDroppedRoutingFlowParts      int64 `json:"last_dropped_routing_flow_partitions"`    // 最近成功轮 routing_flow_fact DROP 分区数（失败轮保留上轮值；口径同上）
+	OldestPartitionUnixMs            int64 `json:"oldest_partition_unix_ms"`                // 路由两张事实表最老分区下界（UnixMilli；0 = 无分区）。早于观测保留 cutoff ⇒ Warn：保留 worker 停摆的兜底观测
+	PartitionCount                   int64 `json:"partition_count"`                         // 路由两张事实表的分区总数（保留 worker 在跑即有界）
+	QualityPartitionCount            int64 `json:"quality_partition_count"`                 // routing_quality_fact 分区数（一表 DROP 失败时聚合只显漂移，此值定位故障表）
+	QualityOldestPartitionUnixMs     int64 `json:"quality_oldest_partition_unix_ms"`        // routing_quality_fact 最老分区下界（UnixMilli；0 = 该表无可解析分区）
+	FlowPartitionCount               int64 `json:"flow_partition_count"`                    // routing_flow_fact 分区数（口径同 quality）
+	FlowOldestPartitionUnixMs        int64 `json:"flow_oldest_partition_unix_ms"`           // routing_flow_fact 最老分区下界（UnixMilli；0 = 该表无可解析分区）
+	SnapshotStateRows                int64 `json:"snapshot_state_rows"`                     // routing_flow_snapshot_state 当前总行数（普通表无分区可 DROP，DELETE 失败即无界增长）
+	UndatedPartitionCount            int64 `json:"undated_partition_count"`                 // 名解析失败的分区数（既不计数也不 DROP，只能人工介入）
+	PartitionStatsStale              bool  `json:"partition_stats_stale"`                   // true = 分区统计查询失败，当前呈现的是上轮过期值（lastPatrol 仍推进）
+	// blocked 持久告警 + 容量处置（spec §3.11）：usage_logs 分区退休屏障挡下的
+	// 分区跨轮保留（阻断未解除即持续出现）；磁盘低于下限 ⇒ 停供应商新流量。
+	LastBlockedLogPartitions        int64                  `json:"last_blocked_log_partitions"` // 最近一轮被屏障挡下的 usage_logs 分区数
+	BlockedAlert                    *RetentionBlockedAlert `json:"blocked_alert,omitempty"`     // 持久被挡分区证据（含首次被挡时刻/最老债权）；nil = 无阻断
+	DiskFreeBytes                   int64                  `json:"disk_free_bytes"`             // 数据盘可用空间（最近采样；探针未装配 = 0）
+	DiskEtaSeconds                  int64                  `json:"disk_eta_seconds"`            // 预计磁盘耗尽秒数（-1 = unknown：探针未装配/无消耗观测）
+	CapacityBlocked                 bool                   `json:"capacity_blocked"`            // true = 可用空间低于下限 ⇒ 停供应商新流量
+	DiskObservedUnixMs              int64                  `json:"disk_observed_unix_ms"`       // 最近一次磁盘采样时刻（0 = 未采样）
+	LogRetentionDays                int                    `json:"log_retention_days"`
+	ErrLogRetentionDays             int                    `json:"errlog_retention_days"`
+	StatsRetentionDays              int                    `json:"stats_retention_days"`
+	RoutingObservationRetentionDays int                    `json:"routing_observation_retention_days"` // 路由观测保留天数（oldest_partition_unix_ms 的 cutoff 解释口径：cutoff = now - 本值）
 }
 
 // Stats 满足 handler.StatsProvider（独立于 worker.Worker 契约；装配链路见 internal/handler/ops.go 文件头）。
@@ -71,8 +91,33 @@ func (w *RetentionWorker) Stats() any {
 		LastDroppedErrLogPartitions:      w.lastDropErrLogs.Load(),
 		LastDroppedStatsPartitions:       w.lastDropStats.Load(),
 		LastDroppedEntityStatsPartitions: w.lastDropEntityStats.Load(),
+		LastDroppedRoutingQualityParts:   w.lastDropRoutingQuality.Load(),
+		LastDroppedRoutingFlowParts:      w.lastDropRoutingFlow.Load(),
+		OldestPartitionUnixMs:            w.oldestPartition.Load(),
+		PartitionCount:                   w.partitionCount.Load(),
+		QualityPartitionCount:            w.qualityPartitionCount.Load(),
+		QualityOldestPartitionUnixMs:     w.qualityOldest.Load(),
+		FlowPartitionCount:               w.flowPartitionCount.Load(),
+		FlowOldestPartitionUnixMs:        w.flowOldest.Load(),
+		SnapshotStateRows:                w.snapshotRows.Load(),
+		UndatedPartitionCount:            w.undatedPartitions.Load(),
+		PartitionStatsStale:              w.statsStale.Load(),
+		LastBlockedLogPartitions:         w.lastBlockedLogs.Load(),
+		BlockedAlert:                     w.blockedAlert(),
+		DiskFreeBytes:                    w.diskFreeBytes.Load(),
+		DiskEtaSeconds:                   w.diskEtaSeconds.Load(),
+		CapacityBlocked:                  w.capacityBlocked.Load(),
+		DiskObservedUnixMs:               w.diskObservedUnixMs.Load(),
 		LogRetentionDays:                 w.cfg.LogRetentionDays,
 		ErrLogRetentionDays:              w.cfg.ErrLogRetentionDays,
 		StatsRetentionDays:               w.cfg.StatsRetentionDays,
+		RoutingObservationRetentionDays:  w.cfg.RoutingObservationRetentionDays,
 	}
+}
+
+// blockedAlert 读持久 blocked 告警状态（锁内取指针；view 创建后不再变更，安全直出）。
+func (w *RetentionWorker) blockedAlert() *RetentionBlockedAlert {
+	w.alertMu.Lock()
+	defer w.alertMu.Unlock()
+	return w.alert
 }

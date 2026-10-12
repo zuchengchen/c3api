@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+package repository
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+
+	"entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/stretchr/testify/require"
+
+	"github.com/is7qin/c3api/internal/domain"
+	"github.com/is7qin/c3api/internal/testsupport/pgtest"
+)
+
+// RED (TestRoutingQualityWindowPlanPG): Q2 must use the fact identity
+// index with no Seq Scan on a seeded multi-candidate fixture, and the Q2 row
+// count stays bounded by the hot-key count. References the production SQL
+// consts directly so plan assertions can never drift from shipped SQL.
+
+type windowPlanNode struct {
+	NodeType     string            `json:"Node Type"`
+	RelationName string            `json:"Relation Name"`
+	IndexName    string            `json:"Index Name"`
+	Plans        []*windowPlanNode `json:"Plans"`
+}
+
+func walkWindowPlan(n *windowPlanNode, visit func(*windowPlanNode)) {
+	if n == nil {
+		return
+	}
+	visit(n)
+	for _, c := range n.Plans {
+		walkWindowPlan(c, visit)
+	}
+}
+
+func TestRoutingQualityWindowPlanPG(t *testing.T) {
+	dsn := pgtest.CloneEmpty(t)
+	ctx := context.Background()
+	pool := pgtest.OpenPool(t, dsn)
+	db := stdlib.OpenDBFromPool(pool)
+	t.Cleanup(func() { _ = db.Close() })
+	repos, err := NewWithPG(ctx, entsql.OpenDB(dialect.Postgres, db), true, pool)
+	require.NoError(t, err)
+
+	m := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, repos.Partitions.EnsureRoutingPartitions(ctx, m))
+	require.NoError(t, repos.Partitions.EnsureRoutingFactPartitions(ctx, m.Add(-25*time.Hour), m.Add(24*time.Hour)))
+
+	// 5000 candidates × 12 rows across ~20h + ANALYZE: the hot set (400)
+	// is selective against the table, mirroring production where the join
+	// must probe the fact identity index instead of seq-scanning the table.
+	const ncand, nhot, nrows = 5000, 400, 12
+	rc := make([]byte, 32)
+	rc[0] = 0xA1
+	qc := make([]byte, 32)
+	qc[0] = 0xB2
+	hotRC, hotFP := make([]string, 0, nhot), make([]string, 0, nhot)
+	batch := &pgx.Batch{}
+	for i := 0; i < ncand; i++ {
+		fp := make([]byte, 32)
+		fp[0] = byte(i)
+		fp[1] = byte(i >> 8)
+		fp[2] = 0xC3
+		if i < nhot {
+			hotRC = append(hotRC, hex.EncodeToString(rc))
+			hotFP = append(hotFP, hex.EncodeToString(fp))
+		}
+		for h := 0; h < nrows; h++ {
+			minute := m.Add(-time.Duration(6+h*110) * time.Minute)
+			batch.Queue(
+				`INSERT INTO routing_quality_fact
+				 (route_class_id, quality_class_id, candidate_fingerprint,
+				  instance_src, bucket_minute, absolute_sequence, attempts, successes, updated_at)
+				 VALUES ($1, $2, $3, 'src-plan', $4, 1, 10, 8, now())`,
+				rc, qc, fp, minute)
+		}
+	}
+	br := pool.SendBatch(ctx, batch)
+	_, err = br.Exec()
+	require.NoError(t, br.Close())
+	_, err = pool.Exec(ctx, `ANALYZE routing_quality_fact`)
+	require.NoError(t, err)
+
+	var planJSON string
+	err = pool.QueryRow(ctx, `EXPLAIN (FORMAT JSON) `+routingQualityWindowBaselineSQL,
+		hotRC, hotFP, m.Add(-24*time.Hour), m.Add(-5*time.Minute), int64(domain.BaselineTruncateAttempts)).Scan(&planJSON)
+	require.NoError(t, err)
+	t.Logf("Q2 plan: %s", planJSON)
+	var plan []struct {
+		Plan *windowPlanNode `json:"Plan"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(planJSON), &plan))
+	require.Len(t, plan, 1)
+	var seqScan, identityIndex bool
+	var indexNames []string
+	// 逐节点计数：A6 要求「必须发布实际节点」，不得只断言「无 Seq Scan」。
+	// 预聚合的**代价形状**（每个 hot 对一次 HashAggregate + 两次 Sort）本身就是
+	// §5 声称的基线窗单价来源（+57%），故它必须被机器断言——否则计划退化成
+	// 「不聚合」时这条用例仍然通过，而结果会静默漂移（见 A4 绊线）。
+	nodeTypes := map[string]int{}
+	walkWindowPlan(plan[0].Plan, func(n *windowPlanNode) {
+		nodeTypes[n.NodeType]++
+		if n.NodeType == "Seq Scan" {
+			seqScan = true
+		}
+		if n.IndexName != "" {
+			indexNames = append(indexNames, n.IndexName)
+		}
+		// Partitioned-table auto index names derive per-partition from the
+		// column list, not the parent name: the plan reports e.g.
+		// routing_quality_fact_20260820_route_class_id_candidate_fing_idx for the
+		// parent identity index routing_quality_fact_uniq (whose canonical name is
+		// pinned by the catalog test). Match table + identity-key leading columns
+		// so the bucket-only index (…_bucket_minute_idx) cannot satisfy it.
+		if strings.Contains(n.IndexName, "routing_quality_fact") && strings.Contains(n.IndexName, "route_class_id_candidate") {
+			identityIndex = true
+		}
+	})
+	require.False(t, seqScan, "Q2 must not seq-scan routing_quality_fact")
+	require.True(t, identityIndex, "Q2 must use the fact identity index, saw %v", indexNames)
+	// 折叠节点的判据是**聚合节点个数 ≥ 2**，不是「存在聚合节点」——外层 GROUP BY 1,2
+	// 无论如何都会产生一个聚合，故「有没有聚合」是空断言（本用例第一版就写错了，
+	// 去掉内层折叠后仍然通过）。实测两种计划的判别点（同一夹具）：
+	//
+	//	生产（含内层折叠）：Sort → Aggregate → Nested Loop →
+	//	    {Function Scan, WindowAgg → Sort → Aggregate → Append → Index Scan×2}
+	//	去掉内层折叠：      Sort → Aggregate → Nested Loop →
+	//	    {Function Scan, WindowAgg → Incremental Sort → Append → Index Scan×2}
+	//
+	// 内层折叠消失后聚合数由 2 变 1，而排序数**不变**（都是 2：Sort×2 vs
+	// Sort×1+Incremental Sort×1）——所以只有聚合计数能抓住这个回归。
+	// 注：PG 的 JSON 计划把聚合统一报 `Aggregate`（策略在 Strategy 字段，如 Hashed），
+	// 而 §5/A6 沿用设计期原型的叫法 `HashAggregate`——同一件事，故三种标签一起计数。
+	aggNodes := nodeTypes["Aggregate"] + nodeTypes["HashAggregate"] + nodeTypes["GroupAggregate"]
+	require.GreaterOrEqual(t, aggNodes, 2,
+		"Q2 必须同时有外层分组聚合与 LATERAL 内层的折叠聚合（预聚合消失则只剩 1 个）；实际节点: %v", nodeTypes)
+	require.Positive(t, nodeTypes["Sort"]+nodeTypes["Incremental Sort"],
+		"Q2 必须出现窗口 ORDER BY 的排序节点；实际节点: %v", nodeTypes)
+
+	// Row-count bound: one row per hot (route, fp) at most.
+	keys := make([]WindowHotKey, 0, nhot)
+	for i := 0; i < nhot; i++ {
+		var rcV domain.RouteClassIDVal
+		copy(rcV[:], rc)
+		fpb, err := hex.DecodeString(hotFP[i])
+		require.NoError(t, err)
+		var fpV domain.CandidateFingerprintVal
+		copy(fpV[:], fpb)
+		keys = append(keys, WindowHotKey{RouteClassID: rcV, Fingerprint: fpV})
+	}
+	got, err := repos.Partitions.QueryBaselineTruncated(ctx, m, keys)
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(got), nhot)
+}

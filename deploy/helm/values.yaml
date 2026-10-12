@@ -1,0 +1,122 @@
+# Default values for c3api.
+# This chart deploys ONLY the c3api application. PostgreSQL and Redis are
+# NOT bundled — you must point the chart at external instances.
+
+replicaCount: 1
+
+# --- Autoscaling (HPA) ---
+# When enabled, the Deployment omits its replica count and the HPA owns scaling.
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+
+image:
+  repository: ghcr.io/is7qin/c3api
+  tag: beta            # production: pin an immutable version, e.g. v1.2.3
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# --- Sensitive material (Secret) ---
+# By default the chart creates a Secret from the values below.
+# Set create=false to reference an externally managed Secret instead.
+secrets:
+  create: true                 # true: render a Secret; false: use existingSecret
+  existingSecret: ""           # keys: auth-jwt-secret (required)
+  jwtSecret: ""                # required (empty -> template `required` fails)
+
+# --- External dependencies (connection info: pick ONE of each pair) ---
+# At least one of dsn/existingSecret (and one of addr/existingSecret) MUST be set,
+# otherwise rendering fails via `required`.
+externalDatabase:
+  dsn: ""                      # full DSN, e.g. postgres://u:p@db:5432/c3api?sslmode=disable
+  existingSecret: ""           # or read the DSN from a Secret (key: db-dsn); takes precedence
+
+externalRedis:
+  addr: ""                     # host:port, e.g. redis:6379
+  existingSecret: ""           # or read the addr from a Secret (key: redis-addr); takes precedence
+
+# --- Application configuration ---
+config:
+  inline: true                 # true: render config.toml into a ConfigMap; false: env-only (-config "")
+  content: |
+    server = { addr = ":18080", time_zone = "" }
+    scheduler = { default_max_concurrency = 8 }
+
+app:
+  port: 18080
+  env:                         # extra container env (key = env var name); empty values are skipped
+    GOGC: ""                   # empty -> not rendered (Go default). Set "off" to disable GC.
+    GOMEMLIMIT: ""             # empty -> not rendered. Plain bytes, e.g. "17179869184".
+    # C3API_SERVER_TIME_ZONE: "Asia/Shanghai"
+    # Note: a key colliding with a built-in C3API_* var above is overridden by it.
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  readOnlyRootFilesystem: true
+  tmpVolume: true              # mount an emptyDir at /tmp (required with a read-only root fs)
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+  probes:
+    startup:
+      enabled: true
+      periodSeconds: 5
+      failureThreshold: 24       # ~120s, covers first-boot bootstrap
+    liveness:
+      enabled: true
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 5
+    readiness:
+      enabled: true
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+  terminationGracePeriodSeconds: 60
+  strategy:
+    maxUnavailable: 0
+    maxSurge: 1
+  revisionHistoryLimit: 3
+  minReadySeconds: 0
+
+service:
+  type: ClusterIP
+  port: 18080
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: c3api.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+podDisruptionBudget:
+  enabled: false               # enabling with replicaCount=1 fails rendering (would block evictions)
+  minAvailable: 1
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""

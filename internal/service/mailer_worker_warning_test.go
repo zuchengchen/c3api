@@ -58,7 +58,7 @@ func TestMailWorker_warning_success_completes_once_with_nil(t *testing.T) {
 		"mail.from_address": "from@example.com",
 		"mail.tls":          "none",
 	})
-	mw := NewMailWorker(svc)
+	mw := newTestMailWorker(svc)
 	recorder := newWarningCompletionRecorder()
 	require.NoError(t, mw.EnqueueBalanceWarning(testWarningEvent(), recorder.complete))
 	require.NoError(t, mw.Start(context.Background()))
@@ -79,7 +79,7 @@ func TestMailWorker_warning_final_failure_completes_once_with_error(t *testing.T
 		"mail.from_address": "from@example.com",
 		"mail.tls":          "none",
 	})
-	mw := NewMailWorker(svc)
+	mw := newTestMailWorker(svc)
 	recorder := newWarningCompletionRecorder()
 	require.NoError(t, mw.EnqueueBalanceWarning(testWarningEvent(), recorder.complete))
 	require.NoError(t, mw.Start(context.Background()))
@@ -91,7 +91,7 @@ func TestMailWorker_warning_final_failure_completes_once_with_error(t *testing.T
 
 func TestMailWorker_selected_warning_cancellation_completes_once(t *testing.T) {
 	useZeroMailBackoff(t)
-	mw := NewMailWorker(newMailService(t, newFakeStore()))
+	mw := newTestMailWorker(newMailService(t, newFakeStore()))
 	selected := make(chan struct{})
 	release := make(chan struct{})
 	mw.testWarningSelected = func() {
@@ -117,7 +117,7 @@ func TestMailWorker_selected_warning_cancellation_completes_once(t *testing.T) {
 }
 
 func TestMailWorker_warning_admission_drop_completes_once(t *testing.T) {
-	mw := NewMailWorker(newMailService(t, newFakeStore()))
+	mw := newTestMailWorker(newMailService(t, newFakeStore()))
 	for range mailWarningQueueCap {
 		require.NoError(t, mw.EnqueueBalanceWarning(testWarningEvent(), nil))
 	}
@@ -134,7 +134,7 @@ func TestMailWorker_warning_admission_drop_completes_once(t *testing.T) {
 }
 
 func TestMailWorker_warning_admission_after_close_completes_once(t *testing.T) {
-	mw := NewMailWorker(newMailService(t, newFakeStore()))
+	mw := newTestMailWorker(newMailService(t, newFakeStore()))
 	require.NoError(t, mw.Close(context.Background()))
 	recorder := newWarningCompletionRecorder()
 
@@ -180,7 +180,7 @@ func TestMailWorker_warning_smtp_cancellation_completes_once(t *testing.T) {
 		"mail.from_address": "from@example.com",
 		"mail.tls":          "none",
 	})
-	mw := NewMailWorker(svc)
+	mw := newTestMailWorker(svc)
 	t.Cleanup(func() { _ = mw.Close(context.Background()) })
 	recorder := newWarningCompletionRecorder()
 	require.NoError(t, mw.EnqueueBalanceWarning(testWarningEvent(), recorder.complete))
@@ -190,16 +190,19 @@ func TestMailWorker_warning_smtp_cancellation_completes_once(t *testing.T) {
 	case <-time.After(time.Second):
 		require.Fail(t, "warning did not enter SMTP")
 	}
-	closeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	require.ErrorIs(t, mw.Close(closeCtx), context.DeadlineExceeded)
-	require.NoError(t, mw.Close(context.Background()))
+	// 停机预算用"预先取消的 ctx"表达，而不是 20ms 定时器：在途 SMTP 被打断要多久由
+	// 调度决定，任何计时窗口都只是给竞态留缝（CI 负载下 Close 会提前返回 nil——
+	// 本测试的原失败模式）。预算已耗尽保证 Close 两条分支（等 senderDone 超时提前
+	// 返回 / 进 drain 立即告错）都收敛到 Canceled，绝不等被卡住的 SMTP 交换收尾。
+	closeCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, mw.Close(closeCtx), context.Canceled)
 	require.ErrorIs(t, recorder.await(t), context.Canceled)
 	require.Equal(t, int64(1), recorder.calls.Load())
 }
 
 func TestMailWorker_drain_timeout_drops_auth_and_completes_warnings_once(t *testing.T) {
-	mw := NewMailWorker(newMailService(t, newFakeStore()))
+	mw := newTestMailWorker(newMailService(t, newFakeStore()))
 	first := newWarningCompletionRecorder()
 	second := newWarningCompletionRecorder()
 	require.NoError(t, mw.Enqueue(MailSendTask{To: "auth@example.com", Purpose: domain.EmailTemplateRegisterCode}))

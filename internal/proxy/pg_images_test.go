@@ -12,7 +12,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +29,7 @@ import (
 	"github.com/is7qin/c3api/internal/repository"
 	"github.com/is7qin/c3api/internal/rule"
 	"github.com/is7qin/c3api/internal/scheduler"
+	"github.com/is7qin/c3api/internal/testsupport/pgtest"
 	"github.com/is7qin/c3api/internal/usage"
 	"github.com/is7qin/c3api/pkg/aiclient"
 )
@@ -39,12 +39,10 @@ import (
 //	TEST_DATABASE_URL=postgres://postgres:c3api@127.0.0.1:15432/c3api_test \
 //	  go test ./internal/proxy/ -run TestPGImages -v
 //
-// 未设置 TEST_DATABASE_URL → t.Skip。独立 schema（proxy_images_test）：与同包
-// 其它 PG 测试并行跑不互踩。断言面：路由集成（spec §7）——api_key /
+// 未设置 TEST_DATABASE_URL → t.Skip。每测试克隆一个私有数据库（pgtest.Clone，
+// 隔离粒度 = database）：与同包其它 PG 测试并行跑不互踩。断言面：路由集成（spec §7）——api_key /
 // responses-special 两类型 × generations/edits 两端点直连、multipart 不撞
 // json.Valid 硬门、402 生死、纯 image 价模型不被 chat 预检误杀。
-
-const imagesPGTestSchema = "proxy_images_test"
 
 // pgImagesUpstream 直连 mock 上游：捕获请求面（路径/鉴权/Content-Type/body），
 // 返回标准 ImageResponse。
@@ -79,29 +77,17 @@ func fakePGImagesUpstream(t *testing.T) (*httptest.Server, *pgImagesUpstream) {
 	return srv, u
 }
 
-// setupImagesPG 打开真实 PG（独立 schema）+ 建模板/组/账号，返回调度器、
+// setupImagesPG 打开真实 PG（每测试克隆库）+ 建模板/组/账号，返回调度器、
 // 两组的组 ID 与上游捕获（模板 BaseURL 指向该上游——断言须读同一捕获）。
 // 两组独立（选号确定性：每组单账号，类型不互抢）。
 func setupImagesPG(t *testing.T) (*scheduler.Scheduler, int64, int64, *pgImagesUpstream) {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping real-PostgreSQL test")
-	}
-	if strings.Contains(dsn, "?") {
-		dsn += "&search_path=" + imagesPGTestSchema
-	} else {
-		dsn += "?search_path=" + imagesPGTestSchema
-	}
+	dsn := pgtest.Clone(t)
 	ctx := context.Background()
-	pool, err := repository.OpenPG(ctx, dsn, 5)
-	require.NoError(t, err)
-	t.Cleanup(pool.Close)
+	pool := pgtest.OpenPool(t, dsn)
 	db := stdlib.OpenDBFromPool(pool)
 	t.Cleanup(func() { _ = db.Close() })
-	_, err = db.ExecContext(ctx, `DROP SCHEMA IF EXISTS `+imagesPGTestSchema+` CASCADE; CREATE SCHEMA `+imagesPGTestSchema+`;`)
-	require.NoError(t, err)
-	repos, err := repository.New(entsql.OpenDB(dialect.Postgres, db), true)
+	repos, err := repository.New(entsql.OpenDB(dialect.Postgres, db), false)
 	require.NoError(t, err)
 
 	upSrv, up := fakePGImagesUpstream(t)
@@ -121,7 +107,7 @@ func setupImagesPG(t *testing.T) (*scheduler.Scheduler, int64, int64, *pgImagesU
 		Models:           []string{"gpt-image-1"},
 		ModelMapping:     domain.ModelMapping{},
 	})
-	require.NoError(t, err, "responses-special 模板声明 openai-images 格式必须可落库（Task B 类型-格式约束扩展）")
+	require.NoError(t, err, "responses-special 模板声明 openai-images 格式必须可落库（类型-格式约束扩展）")
 
 	gAPI, err := repos.Groups.CreateGroup(ctx, &domain.Group{Name: "g-images-api", Visibility: domain.GroupVisibilityPublic})
 	require.NoError(t, err)
@@ -137,18 +123,20 @@ func setupImagesPG(t *testing.T) (*scheduler.Scheduler, int64, int64, *pgImagesU
 	} {
 		acc, err := repos.Accounts.CreateAccount(ctx, &domain.Account{
 			Name: g.name, TemplateID: g.tplID, UpstreamKey: "sk-upstream",
-			Weight: 1, MaxConcurrency: 8,
+			MaxConcurrency: 8, Enabled: true,
 		})
 		require.NoError(t, err)
 		require.NoError(t, repos.Accounts.SetAccountGroups(ctx, acc.ID, []int64{g.groupID}))
 	}
 
-	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil)
+	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil, nil, nil)
 	require.NoError(t, re.Reload(context.Background()))
 	sched := scheduler.New(scheduler.Config{
-		DefaultMaxConcurrency: 4, SyncInterval: time.Hour,
-	}, repos.Groups, re, nil)
+		SyncInterval: time.Hour,
+	}, repos.Groups, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
+	publishTestRoutes(t, sched)
+
 	return sched, gAPI.ID, gSpecial.ID, up
 }
 
@@ -168,7 +156,7 @@ func newPGImagesTestProxy(t *testing.T, sched *scheduler.Scheduler, groupID int6
 	}, noopLogStore{}, nil)
 	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{
 		keyForGroup(groupID): activeKey(1, 1, groupID),
-	}}, noopUserLoader{}, nil, true)
+	}}, noopUserLoader{}, nil, nil, true)
 	require.NoError(t, auth.Reload(context.Background()))
 	hc := &http.Client{Transport: http.DefaultTransport}
 	clients := aiclient.NewFactory(hc, aiclient.Config{
@@ -176,7 +164,7 @@ func newPGImagesTestProxy(t *testing.T, sched *scheduler.Scheduler, groupID int6
 		UpstreamStreamTimeout: 30 * time.Second,
 	})
 	errlogW := usage.NewErrLogWorker(usage.ErrLogConfig{QueueSize: 4096, FlushInterval: time.Hour}, noopErrLogStore{}, nil)
-	return New(cfg, sched, credential.New(), rec, clients, auth, nil, bill, errlogW)
+	return New(cfg, sched, credential.New(), rec, clients, auth, nil, bill, errlogW, Deps{})
 }
 
 func keyForGroup(groupID int64) string { return "ck-" + strconv.FormatInt(groupID, 10) }

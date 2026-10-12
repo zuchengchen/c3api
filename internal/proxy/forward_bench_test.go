@@ -22,7 +22,7 @@ import (
 	"github.com/is7qin/c3api/pkg/aiclient"
 )
 
-// 转发热路径基准（Task 3）：完整 Proxy + fake 上游 + 固定 body，流式/非流式
+// 转发热路径基准：完整 Proxy + fake 上游 + 固定 body，流式/非流式
 // 各一。经 AIRouter 走生产分发路径（main 上 = HandleXxx，分支上 = handleFormat），
 // 与 main 基线对比 alloc/op 零增长是硬标准。
 // 基准文件随分支提交；main 基线用临时 worktree 跑同一文件（比 stash 安全）。
@@ -64,8 +64,8 @@ func benchUpstream() *httptest.Server {
 	}))
 }
 
-// benchProxy 构造完整 Proxy（与 newTestProxyTplTimeoutLogs 同构；bench 内无 *testing.T）。
-func benchProxy(upstream string) *Proxy {
+// benchProxy 构造完整 Proxy（与 newTestProxyTplTimeoutLogs 同构；tb 供测试车道发布）。
+func benchProxy(tb testing.TB, upstream string) *Proxy {
 	tpl := &domain.Template{
 		ID: 1, Name: "t", BaseURL: upstream,
 		CredentialType:   credential.TypeAPIKey,
@@ -73,7 +73,7 @@ func benchProxy(upstream string) *Proxy {
 	}
 	accs := map[int64][]*domain.Account{10: {{
 		ID: 1, TemplateID: 1, Template: tpl, UpstreamKey: "sk-upstream",
-		Status: domain.StatusActive, Weight: 100, MaxConcurrency: 4,
+		Enabled: true, LifecycleRevision: 1, IdentityRevision: 1, MaxConcurrency: 4,
 	}}}
 	cfg := Config{
 		MaxBodySize: 1 << 20, FailoverAttempts: 2,
@@ -81,21 +81,22 @@ func benchProxy(upstream string) *Proxy {
 		UpstreamStreamTimeout: 30 * time.Second,
 		UsageCapture:          true,
 	}
-	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil)
+	re := rule.New(rule.Config{}, &fakeRuleStore{rules: map[int64]domain.Rule{}, next: 1}, nil, nil, nil)
 	if err := re.Reload(context.Background()); err != nil {
 		panic(err)
 	}
-	sched := scheduler.New(scheduler.Config{DefaultMaxConcurrency: 4, SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil)
+	sched := scheduler.New(scheduler.Config{SyncInterval: time.Hour}, noopLoader{accs: accs}, re, nil, nil, nil, nil)
 	if err := sched.InvalidateAllSync(); err != nil {
 		panic(err)
 	}
+	publishTestRoutes(tb, sched)
 	rec := usage.New(usage.UsageConfig{
 		BatchSize: 100, FlushInterval: time.Hour,
 		QuotaFlushInterval: time.Hour,
 	}, noopLogStore{}, nil)
 	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{
 		"ck-1": activeKey(1, 1, 10),
-	}}, noopUserLoader{}, nil, true)
+	}}, noopUserLoader{}, nil, nil, true)
 	if err := auth.Reload(context.Background()); err != nil { // 构造不再自载——显式首刷（快照注册表单一入口）
 		panic(err)
 	}
@@ -103,13 +104,13 @@ func benchProxy(upstream string) *Proxy {
 	clients := aiclient.NewFactory(hc, aiclient.Config{
 		UpstreamTimeout: 5 * time.Second, UpstreamStreamTimeout: 30 * time.Second,
 	})
-	return New(cfg, sched, credential.New(), rec, clients, auth, nil, nil, nil)
+	return New(cfg, sched, credential.New(), rec, clients, auth, nil, nil, nil, Deps{})
 }
 
 func benchForwardChat(b *testing.B, streaming bool) {
 	up := benchUpstream()
 	defer up.Close()
-	p := benchProxy(up.URL)
+	p := benchProxy(b, up.URL)
 	r := AIRouter(p)
 	stream := "false"
 	if streaming {

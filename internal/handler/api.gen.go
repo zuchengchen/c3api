@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/oapi-codegen/nullable"
 	"github.com/oapi-codegen/runtime"
 	openapi_types "github.com/oapi-codegen/runtime/types"
 )
@@ -19,26 +20,36 @@ const (
 	AccountExtCredentialTypeCodexPat   AccountExtCredentialType = "codex-pat"
 )
 
-// Defines values for AccountPatchStatus.
-const (
-	AccountPatchStatusActive    AccountPatchStatus = "active"
-	AccountPatchStatusDisabled  AccountPatchStatus = "disabled"
-	AccountPatchStatusN429      AccountPatchStatus = "429"
-	AccountPatchStatusUnhealthy AccountPatchStatus = "unhealthy"
-)
-
-// Defines values for AccountStatus.
-const (
-	AccountStatusActive    AccountStatus = "active"
-	AccountStatusDisabled  AccountStatus = "disabled"
-	AccountStatusN429      AccountStatus = "429"
-	AccountStatusUnhealthy AccountStatus = "unhealthy"
-)
-
 // Defines values for AccountUsageItemUpstreamError.
 const (
 	AuthExpired         AccountUsageItemUpstreamError = "auth_expired"
 	UpstreamUnavailable AccountUsageItemUpstreamError = "upstream_unavailable"
+)
+
+// Defines values for BalanceLogSource.
+const (
+	AdminAdjust   BalanceLogSource = "admin_adjust"
+	AdminCreate   BalanceLogSource = "admin_create"
+	Redemption    BalanceLogSource = "redemption"
+	SignupDefault BalanceLogSource = "signup_default"
+)
+
+// Defines values for ErrorResponseReason.
+const (
+	CubeHorizon     ErrorResponseReason = "cube_horizon"
+	Dst             ErrorResponseReason = "dst"
+	Offset          ErrorResponseReason = "offset"
+	RawHorizon      ErrorResponseReason = "raw_horizon"
+	SpanBelowGrid   ErrorResponseReason = "span_below_grid"
+	WindowAmbiguous ErrorResponseReason = "window_ambiguous"
+	WindowInvalid   ErrorResponseReason = "window_invalid"
+	WindowTooLong   ErrorResponseReason = "window_too_long"
+)
+
+// Defines values for ErrorResponseStorage.
+const (
+	ErrorResponseStorageCube ErrorResponseStorage = "cube"
+	ErrorResponseStorageRaw  ErrorResponseStorage = "raw"
 )
 
 // Defines values for ErrorType.
@@ -190,6 +201,27 @@ const (
 	StatTopEntryEntityTypeUser    StatTopEntryEntityType = "user"
 )
 
+// Defines values for StatsKindCapabilityStorages.
+const (
+	StatsKindCapabilityStoragesCube StatsKindCapabilityStorages = "cube"
+	StatsKindCapabilityStoragesRaw  StatsKindCapabilityStorages = "raw"
+)
+
+// Defines values for SupplierSettlementKind.
+const (
+	SupplierSettlementKindAdminRequest    SupplierSettlementKind = "admin_request"
+	SupplierSettlementKindSupplierRequest SupplierSettlementKind = "supplier_request"
+)
+
+// Defines values for SupplierSettlementStatus.
+const (
+	SupplierSettlementStatusApproved SupplierSettlementStatus = "approved"
+	SupplierSettlementStatusPaid     SupplierSettlementStatus = "paid"
+	SupplierSettlementStatusPaying   SupplierSettlementStatus = "paying"
+	SupplierSettlementStatusPending  SupplierSettlementStatus = "pending"
+	SupplierSettlementStatusRejected SupplierSettlementStatus = "rejected"
+)
+
 // Defines values for TemplateCredentialType.
 const (
 	TemplateCredentialTypeApiKey           TemplateCredentialType = "api_key"
@@ -246,6 +278,7 @@ const (
 // Defines values for UserRole.
 const (
 	UserRolePlatformAdmin UserRole = "platform_admin"
+	UserRoleSupplier      UserRole = "supplier"
 	UserRoleUser          UserRole = "user"
 )
 
@@ -253,6 +286,12 @@ const (
 const (
 	UserStatusActive   UserStatus = "active"
 	UserStatusDisabled UserStatus = "disabled"
+)
+
+// Defines values for ListOrder.
+const (
+	ListOrderAsc  ListOrder = "asc"
+	ListOrderDesc ListOrder = "desc"
 )
 
 // Defines values for GetAccountsParamsOrder.
@@ -351,6 +390,21 @@ const (
 	GetStatsTTFTParamsEntityUser    GetStatsTTFTParamsEntity = "user"
 )
 
+// Defines values for GetAdminSupplierSettlementsParamsStatus.
+const (
+	GetAdminSupplierSettlementsParamsStatusApproved GetAdminSupplierSettlementsParamsStatus = "approved"
+	GetAdminSupplierSettlementsParamsStatusPaid     GetAdminSupplierSettlementsParamsStatus = "paid"
+	GetAdminSupplierSettlementsParamsStatusPaying   GetAdminSupplierSettlementsParamsStatus = "paying"
+	GetAdminSupplierSettlementsParamsStatusPending  GetAdminSupplierSettlementsParamsStatus = "pending"
+	GetAdminSupplierSettlementsParamsStatusRejected GetAdminSupplierSettlementsParamsStatus = "rejected"
+)
+
+// Defines values for GetAdminSupplierSettlementsParamsKind.
+const (
+	GetAdminSupplierSettlementsParamsKindAdminRequest    GetAdminSupplierSettlementsParamsKind = "admin_request"
+	GetAdminSupplierSettlementsParamsKindSupplierRequest GetAdminSupplierSettlementsParamsKind = "supplier_request"
+)
+
 // Defines values for GetTempBalancesParamsOrder.
 const (
 	GetTempBalancesParamsOrderAsc  GetTempBalancesParamsOrder = "asc"
@@ -365,56 +419,94 @@ const (
 
 // Defines values for GetUsersParamsOrder.
 const (
-	GetUsersParamsOrderAsc  GetUsersParamsOrder = "asc"
-	GetUsersParamsOrderDesc GetUsersParamsOrder = "desc"
+	Asc  GetUsersParamsOrder = "asc"
+	Desc GetUsersParamsOrder = "desc"
+)
+
+// Defines values for GetUsersParamsRole.
+const (
+	GetUsersParamsRolePlatformAdmin GetUsersParamsRole = "platform_admin"
+	GetUsersParamsRoleSupplier      GetUsersParamsRole = "supplier"
+	GetUsersParamsRoleUser          GetUsersParamsRole = "user"
 )
 
 // Account defines model for Account.
 type Account struct {
 	// BaseURL credential-type conditional: if template is codex-oauth/codex-pat must be null (non-empty forbidden); if api_key/responses-special non-empty overrides template
-	BaseURL       *string    `json:"BaseURL"`
-	CooldownUntil *time.Time `json:"CooldownUntil"`
-	CreatedAt     *time.Time `json:"CreatedAt,omitempty"`
+	BaseURL *string `json:"BaseURL"`
+
+	// CacheDomain 共享缓存域（null = 账号私有域；软亲和一致性哈希的域标识；写面 PATCH /accounts/{id} 的 cache_domain 字段）
+	CacheDomain *string    `json:"CacheDomain"`
+	CreatedAt   *time.Time `json:"CreatedAt,omitempty"`
 
 	// DeletedAt 软删除时间戳；null = 存活（列表过滤已删；GET 单个可查已删项）
-	DeletedAt      *time.Time     `json:"DeletedAt"`
-	ID             *int64         `json:"ID,omitempty"`
-	LastError      *string        `json:"LastError"`
-	LastUsedAt     *time.Time     `json:"LastUsedAt"`
-	MaxConcurrency *int           `json:"MaxConcurrency,omitempty"`
-	Name           *string        `json:"Name,omitempty"`
-	Status         *AccountStatus `json:"Status,omitempty"`
-	Template       *Template      `json:"Template,omitempty"`
-	TemplateID     *int64         `json:"TemplateID,omitempty"`
-	UpdatedAt      *time.Time     `json:"UpdatedAt,omitempty"`
-	UpstreamKey    *string        `json:"UpstreamKey,omitempty"`
-	Weight         *int           `json:"Weight,omitempty"`
+	DeletedAt *time.Time `json:"DeletedAt"`
+
+	// Enabled 管理面启停（写面 PATCH /accounts/{id} 的 enabled 字段；与运行时失效语义分离）
+	Enabled *bool `json:"Enabled,omitempty"`
+
+	// FailedAt 运行时失效时刻（rule 判死/SDK fatal；null = 未失效；恢复唯一入口 POST /accounts/{id}/recover）
+	FailedAt *time.Time `json:"FailedAt"`
+
+	// FailureSource 失效来源（rule/sdk 等；随 recover 清除）
+	FailureSource *string `json:"FailureSource"`
+	ID            *int64  `json:"ID,omitempty"`
+
+	// IdentityRevision 身份代际 K：仅身份类字段（template_id/base_url/upstream_key 及可轮换凭据）按值变更时 +1；SDK 自动 token 刷新不推进
+	IdentityRevision *int64     `json:"IdentityRevision,omitempty"`
+	LastError        *string    `json:"LastError"`
+	LastUsedAt       *time.Time `json:"LastUsedAt"`
+
+	// LifecycleRevision 配置代际 C（客户端 CAS 令牌 + DB 变更水位）：每次写面落库无条件 +1；PATCH 以 If-Match 作前置条件（陈旧 → 412），recover 以 body expected_revision（陈旧 → 409）
+	LifecycleRevision *int64     `json:"LifecycleRevision,omitempty"`
+	MaxConcurrency    *int       `json:"MaxConcurrency,omitempty"`
+	Name              *string    `json:"Name,omitempty"`
+	Template          *Template  `json:"Template,omitempty"`
+	TemplateID        *int64     `json:"TemplateID,omitempty"`
+	UpdatedAt         *time.Time `json:"UpdatedAt,omitempty"`
+
+	// UpstreamCostMultiplier 采购成本倍率（正常值，1 = ×1，0 = 免费，上限 10 = ×10；API 边界与 basis points 换算——存储 25000 ↔ 显示 2.5；写面 PATCH /accounts/{id} 的 upstream_cost_multiplier 字段）
+	UpstreamCostMultiplier *float64 `json:"UpstreamCostMultiplier,omitempty"`
+	UpstreamKey            *string  `json:"UpstreamKey,omitempty"`
+
+	// SupplierUserId 供应商归属（null = 平台自有；非空 = 归属该 supplier uid；只读回显，写面 PATCH /accounts/{id} 的 supplier_user_id）
+	SupplierUserId *int64 `json:"supplier_user_id"`
 }
 
-// AccountCreate defines model for AccountCreate.
-type AccountCreate struct {
-	// BaseUrl credential-type conditional: if template is codex-oauth/codex-pat must be empty/null (non-empty forbidden, inherits SDK default); if api_key/responses-special non-empty overrides template base_url, null/empty inherits template
-	BaseUrl        *string        `json:"base_url"`
-	GroupIds       *[]int64       `json:"group_ids,omitempty"`
-	MaxConcurrency *int           `json:"max_concurrency,omitempty"`
-	Name           string         `json:"name"`
-	Status         *AccountStatus `json:"status,omitempty"`
-	TemplateId     int64          `json:"template_id"`
-	UpstreamKey    string         `json:"upstream_key"`
-	Weight         *int           `json:"weight,omitempty"`
+// AccountBatchUpdateResponse 账号批量更新响应（独立 schema——不与 templates/groups 共用的 BatchUpdateResponse 合并）
+type AccountBatchUpdateResponse struct {
+	Items   []AccountRevision `json:"items"`
+	Updated int               `json:"updated"`
 }
+
+// AccountConfigPatch 账号写面唯一字段模型（创建 / PATCH / 批量共用）。三态：字段缺席 = 不变（永不清空）； 可空标量 null = 清空；集合 null = 不变、[] = 清空；不可空标量 null = 400； 可空标量 "" = 400（空串哨兵已取消——清空只有一个拼法 null）。
+type AccountConfigPatch struct {
+	BaseUrl                nullable.Nullable[string]  `json:"base_url,omitempty"`
+	CacheDomain            nullable.Nullable[string]  `json:"cache_domain,omitempty"`
+	Enabled                nullable.Nullable[bool]    `json:"enabled,omitempty"`
+	GroupIds               *[]int64                   `json:"group_ids,omitempty"`
+	MaxConcurrency         nullable.Nullable[int]     `json:"max_concurrency,omitempty"`
+	Name                   nullable.Nullable[string]  `json:"name,omitempty"`
+	SupplierUserId         nullable.Nullable[int64]   `json:"supplier_user_id,omitempty"`
+	TemplateId             nullable.Nullable[int64]   `json:"template_id,omitempty"`
+	UpstreamCostMultiplier nullable.Nullable[float64] `json:"upstream_cost_multiplier,omitempty"`
+	UpstreamKey            nullable.Nullable[string]  `json:"upstream_key,omitempty"`
+}
+
+// AccountCreate 账号写面唯一字段模型（创建 / PATCH / 批量共用）。三态：字段缺席 = 不变（永不清空）； 可空标量 null = 清空；集合 null = 不变、[] = 清空；不可空标量 null = 400； 可空标量 "" = 400（空串哨兵已取消——清空只有一个拼法 null）。
+type AccountCreate = AccountConfigPatch
 
 // AccountExt defines model for AccountExt.
 type AccountExt struct {
 	AccountId *int64 `json:"account_id,omitempty"`
 
-	// CodexAccountId 上游账号/空间标识（Task B 导入必填；本 task 仅声明）
+	// CodexAccountId 上游账号/空间标识；可留空——导入/单账号保存时自动识别（OAuth token claims 离线解析 / PAT whoami 查询）；识别失败：导入行拒绝、单账号保存留空且下次保存重试
 	CodexAccountId *string `json:"codex_account_id"`
 
-	// CodexEmail 管理标识：codex 账号登录邮箱（导入时由人工/上游提供，非自动生成——NewCodexIdentity 只生成身份四元组；可空）
+	// CodexEmail 管理标识：codex 账号登录邮箱（导入时由人工/上游提供，非自动生成——NewCodexIdentity 只生成 installation_id；可空）
 	CodexEmail *string `json:"codex_email"`
 
-	// CodexIdentity codex 账号身份四元组（account_ext.codex_identity jsonb 契约形态；对象字段请求语义：null 与空串同 = 未提供）
+	// CodexIdentity codex 账号持久身份（account_ext.codex_identity jsonb 契约形态；对象字段请求语义：null 与空串同 = 未提供）。仅 installation_id——会话级 session/thread/window 已退役为运行时槽状态，不再持久化/暴露。
 	CodexIdentity *CodexIdentity `json:"codex_identity,omitempty"`
 
 	// CodexOauthExpiresAt 凭据：oauth 访问令牌过期时间
@@ -447,24 +539,17 @@ type AccountListResponse struct {
 	Total int64         `json:"total"`
 }
 
-// AccountPatch defines model for AccountPatch.
-type AccountPatch struct {
-	// BaseUrl credential-type conditional batch: if any effective target is codex-oauth/codex-pat must be empty/null (non-empty forbidden); otherwise batch tristate: empty string=clear to inherit, null/omitted=unchanged, non-empty=override
-	BaseUrl        *string             `json:"base_url"`
-	GroupIds       *[]int64            `json:"group_ids,omitempty"`
-	MaxConcurrency *int                `json:"max_concurrency,omitempty"`
-	Name           *string             `json:"name,omitempty"`
-	Status         *AccountPatchStatus `json:"status,omitempty"`
-	TemplateId     *int64              `json:"template_id,omitempty"`
-	UpstreamKey    *string             `json:"upstream_key,omitempty"`
-	Weight         *int                `json:"weight,omitempty"`
+// AccountRecoverBody defines model for AccountRecoverBody.
+type AccountRecoverBody struct {
+	// ExpectedRevision CAS 期望代际（= 读到的 LifecycleRevision）；过期 → 409
+	ExpectedRevision int64 `json:"expected_revision"`
 }
 
-// AccountPatchStatus defines model for AccountPatch.Status.
-type AccountPatchStatus string
-
-// AccountStatus defines model for AccountStatus.
-type AccountStatus string
+// AccountRevision 单账号更新后的配置代际（C = 客户端 CAS 令牌；与路由观测面的 identity_revision 不同）
+type AccountRevision struct {
+	AccountId         int64 `json:"account_id"`
+	LifecycleRevision int64 `json:"lifecycle_revision"`
+}
 
 // AccountUsageItem 账号 usage 视图 item（恒 = account_ids 去重后全量；upstream 为 codex 额度快照，api-key/无凭据账号恒 null）
 type AccountUsageItem struct {
@@ -484,26 +569,47 @@ type AccountUsageItemUpstreamError string
 // AccountView defines model for AccountView.
 type AccountView struct {
 	// BaseURL credential-type conditional: if template is codex-oauth/codex-pat must be null (non-empty forbidden); if api_key/responses-special non-empty overrides template
-	BaseURL       *string    `json:"BaseURL"`
-	CooldownUntil *time.Time `json:"CooldownUntil"`
-	CreatedAt     *time.Time `json:"CreatedAt,omitempty"`
+	BaseURL *string `json:"BaseURL"`
+
+	// CacheDomain 共享缓存域（null = 账号私有域；软亲和一致性哈希的域标识；写面 PATCH /accounts/{id} 的 cache_domain 字段）
+	CacheDomain *string    `json:"CacheDomain"`
+	CreatedAt   *time.Time `json:"CreatedAt,omitempty"`
 
 	// DeletedAt 软删除时间戳；null = 存活（列表过滤已删；GET 单个可查已删项）
-	DeletedAt      *time.Time     `json:"DeletedAt"`
-	ID             *int64         `json:"ID,omitempty"`
-	LastError      *string        `json:"LastError"`
-	LastUsedAt     *time.Time     `json:"LastUsedAt"`
-	MaxConcurrency *int           `json:"MaxConcurrency,omitempty"`
-	Name           *string        `json:"Name,omitempty"`
-	Status         *AccountStatus `json:"Status,omitempty"`
-	Template       *Template      `json:"Template,omitempty"`
-	TemplateID     *int64         `json:"TemplateID,omitempty"`
-	UpdatedAt      *time.Time     `json:"UpdatedAt,omitempty"`
-	UpstreamKey    *string        `json:"UpstreamKey,omitempty"`
-	Weight         *int           `json:"Weight,omitempty"`
-	Concurrency    *int64         `json:"concurrency,omitempty"`
-	ErrCount       *int           `json:"err_count,omitempty"`
-	ErrRate        *float64       `json:"err_rate,omitempty"`
+	DeletedAt *time.Time `json:"DeletedAt"`
+
+	// Enabled 管理面启停（写面 PATCH /accounts/{id} 的 enabled 字段；与运行时失效语义分离）
+	Enabled *bool `json:"Enabled,omitempty"`
+
+	// FailedAt 运行时失效时刻（rule 判死/SDK fatal；null = 未失效；恢复唯一入口 POST /accounts/{id}/recover）
+	FailedAt *time.Time `json:"FailedAt"`
+
+	// FailureSource 失效来源（rule/sdk 等；随 recover 清除）
+	FailureSource *string `json:"FailureSource"`
+	ID            *int64  `json:"ID,omitempty"`
+
+	// IdentityRevision 身份代际 K：仅身份类字段（template_id/base_url/upstream_key 及可轮换凭据）按值变更时 +1；SDK 自动 token 刷新不推进
+	IdentityRevision *int64     `json:"IdentityRevision,omitempty"`
+	LastError        *string    `json:"LastError"`
+	LastUsedAt       *time.Time `json:"LastUsedAt"`
+
+	// LifecycleRevision 配置代际 C（客户端 CAS 令牌 + DB 变更水位）：每次写面落库无条件 +1；PATCH 以 If-Match 作前置条件（陈旧 → 412），recover 以 body expected_revision（陈旧 → 409）
+	LifecycleRevision *int64     `json:"LifecycleRevision,omitempty"`
+	MaxConcurrency    *int       `json:"MaxConcurrency,omitempty"`
+	Name              *string    `json:"Name,omitempty"`
+	Template          *Template  `json:"Template,omitempty"`
+	TemplateID        *int64     `json:"TemplateID,omitempty"`
+	UpdatedAt         *time.Time `json:"UpdatedAt,omitempty"`
+
+	// UpstreamCostMultiplier 采购成本倍率（正常值，1 = ×1，0 = 免费，上限 10 = ×10；API 边界与 basis points 换算——存储 25000 ↔ 显示 2.5；写面 PATCH /accounts/{id} 的 upstream_cost_multiplier 字段）
+	UpstreamCostMultiplier *float64 `json:"UpstreamCostMultiplier,omitempty"`
+	UpstreamKey            *string  `json:"UpstreamKey,omitempty"`
+	Concurrency            *int64   `json:"concurrency,omitempty"`
+	ErrCount               *int     `json:"err_count,omitempty"`
+	ErrRate                *float64 `json:"err_rate,omitempty"`
+
+	// SupplierUserId 供应商归属（null = 平台自有；非空 = 归属该 supplier uid；只读回显，写面 PATCH /accounts/{id} 的 supplier_user_id）
+	SupplierUserId *int64 `json:"supplier_user_id"`
 }
 
 // AccountsUsageResponse 账号用量聚合响应（items 顺序 = account_ids 去重后顺序）
@@ -513,12 +619,15 @@ type AccountsUsageResponse struct {
 
 // AdminKey defines model for AdminKey.
 type AdminKey struct {
-	CreatedAt      *time.Time `json:"CreatedAt,omitempty"`
-	DeletedAt      *time.Time `json:"DeletedAt"`
-	GroupID        *int64     `json:"GroupID,omitempty"`
-	ID             *int64     `json:"ID,omitempty"`
-	MaxConcurrency *int       `json:"MaxConcurrency,omitempty"`
-	Name           *string    `json:"Name,omitempty"`
+	CreatedAt *time.Time `json:"CreatedAt,omitempty"`
+	DeletedAt *time.Time `json:"DeletedAt"`
+	GroupID   *int64     `json:"GroupID,omitempty"`
+
+	// GroupName 归属分组名（只读投影；组非存活/未加载 → 空串）
+	GroupName      *string `json:"GroupName,omitempty"`
+	ID             *int64  `json:"ID,omitempty"`
+	MaxConcurrency *int    `json:"MaxConcurrency,omitempty"`
+	Name           *string `json:"Name,omitempty"`
 
 	// Quota 累计最终计费金额上限（毫分，1 USD = 100,000 毫分）；0 = 不限
 	Quota *int64 `json:"Quota,omitempty"`
@@ -534,6 +643,19 @@ type AdminKey struct {
 type AdminKeyListResponse struct {
 	Rows  []AdminKey `json:"rows"`
 	Total int64      `json:"total"`
+}
+
+// AdminRequestSettlementBody defines model for AdminRequestSettlementBody.
+type AdminRequestSettlementBody struct {
+	// AmountMillis 金额（> 0）
+	AmountMillis int64   `json:"amount_millis"`
+	Note         *string `json:"note,omitempty"`
+
+	// RequestKey 业务幂等键
+	RequestKey string `json:"request_key"`
+
+	// SupplierUserId 目标供应商（须已有余额行，否则 404）
+	SupplierUserId int64 `json:"supplier_user_id"`
 }
 
 // AdminTempBalanceRow defines model for AdminTempBalanceRow.
@@ -554,6 +676,34 @@ type AdminTempBalancesResponse struct {
 	Rows  []AdminTempBalanceRow `json:"rows"`
 	Total int64                 `json:"total"`
 }
+
+// BalanceLog defines model for BalanceLog.
+type BalanceLog struct {
+	// Amount 变动额 USD（有符号：正=增加/负=减少；1 USD = 100,000 毫分）
+	Amount float64 `json:"Amount"`
+
+	// BalanceAfter 变更后余额 USD（毫分快照 /1e5）
+	BalanceAfter float64   `json:"BalanceAfter"`
+	CreatedAt    time.Time `json:"CreatedAt"`
+	ID           int64     `json:"ID"`
+
+	// Note 附加说明（兑换→兑换码文本；其余可空）
+	Note *string `json:"Note"`
+
+	// OperatorID 0 = 系统/用户自助；>0 = platform_admin 用户 id
+	OperatorID int64            `json:"OperatorID"`
+	Source     BalanceLogSource `json:"Source"`
+	UserID     int64            `json:"UserID"`
+}
+
+// BalanceLogListResponse defines model for BalanceLogListResponse.
+type BalanceLogListResponse struct {
+	Rows  []BalanceLog `json:"rows"`
+	Total int64        `json:"total"`
+}
+
+// BalanceLogSource defines model for BalanceLogSource.
+type BalanceLogSource string
 
 // BatchDeactivateRequest defines model for BatchDeactivateRequest.
 type BatchDeactivateRequest struct {
@@ -576,20 +726,11 @@ type BatchDeleteResponse struct {
 	Deleted int `json:"deleted"`
 }
 
-// BatchResetCooldownBody defines model for BatchResetCooldownBody.
-type BatchResetCooldownBody struct {
-	Ids []int64 `json:"ids"`
-}
-
-// BatchResetCooldownResponse defines model for BatchResetCooldownResponse.
-type BatchResetCooldownResponse struct {
-	Reset int `json:"reset"`
-}
-
 // BatchUpdateAccountsBody defines model for BatchUpdateAccountsBody.
 type BatchUpdateAccountsBody struct {
-	Fields AccountPatch `json:"fields"`
-	Ids    []int64      `json:"ids"`
+	// Fields 账号写面唯一字段模型（创建 / PATCH / 批量共用）。三态：字段缺席 = 不变（永不清空）； 可空标量 null = 清空；集合 null = 不变、[] = 清空；不可空标量 null = 400； 可空标量 "" = 400（空串哨兵已取消——清空只有一个拼法 null）。
+	Fields AccountConfigPatch `json:"fields"`
+	Ids    []int64            `json:"ids"`
 }
 
 // BatchUpdateGroupsBody defines model for BatchUpdateGroupsBody.
@@ -614,29 +755,32 @@ type CodexCredits struct {
 	Balance *string `json:"balance"`
 }
 
-// CodexIdentity codex 账号身份四元组（account_ext.codex_identity jsonb 契约形态；对象字段请求语义：null 与空串同 = 未提供）
+// CodexIdentity codex 账号持久身份（account_ext.codex_identity jsonb 契约形态；对象字段请求语义：null 与空串同 = 未提供）。仅 installation_id——会话级 session/thread/window 已退役为运行时槽状态，不再持久化/暴露。
 type CodexIdentity struct {
 	// InstallationId 身份：账号级唯一（UUIDv4；响应恒有——首次写入自动生成；空/缺省 → service 自动生成）
 	InstallationId *string `json:"installation_id,omitempty"`
-
-	// SessionId 身份：会话级（UUIDv7；恒等 == thread_id；service 自动生成/沿用；响应 nil → null）
-	SessionId *string `json:"session_id"`
-
-	// ThreadId 身份：会话级（UUIDv7；恒等 == session_id；响应 nil → null）
-	ThreadId *string `json:"thread_id"`
-
-	// WindowId 身份：会话级派生 {thread_id}:0（导入时生成后恒定不变——恒 0，无透传无解析；上游不校验 n；响应 nil → null）
-	WindowId *string `json:"window_id"`
 }
 
 // CodexOAuthImportBody 批量导入 codex-oauth 请求体（items 1-100 原始条数——空/超限 → 400；template_id 必填——缺失 → 400 / 不存在 → 404；**credential_type 必须 == codex-oauth——错配 → 400 整批拒绝**；group_id 可选——不存在 → 行级 failed）
 type CodexOAuthImportBody struct {
+	// CacheDomain 可选：新建账号的共享缓存域（缺省/空串 = 账号私有域；非空须为合法小写域名 ≤253——非法 → 400 整批拒绝）
+	CacheDomain *string `json:"cache_domain,omitempty"`
+
+	// Enabled 可选：新建账号的管理面启停（缺省 true = 启用；仅新建行生效）
+	Enabled *bool `json:"enabled,omitempty"`
+
 	// GroupId 可选：新建账号归组（缺省不归组；不存在 → 行级 failed——FK 违反归行级不整批 400）
 	GroupId *int64                 `json:"group_id"`
 	Items   []CodexOAuthImportItem `json:"items"`
 
+	// SupplierUserId 保留：供应商面出现 ⇒ 400（归属恒为 JWT 本人；导入不分配归属）
+	SupplierUserId *int64 `json:"supplier_user_id"`
+
 	// TemplateId 必填：codex 账号归属模板（credential_type 必须 == 端点类型 codex-oauth）
 	TemplateId int64 `json:"template_id"`
+
+	// UpstreamCostMultiplier 可选：新建账号的采购成本倍率（缺省 ×1；0–10，0 = 免费；越界 → 400 整批拒绝）
+	UpstreamCostMultiplier *float64 `json:"upstream_cost_multiplier,omitempty"`
 }
 
 // CodexOAuthImportItem 批量导入 codex-oauth 单行（组合幂等键 codex_email + codex_account_id；token+refresh 成对必填）
@@ -658,19 +802,28 @@ type CodexOAuthImportItem struct {
 
 	// MaxConcurrency 可选；缺省 25（导入面裁决——非账号表默认 8）；<1 → 归 25
 	MaxConcurrency *int `json:"max_concurrency,omitempty"`
-
-	// Weight 可选；缺省 100；负值 → 行级 failed
-	Weight *int `json:"weight,omitempty"`
 }
 
 // CodexPATImportBody 批量导入 codex-pat 请求体（items 1-100 原始条数——空/超限 → 400；template_id 必填——缺失 → 400 / 不存在 → 404；**credential_type 必须 == codex-pat——错配 → 400 整批拒绝**；group_id 可选——不存在 → 行级 failed）
 type CodexPATImportBody struct {
+	// CacheDomain 可选：新建账号的共享缓存域（缺省/空串 = 账号私有域；非空须为合法小写域名 ≤253——非法 → 400 整批拒绝）
+	CacheDomain *string `json:"cache_domain,omitempty"`
+
+	// Enabled 可选：新建账号的管理面启停（缺省 true = 启用；仅新建行生效）
+	Enabled *bool `json:"enabled,omitempty"`
+
 	// GroupId 可选：新建账号归组（不存在 → 行级 failed）
 	GroupId *int64               `json:"group_id"`
 	Items   []CodexPATImportItem `json:"items"`
 
+	// SupplierUserId 保留：供应商面出现 ⇒ 400（归属恒为 JWT 本人；导入不分配归属）
+	SupplierUserId *int64 `json:"supplier_user_id"`
+
 	// TemplateId 必填：codex 账号归属模板（credential_type 必须 == 端点类型 codex-pat）
 	TemplateId int64 `json:"template_id"`
+
+	// UpstreamCostMultiplier 可选：新建账号的采购成本倍率（缺省 ×1；0–10，0 = 免费；越界 → 400 整批拒绝）
+	UpstreamCostMultiplier *float64 `json:"upstream_cost_multiplier,omitempty"`
 }
 
 // CodexPATImportItem 批量导入 codex-pat 单行（组合幂等键同上）
@@ -686,9 +839,6 @@ type CodexPATImportItem struct {
 
 	// MaxConcurrency 可选；缺省 25（导入面裁决）；<1 → 归 25
 	MaxConcurrency *int `json:"max_concurrency,omitempty"`
-
-	// Weight 可选；缺省 100；负值 → 行级 failed
-	Weight *int `json:"weight,omitempty"`
 }
 
 // CodexRateLimit 主窗口用量（reset_at RFC3339——上游主窗口省略时 null，非虚假 0001-01-01）
@@ -773,8 +923,47 @@ type ErrLogsResponse struct {
 
 // ErrorResponse defines model for ErrorResponse.
 type ErrorResponse struct {
-	Error string `json:"error"`
+	// EffectiveFrom 判定后的生效窗口下界（`window_invalid`/`window_ambiguous` 不携带）
+	EffectiveFrom *time.Time `json:"effective_from,omitempty"`
+
+	// EffectiveTo 判定后的生效窗口上界（`window_invalid`/`window_ambiguous` 不携带）
+	EffectiveTo *time.Time `json:"effective_to,omitempty"`
+	Error       string     `json:"error"`
+
+	// LimitSeconds 成本上限秒数（`window_too_long` 携带；0 = 无上限）
+	LimitSeconds *int64 `json:"limit_seconds,omitempty"`
+
+	// Reason 统计窗口被拒的机读原因（仅统计端点可能携带）。取值词表取自规划层原因与
+	// 拒绝原因的**全量映射表**（唯一来源），本版实际会发出的有五个：
+	// raw_horizon/cube_horizon = 起点早于所要读表的保留截止；
+	// window_too_long = 请求跨度超过该形状的成本上限；window_invalid =
+	// 必填/倒序/`window` 时长串不可解析等参数本身非法；window_ambiguous =
+	// `from`/`to`/`window` 三者的"恰择一"未被满足（两态都给、只给一端、
+	// 或两态都不给）。offset/dst/span_below_grid 是"该窗口无法用卷积表精确
+	// 表达、已降级到原始行"的派生原因（只用于降级告警日志，不作为拒绝原因
+	// 发出）。
+	Reason *ErrorResponseReason `json:"reason,omitempty"`
+
+	// RetentionDays 覆盖判定所依据的最保守保留天数（`*_horizon` 携带）
+	RetentionDays *int `json:"retention_days,omitempty"`
+
+	// Storage 判定所依据的实际存储（`window_invalid`/`window_ambiguous` 不携带）
+	Storage *ErrorResponseStorage `json:"storage,omitempty"`
 }
+
+// ErrorResponseReason 统计窗口被拒的机读原因（仅统计端点可能携带）。取值词表取自规划层原因与
+// 拒绝原因的**全量映射表**（唯一来源），本版实际会发出的有五个：
+// raw_horizon/cube_horizon = 起点早于所要读表的保留截止；
+// window_too_long = 请求跨度超过该形状的成本上限；window_invalid =
+// 必填/倒序/`window` 时长串不可解析等参数本身非法；window_ambiguous =
+// `from`/`to`/`window` 三者的"恰择一"未被满足（两态都给、只给一端、
+// 或两态都不给）。offset/dst/span_below_grid 是"该窗口无法用卷积表精确
+// 表达、已降级到原始行"的派生原因（只用于降级告警日志，不作为拒绝原因
+// 发出）。
+type ErrorResponseReason string
+
+// ErrorResponseStorage 判定所依据的实际存储（`window_invalid`/`window_ambiguous` 不携带）
+type ErrorResponseStorage string
 
 // ErrorType defines model for ErrorType.
 type ErrorType string
@@ -810,8 +999,11 @@ type Group struct {
 
 	// DeletedAt 软删除时间戳；null = 存活（列表/消费路径过滤已删；GET 单个可查已删项）
 	DeletedAt *time.Time `json:"DeletedAt"`
-	ID        *int64     `json:"ID,omitempty"`
-	Name      *string    `json:"Name,omitempty"`
+
+	// Description 分组描述（空串 = 无描述）
+	Description *string `json:"Description,omitempty"`
+	ID          *int64  `json:"ID,omitempty"`
+	Name        *string `json:"Name,omitempty"`
 
 	// PriceMultiplier 价格倍率（正常值，1 = ×1，0 = 免费，上限 10 = ×10；API 边界与万分数换算——存储 15000 ↔ 显示 1.5）
 	PriceMultiplier *float64 `json:"PriceMultiplier,omitempty"`
@@ -840,7 +1032,9 @@ type GroupAssignmentsResponse struct {
 
 // GroupCreate defines model for GroupCreate.
 type GroupCreate struct {
-	Name string `json:"name"`
+	// Description 分组描述（可选）。POST：缺省/null = 空；PUT：缺省/null = 保持原值，显式空串 = 清空
+	Description *string `json:"description"`
+	Name        string  `json:"name"`
 
 	// PriceMultiplier 价格倍率（正常值，1 = ×1，0 = 免费，上限 10 = ×10；API 边界与万分数换算——存储 15000 ↔ 显示 1.5）。缺省/null = 不设置（×1）；显式 0 = 免费组；PUT 显式写（含 0）
 	PriceMultiplier *float64 `json:"price_multiplier"`
@@ -862,7 +1056,7 @@ type GroupPatch struct {
 	Visibility *GroupVisibility `json:"visibility,omitempty"`
 }
 
-// GroupProtocolConvert 分组级协议转换方向（只补差，W5 网关 internal/protoconv 消费）：chat_to_resp = 客户端 chat → 模板 resp；mess_to_resp = anthropic messages → resp；resp_to_mess = resp → anthropic messages；chat_to_mess = chat → anthropic messages。off 不在枚举内——不转换 = 空数组（见 protocol_convert 字段说明）
+// GroupProtocolConvert 分组级协议转换方向（只补差，网关 internal/protoconv 消费）：chat_to_resp = 客户端 chat → 模板 resp；mess_to_resp = anthropic messages → resp；resp_to_mess = resp → anthropic messages；chat_to_mess = chat → anthropic messages。off 不在枚举内——不转换 = 空数组（见 protocol_convert 字段说明）
 type GroupProtocolConvert string
 
 // GroupVisibility defines model for GroupVisibility.
@@ -949,7 +1143,7 @@ type OverviewAccounts struct {
 	Unhealthy      int `json:"unhealthy"`
 }
 
-// OverviewAlerts 告警面（billing 游标消费者 lag 族观测，F2 ledger-cursor；注入面读取，未装配 = 全零）
+// OverviewAlerts 告警面（billing 游标消费者 lag 族观测，ledger-cursor；注入面读取，未装配 = 全零）
 type OverviewAlerts struct {
 	// BillingLagMs 游标积压时滞（毫秒）= 最近周期探测的 now − 最老 unbilled 行 created_at；0 = 游标空/未探测
 	BillingLagMs int64 `json:"billing_lag_ms"`
@@ -982,7 +1176,7 @@ type OverviewResponse struct {
 	// Accounts 账号健康分布 + 并发水位（调度器快照同源——与账号列表运行时视图一致）
 	Accounts OverviewAccounts `json:"accounts"`
 
-	// Alerts 告警面（billing 游标消费者 lag 族观测，F2 ledger-cursor；注入面读取，未装配 = 全零）
+	// Alerts 告警面（billing 游标消费者 lag 族观测，ledger-cursor；注入面读取，未装配 = 全零）
 	Alerts OverviewAlerts   `json:"alerts"`
 	ErrTop []OverviewErrTop `json:"err_top"`
 
@@ -1202,7 +1396,7 @@ type RedemptionCode struct {
 	Code      string    `json:"Code"`
 	CreatedAt time.Time `json:"CreatedAt"`
 
-	// CreatedBy 0 = 系统（静态 admin token）；>0 = platform_admin 用户 id
+	// CreatedBy platform_admin 用户 id（adminAuth 鉴权路径恒注入 owner id）；0 = 系统/无归属
 	CreatedBy int64 `json:"CreatedBy"`
 
 	// ExpiresAt 码未兑换即过期；null = 永久
@@ -1259,6 +1453,277 @@ type RedemptionUseListResponse struct {
 // RequestFormat defines model for RequestFormat.
 type RequestFormat string
 
+// RoutingFlowEdge 一条聚合边（合并层行；最早代际为同边多代折叠的最小值）
+type RoutingFlowEdge struct {
+	AccountId int64 `json:"account_id"`
+
+	// ChainCount 同身份链数（SUM）
+	ChainCount int64 `json:"chain_count"`
+
+	// IsTerminal true = 该链 Final
+	IsTerminal bool `json:"is_terminal"`
+
+	// Lane 通道（primary/explore/degraded）
+	Lane string `json:"lane"`
+
+	// MinGeneration 本边链最早计划代际（同边多代折叠的最小值）
+	MinGeneration int64 `json:"min_generation"`
+
+	// Ordinal 链内第几次尝试（1 = 首发）
+	Ordinal int `json:"ordinal"`
+
+	// Outcome 本边结局（success/429/4xx/5xx/network…）
+	Outcome string `json:"outcome"`
+
+	// PreviousAccountId 前驱账号（首发边 null）
+	PreviousAccountId *int64 `json:"previous_account_id"`
+
+	// PreviousOutcome 前驱结局（首发边空串）
+	PreviousOutcome string `json:"previous_outcome"`
+
+	// TransitionReason 迁移原因（failover 等；首发边空串）
+	TransitionReason string `json:"transition_reason"`
+}
+
+// RoutingFlowGraph 桑基图边集（已按 (ordinal,lane,account,outcome,is_terminal) 聚合）
+type RoutingFlowGraph struct {
+	// AccountLimit 每层保留的账号数 N（实际生效值）
+	AccountLimit int                    `json:"account_limit"`
+	Edges        []RoutingFlowGraphEdge `json:"edges"`
+
+	// Folded folded_accounts > 0 的冗余布尔，便于消费方直读
+	Folded bool `json:"folded"`
+
+	// FoldedAccounts 各 (ordinal
+	FoldedAccounts int64 `json:"folded_accounts"`
+}
+
+// RoutingFlowGraphEdge 一条桑基边；account_id=0 且 folded=true 表示「其他」聚合节点
+type RoutingFlowGraphEdge struct {
+	// AccountId 本跳账号；0 = 「其他」聚合节点
+	AccountId int64 `json:"account_id"`
+
+	// ChainCount 同身份链数（SUM）
+	ChainCount int64 `json:"chain_count"`
+
+	// Folded true = 该边是折叠后的「其他」聚合（account_id 恒 0）
+	Folded bool `json:"folded"`
+
+	// IsTerminal true = 该链 Final
+	IsTerminal bool `json:"is_terminal"`
+
+	// Lane 通道（primary/explore/degraded）
+	Lane string `json:"lane"`
+
+	// Ordinal 链内第几次尝试（1 = 首发）
+	Ordinal int `json:"ordinal"`
+
+	// Outcome 本边结局（success/429/4xx/5xx/network…）
+	Outcome string `json:"outcome"`
+
+	// PreviousAccounts 到达链的 previous_account_id 去重集（升序）；折叠节点为空
+	PreviousAccounts []int64 `json:"previous_accounts"`
+
+	// PreviousOutcomes 到达链的 previous_outcome 去重集（升序）
+	PreviousOutcomes []string `json:"previous_outcomes"`
+
+	// TransitionReasons 到达链的 transition_reason 去重集（升序）
+	TransitionReasons []string `json:"transition_reasons"`
+}
+
+// RoutingFlowLane (ordinal, lane) 分组；组间按 (ordinal, lane) 全序，组内保持仓储确定性行序
+type RoutingFlowLane struct {
+	Edges   []RoutingFlowEdge `json:"edges"`
+	Lane    string            `json:"lane"`
+	Ordinal int               `json:"ordinal"`
+}
+
+// RoutingFlowResponse defines model for RoutingFlowResponse.
+type RoutingFlowResponse struct {
+	// FirstDispatchChains Attempt1 = ordinal=1 链数和（守恒左端；完整边集聚合，不受分页影响）
+	FirstDispatchChains int64 `json:"first_dispatch_chains"`
+
+	// FlowOverflowDroppedChains 故障预算淘汰链（容量/入队拒绝；非上游失败）
+	FlowOverflowDroppedChains int64 `json:"flow_overflow_dropped_chains"`
+
+	// IncompleteChainDropped 本进程已观察 cleanup 缺 terminal 的链（非上游失败）
+	IncompleteChainDropped int64 `json:"incomplete_chain_dropped"`
+
+	// Lanes 边表的当前页（offset/limit 切片后仍按 (ordinal,lane) 分组，组内保持仓储确定性行序）
+	Lanes []RoutingFlowLane `json:"lanes"`
+
+	// PlanGeneration 当前发布计划 generation（边行各自 generation 不混入）
+	PlanGeneration int64 `json:"plan_generation"`
+
+	// ProcessCrashLossUnobservable 硬崩丢失不可量化标记，恒 true
+	ProcessCrashLossUnobservable bool   `json:"process_crash_loss_unobservable"`
+	RouteClassId                 string `json:"route_class_id"`
+
+	// Sankey 桑基图边集（已按 (ordinal,lane,account,outcome,is_terminal) 聚合）
+	Sankey RoutingFlowGraph `json:"sankey"`
+
+	// StaleGenerationPresent 完整边集内是否存在 min_generation != plan_generation 的边行（行级谓词，精确——无高估无低估；不受 offset/limit 影响）。精确性前提：generation 随发布单调不减，故存量行恒有 min_generation ≤ plan_generation；未来代际竞态不在目标场景内）
+	StaleGenerationPresent bool `json:"stale_generation_present"`
+
+	// TerminalChains 保留 terminal 链数和（守恒右端，恒等于 first_dispatch_chains；完整边集聚合）
+	TerminalChains int64 `json:"terminal_chains"`
+
+	// TotalEdges 窗口内完整边行数（行单位，驱动前端翻页器；不受 offset/limit 影响）
+	TotalEdges int64 `json:"total_edges"`
+}
+
+// RoutingFrontierCandidate defines model for RoutingFrontierCandidate.
+type RoutingFrontierCandidate struct {
+	// AccountId unknown 候选为 0
+	AccountId            int64  `json:"account_id"`
+	Attempts             int64  `json:"attempts"`
+	CandidateFingerprint string `json:"candidate_fingerprint"`
+
+	// CostKnown known + 有成功样本 + 价格可解析
+	CostKnown bool `json:"cost_known"`
+
+	// IdentityRevision 候选内容代际 K（identity_revision）——非客户端 CAS 令牌 C（lifecycle_revision）；C 只围栏管理员写入
+	IdentityRevision int64 `json:"identity_revision"`
+
+	// InputUnitCost 输入侧单位采购价（毫分/1M 输入侧 token，1 USD = 100,000 毫分，与 compiler 同式；cost_known=false 时无意义）
+	InputUnitCost int64 `json:"input_unit_cost"`
+
+	// Insufficient 样本 <30（与 explore 同门槛）
+	Insufficient bool `json:"insufficient"`
+
+	// Known 指纹在当前发布计划该路由候选目录内；false = 只呈现观测事实
+	Known       bool   `json:"known"`
+	MappedModel string `json:"mapped_model"`
+
+	// OnFrontier Pareto 非支配（仅 known 且 cost_known 间扫描）
+	OnFrontier     bool   `json:"on_frontier"`
+	QualityClassId string `json:"quality_class_id"`
+
+	// SuccessLcb Wilson95 下界
+	SuccessLcb float64 `json:"success_lcb"`
+
+	// SuccessUcb Wilson95 上界
+	SuccessUcb float64 `json:"success_ucb"`
+	Successes  int64   `json:"successes"`
+	TemplateId int64   `json:"template_id"`
+
+	// TtftKnown 样本量足以给出区间
+	TtftKnown bool `json:"ttft_known"`
+
+	// TtftLcb TTFT 对数区间下界（ttft_known=false 时无意义）
+	TtftLcb float64 `json:"ttft_lcb"`
+	TtftUcb float64 `json:"ttft_ucb"`
+}
+
+// RoutingFrontierResponse defines model for RoutingFrontierResponse.
+type RoutingFrontierResponse struct {
+	// Candidates 排序后的一页候选
+	Candidates     []RoutingFrontierCandidate `json:"candidates"`
+	PlanGeneration int64                      `json:"plan_generation"`
+	RouteClassId   string                     `json:"route_class_id"`
+
+	// TotalCandidates 排序后候选总条数（分页用；不受 offset/limit 影响）
+	TotalCandidates int64 `json:"total_candidates"`
+}
+
+// RoutingPlanCandidate 候选静态身份（缺叶子引用时 identity-only，其余字段零值）
+type RoutingPlanCandidate struct {
+	AccountId int64 `json:"account_id"`
+
+	// Fingerprint 真实候选指纹 hex（不可导出 = 空串）
+	Fingerprint string `json:"fingerprint"`
+
+	// IdentityFingerprint rollup join 身份指纹 hex（compiler 合成规则同源）
+	IdentityFingerprint string `json:"identity_fingerprint"`
+
+	// IdentityRevision 候选内容代际 K（identity_revision）——与编译器事实、wire 同源；非客户端 CAS 令牌 C
+	IdentityRevision int64  `json:"identity_revision"`
+	MappedModel      string `json:"mapped_model"`
+	QualityClassId   string `json:"quality_class_id"`
+	TemplateId       int64  `json:"template_id"`
+
+	// UpstreamCostMultiplierBp 采购倍率 basis points（10000 = ×1）
+	UpstreamCostMultiplierBp int `json:"upstream_cost_multiplier_bp"`
+}
+
+// RoutingPlanExplore explore 决策表（发布序 + 权重 + 累积轮盘；序是语义不重排）
+type RoutingPlanExplore struct {
+	Cumulative []int64 `json:"cumulative"`
+	Fallback   []int64 `json:"fallback"`
+	Ids        []int64 `json:"ids"`
+	Total      int64   `json:"total"`
+
+	// Weights account_id（十进制字符串键）→ 权重
+	Weights map[string]int `json:"weights"`
+}
+
+// RoutingPlanIncident 路由 expose-only 事故标记（detect+surface：不改通道、不节流、不探针；零值 = 无事故）
+type RoutingPlanIncident struct {
+	Active bool `json:"active"`
+
+	// Comparable 可比候选数（current/baseline attempts≥30 且 TTFT≥30）
+	Comparable int `json:"comparable"`
+
+	// Degraded 退化候选数（Wilson 成功区间不重叠）
+	Degraded int `json:"degraded"`
+
+	// Domains 可比去重 failure-domain 数
+	Domains int `json:"domains"`
+
+	// EvaluatedMinute 证据分钟 M（unix 秒；窗口边界可由 M 推导）
+	EvaluatedMinute int64 `json:"evaluated_minute"`
+
+	// Kind "domain"|"model"|"both"（inactive 时为空串）
+	Kind string `json:"kind"`
+}
+
+// RoutingPlanRef 路由全身份（group+format+model+operation+route class）
+type RoutingPlanRef struct {
+	Format       string `json:"format"`
+	GroupId      int64  `json:"group_id"`
+	Model        string `json:"model"`
+	OperationTag string `json:"operation_tag"`
+	RouteClassId string `json:"route_class_id"`
+}
+
+// RoutingPlanResponse 当前发布计划快照（无历史 generation 查询面；空视图 = generation 0 + routes []）
+type RoutingPlanResponse struct {
+	Generation int64 `json:"generation"`
+
+	// PlanTotalRoutes 未过滤的当前计划路由总数（区分「空计划」与「窗口内无流量」）
+	PlanTotalRoutes int64 `json:"plan_total_routes"`
+
+	// Routes 全身份确定性路由序（与发布字节守卫同序）
+	Routes []RoutingPlanRoute `json:"routes"`
+
+	// TotalRoutes 过滤后（search ∩ observed 窗口；route 给定时恒为 1）的路由总数（分页用）
+	TotalRoutes int64 `json:"total_routes"`
+}
+
+// RoutingPlanRoute defines model for RoutingPlanRoute.
+type RoutingPlanRoute struct {
+	// Candidates 通道账号并集（升序 AccountID）的当前页；candidates_limit=0 时为空数组
+	Candidates []RoutingPlanCandidate `json:"candidates"`
+
+	// CandidatesTotal 该路由候选总数（分页用；不受 candidates_offset/candidates_limit 影响）
+	CandidatesTotal int64 `json:"candidates_total"`
+
+	// Degraded degraded 候选发布序
+	Degraded []int64 `json:"degraded"`
+
+	// Explore explore 决策表（发布序 + 权重 + 累积轮盘；序是语义不重排）
+	Explore RoutingPlanExplore `json:"explore"`
+
+	// Incident 路由 expose-only 事故标记（detect+surface：不改通道、不节流、不探针；零值 = 无事故）
+	Incident RoutingPlanIncident `json:"incident"`
+
+	// Primary primary 候选发布序
+	Primary []int64 `json:"primary"`
+
+	// Ref 路由全身份（group+format+model+operation+route class）
+	Ref RoutingPlanRef `json:"ref"`
+}
+
 // Rule defines model for Rule.
 type Rule struct {
 	CreatedAt time.Time `json:"CreatedAt"`
@@ -1270,7 +1735,7 @@ type Rule struct {
 	Name      string     `json:"Name"`
 	Priority  int        `json:"Priority"`
 
-	// Then 动作集（只读回显；字段集与语义同 RuleCreate.then——status/cooldown/weight/response_code/custom_message；全空 {} = 纯透传规则：命中后码/文双透、零惩罚）
+	// Then 动作集（只读回显；字段集与语义同 RuleCreate.then——throttle/fail_account/response_code/custom_message；全空 {} = 纯透传规则：命中后码/文双透、零惩罚）
 	Then      map[string]interface{} `json:"Then"`
 	UpdatedAt time.Time              `json:"UpdatedAt"`
 
@@ -1285,11 +1750,17 @@ type RuleCreate struct {
 	Priority int    `json:"priority"`
 
 	// Then 动作集（指针即意图：键缺省/null = 该维度透传不改）。全空对象 {} 合法 =
-	// 纯透传规则：命中后状态/冷却/权重零改动、响应码与文案双透传上游原样返回、
+	// 纯透传规则：命中后零惩罚、响应码与文案双透传上游原样返回、
 	// 不计惩罚（不投递状态事件）。可用键：
-	// - status：命中后账号目标状态，active/unhealthy/429/disabled 之一
-	// - cooldown：冷却时长，Go time.ParseDuration 可解析且 > 0（如 "30s"、"5h"）
-	// - weight：调度权重 ∈ [0,100]
+	// - throttle：typed 限流动作（与 fail_account 互斥；
+	//   response_code/custom_message 塑形可并存）——
+	//   {scope: account|account_route, mode: retry_after|open, duration_ms?, use_reset}；
+	//   scope=account 作用该账号全部 RouteClass，account_route 作用单 RouteClass
+	//   （匹配时事件须携带账号+路由定位）；mode=retry_after 要求 use_reset=true
+	//   （上游 Reset 头优先，duration_ms 可选为回退）；mode=open 要求 use_reset=false
+	//   且 duration_ms > 0（固定摘除窗口）
+	// - fail_account：true = 命中即判死（终态失效：failed_at + failure_source=rule，CAS fenced，
+	//   恢复唯一入口 /accounts/{id}/recover）；与 throttle 互斥
 	// - response_code：缺省/null = 透传上游状态码；设置 = 覆写为指定码（400-599）
 	// - custom_message：缺省/null = 透传上游错误文案；设置 = 覆写为固定文案（禁止空串）
 	// 错误响应面无任何规则命中时默认归一为 502 "upstream rejected request"
@@ -1327,11 +1798,17 @@ type RulePatch struct {
 	// Then 动作集（指针即意图：键缺省/null = 该维度透传不改）。PUT 部分更新语义：
 	// 键缺省（null/省略）= 保持原值；显式提供时整体替换该对象（显式 {} = 清空），
 	// 并对合并后的完整 when/then 重新校验。全空对象 {} 合法 = 纯透传规则：
-	// 命中后状态/冷却/权重零改动、响应码与文案双透传上游原样返回、不计惩罚
+	// 命中后零惩罚、响应码与文案双透传上游原样返回、不计惩罚
 	// （不投递状态事件）。可用键：
-	// - status：命中后账号目标状态，active/unhealthy/429/disabled 之一
-	// - cooldown：冷却时长，Go time.ParseDuration 可解析且 > 0（如 "30s"、"5h"）
-	// - weight：调度权重 ∈ [0,100]
+	// - throttle：typed 限流动作（与 fail_account 互斥；
+	//   response_code/custom_message 塑形可并存）——
+	//   {scope: account|account_route, mode: retry_after|open, duration_ms?, use_reset}；
+	//   scope=account 作用该账号全部 RouteClass，account_route 作用单 RouteClass
+	//   （匹配时事件须携带账号+路由定位）；mode=retry_after 要求 use_reset=true
+	//   （上游 Reset 头优先，duration_ms 可选为回退）；mode=open 要求 use_reset=false
+	//   且 duration_ms > 0（固定摘除窗口）
+	// - fail_account：true = 命中即判死（终态失效：failed_at + failure_source=rule，CAS fenced，
+	//   恢复唯一入口 /accounts/{id}/recover）；与 throttle 互斥
 	// - response_code：缺省/null = 透传上游状态码；设置 = 覆写为指定码（400-599）
 	// - custom_message：缺省/null = 透传上游错误文案；设置 = 覆写为固定文案（禁止空串）
 	// 错误响应面无任何规则命中时默认归一为 502 "upstream rejected request"
@@ -1371,6 +1848,78 @@ type SettingType string
 type SettingUpdate struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+}
+
+// SettlementClaimBody 认领付款；金额必须等于单据金额 + 结构化收款目标快照固定 + 风险核对证据（服务端派生 operator_id/decided_at/expires_at）
+type SettlementClaimBody struct {
+	// AmountMillis 认领金额，必须 == 单据 amount_millis（不符 ⇒ 400）
+	AmountMillis  int64 `json:"amount_millis"`
+	SettlementRev int64 `json:"expected_revision"`
+
+	// PayeeSnapshot 收款目标快照（结构化；副作用前固定、重试复用、不一致拒绝）
+	PayeeSnapshot SettlementPayeeSnapshot `json:"payee_snapshot"`
+
+	// RiskEvidence 风险核对证据（结构化；reference/摘要非空 + 绑定 approved revision；服务端派生 operator_id/decided_at/scope/decision/expires_at）
+	RiskEvidence SettlementRiskEvidence `json:"risk_evidence"`
+}
+
+// SettlementConfirmFailedBody paying→approved；仅接受结构化「确定未支付」+「旧执行已停止」核验（未知 ⇒ 失败闭合保留 paying）
+type SettlementConfirmFailedBody struct {
+	// ConfirmedNotPaid 渠道/人工已核验「确定未支付」
+	ConfirmedNotPaid bool `json:"confirmed_not_paid"`
+
+	// Evidence 核验证据 reference（非空）
+	Evidence      string `json:"evidence"`
+	SettlementRev int64  `json:"expected_revision"`
+
+	// OldExecutionStopped 已确认旧外部执行已停止（回收/等待/具名确认）
+	OldExecutionStopped bool `json:"old_execution_stopped"`
+
+	// Reason 确定未支付的原因（网络失败不算）
+	Reason string `json:"reason"`
+}
+
+// SettlementPaidBody 仅 paying→paid；必须提供非空银行/渠道回单号（未核验不得确认）
+type SettlementPaidBody struct {
+	SettlementRev int64 `json:"expected_revision"`
+
+	// ExternalRef 银行/渠道回单号（非空）
+	ExternalRef string `json:"external_ref"`
+}
+
+// SettlementPayeeSnapshot 收款目标快照（结构化；副作用前固定、重试复用、不一致拒绝）
+type SettlementPayeeSnapshot struct {
+	// Account 收款账号
+	Account string `json:"account"`
+
+	// PayeeName 收款人/开户名
+	PayeeName string `json:"payee_name"`
+
+	// Unit 金额单位/币种
+	Unit string `json:"unit"`
+}
+
+// SettlementRejectBody defines model for SettlementRejectBody.
+type SettlementRejectBody struct {
+	SettlementRev int64   `json:"expected_revision"`
+	Reason        *string `json:"reason"`
+}
+
+// SettlementRiskEvidence 风险核对证据（结构化；reference/摘要非空 + 绑定 approved revision；服务端派生 operator_id/decided_at/scope/decision/expires_at）
+type SettlementRiskEvidence struct {
+	// ApprovedRevision 必须 == expected_revision（锁内当前 approved revision）
+	ApprovedRevision int64 `json:"approved_revision"`
+
+	// Reference 证据 reference（非空）
+	Reference string `json:"reference"`
+
+	// Summary 核对摘要（非空）
+	Summary string `json:"summary"`
+}
+
+// SettlementTransitionBody 状态迁移 CAS 令牌（陈旧 ⇒ 409；缺席 ⇒ 400）
+type SettlementTransitionBody struct {
+	SettlementRev int64 `json:"expected_revision"`
 }
 
 // SnapshotState defines model for SnapshotState.
@@ -1448,9 +1997,110 @@ type StatTrendPoint struct {
 	TotalTokens *int64 `json:"TotalTokens,omitempty"`
 }
 
+// StatsCapabilities defines model for StatsCapabilities.
+type StatsCapabilities struct {
+	// BucketGridSeconds 卷积表桶网格单位（秒；恒 3600 = 1 小时）
+	BucketGridSeconds int `json:"bucket_grid_seconds"`
+
+	// Kinds 键 = 读形状标识（trend/entity_trend/summary/days/top/ttft_sketch/ttft_exact/usage_agg/usage_list/errlog_list）
+	Kinds map[string]StatsKindCapability `json:"kinds"`
+}
+
+// StatsKindCapability defines model for StatsKindCapability.
+type StatsKindCapability struct {
+	// CostCapSeconds 每候选存储的最大跨度秒数（保留期无关的纯常量；0 = 无上限）
+	CostCapSeconds map[string]int64 `json:"cost_cap_seconds"`
+
+	// CoverageDays 每候选存储实际读表的保留天数（读多表取最保守者；0 = 该表未启用分区保留，覆盖守卫关闭）
+	CoverageDays map[string]int `json:"coverage_days"`
+
+	// Grouping 读形状的分组模式：`zoned` = 按请求时区分组（桶界随时区变）；`none` =
+	// 数值与请求时区无关。刻意不写 enum：enum 会为一个取值是 `none` 的字段
+	// 生成名为 `None` 的常量，与既有 `ErrorType` 枚举的 `None` 撞名，触发
+	// oapi-codegen 把该枚举九个常量全部改名（无关生成的额外改动）。
+	Grouping string `json:"grouping"`
+
+	// Storages 候选存储（按偏好序）
+	Storages []StatsKindCapabilityStorages `json:"storages"`
+}
+
+// StatsKindCapabilityStorages defines model for StatsKindCapability.Storages.
+type StatsKindCapabilityStorages string
+
+// SupplierBalance defines model for SupplierBalance.
+type SupplierBalance struct {
+	Available         int64      `json:"available"`
+	BucketRows        int64      `json:"bucket_rows"`
+	FreezeHours       *int       `json:"freeze_hours"`
+	LatestAvailableAt *time.Time `json:"latest_available_at"`
+	LifetimeCredited  int64      `json:"lifetime_credited"`
+	LifetimePaid      int64      `json:"lifetime_paid"`
+	ShareBp           *int       `json:"share_bp"`
+	SupplierUserId    int64      `json:"supplier_user_id"`
+}
+
+// SupplierBalanceList defines model for SupplierBalanceList.
+type SupplierBalanceList struct {
+	Items []SupplierBalance `json:"items"`
+	Total int64             `json:"total"`
+}
+
+// SupplierBalancePatchBody PATCH 逐供应商配置（仅 share_bp/freeze_hours；缺席 = 不变；null = 清空回继承）
+type SupplierBalancePatchBody struct {
+	FreezeHours nullable.Nullable[int] `json:"freeze_hours,omitempty"`
+	ShareBp     nullable.Nullable[int] `json:"share_bp,omitempty"`
+}
+
+// SupplierSettlement defines model for SupplierSettlement.
+type SupplierSettlement struct {
+	AmountMillis       int64                  `json:"amount_millis"`
+	ExternalRef        *string                `json:"external_ref"`
+	Id                 int64                  `json:"id"`
+	Kind               SupplierSettlementKind `json:"kind"`
+	Note               *string                `json:"note"`
+	PaidAt             *time.Time             `json:"paid_at"`
+	PaidOperatorUserId *int64                 `json:"paid_operator_user_id"`
+
+	// PayeeSnapshot 固定收款目标快照（结构化 JSON）
+	PayeeSnapshot *string `json:"payee_snapshot"`
+
+	// PaymentKey 首次 claim 生成、全局唯一、永久固定的付款键（重试/恢复复用不换键）
+	PaymentKey           *string    `json:"payment_key"`
+	PayoutFailedAt       *time.Time `json:"payout_failed_at"`
+	PayoutFailureReason  *string    `json:"payout_failure_reason"`
+	PayoutOperatorUserId *int64     `json:"payout_operator_user_id"`
+	PayoutStartedAt      *time.Time `json:"payout_started_at"`
+	PeriodEnd            time.Time  `json:"period_end"`
+	PeriodStart          time.Time  `json:"period_start"`
+	RejectReason         *string    `json:"reject_reason"`
+	RequestKey           string     `json:"request_key"`
+	RequestedAt          time.Time  `json:"requested_at"`
+	RequestedOperator    int64      `json:"requested_operator"`
+	ReviewedAt           *time.Time `json:"reviewed_at"`
+	ReviewerUserId       *int64     `json:"reviewer_user_id"`
+	Revision             int64      `json:"revision"`
+
+	// RiskReview 风险核对记录（结构化 JSON）
+	RiskReview     *string                  `json:"risk_review"`
+	Status         SupplierSettlementStatus `json:"status"`
+	SupplierUserId int64                    `json:"supplier_user_id"`
+}
+
+// SupplierSettlementKind defines model for SupplierSettlement.Kind.
+type SupplierSettlementKind string
+
+// SupplierSettlementStatus defines model for SupplierSettlement.Status.
+type SupplierSettlementStatus string
+
+// SupplierSettlementList defines model for SupplierSettlementList.
+type SupplierSettlementList struct {
+	Items []SupplierSettlement `json:"items"`
+	Total int64                `json:"total"`
+}
+
 // Template defines model for Template.
 type Template struct {
-	// BaseURL credential-type conditional: codex-oauth/codex-pat always empty (non-empty forbidden); api_key/responses-special bare root override (non-empty) or empty (default/route failure)
+	// BaseURL credential-type conditional: codex-oauth/codex-pat always empty (non-empty forbidden); api_key/responses-special may include a protocol prefix such as /zen but must not end in /v1 (non-empty override, or empty for default/route failure)
 	BaseURL   string    `json:"BaseURL"`
 	CreatedAt time.Time `json:"CreatedAt"`
 
@@ -1476,7 +2126,7 @@ type TemplateSupportedFormats string
 
 // TemplateCreate defines model for TemplateCreate.
 type TemplateCreate struct {
-	// BaseUrl credential-type conditional: codex-oauth/codex-pat must be empty (non-empty forbidden, SDK default endpoint); api_key/responses-special optional bare root without /v1 (non-empty overrides, empty uses default or fails to route)
+	// BaseUrl credential-type conditional: codex-oauth/codex-pat must be empty (non-empty forbidden, SDK default endpoint); api_key/responses-special may include a protocol prefix such as /zen but must not end in /v1 (the gateway appends /v1; non-empty overrides, empty uses default or fails to route)
 	BaseUrl          *string                          `json:"base_url,omitempty"`
 	CredentialType   *TemplateCreateCredentialType    `json:"credential_type,omitempty"`
 	FormatModels     *map[string][]string             `json:"format_models,omitempty"`
@@ -1513,7 +2163,7 @@ type TemplateListResponse struct {
 
 // TemplatePatch defines model for TemplatePatch.
 type TemplatePatch struct {
-	// BaseUrl credential-type conditional: codex-oauth/codex-pat must be empty (non-empty forbidden); api_key/responses-special optional bare root override
+	// BaseUrl credential-type conditional: codex-oauth/codex-pat must be empty (non-empty forbidden); api_key/responses-special optional override, protocol prefix allowed, must not end in /v1
 	BaseUrl          *string                          `json:"base_url,omitempty"`
 	FormatModels     *map[string][]string             `json:"format_models,omitempty"`
 	ModelMapping     *map[string]ModelMappingEntry    `json:"model_mapping,omitempty"`
@@ -1694,21 +2344,54 @@ type WorkersResponse struct {
 	Workers     []WorkerStatus  `json:"workers"`
 }
 
+// AccountEnabled defines model for AccountEnabled.
+type AccountEnabled = bool
+
+// AccountTemplateId defines model for AccountTemplateId.
+type AccountTemplateId = int64
+
+// ListLimit defines model for ListLimit.
+type ListLimit = int
+
+// ListName defines model for ListName.
+type ListName = string
+
+// ListOffset defines model for ListOffset.
+type ListOffset = int
+
+// ListOrder defines model for ListOrder.
+type ListOrder string
+
+// ListSort defines model for ListSort.
+type ListSort = string
+
+// StatsFrom defines model for StatsFrom.
+type StatsFrom = time.Time
+
 // StatsTimezone defines model for StatsTimezone.
 type StatsTimezone = string
+
+// StatsTo defines model for StatsTo.
+type StatsTo = time.Time
+
+// StatsWindow defines model for StatsWindow.
+type StatsWindow = string
 
 // Error defines model for Error.
 type Error = ErrorResponse
 
 // GetAccountsParams defines parameters for GetAccounts.
 type GetAccountsParams struct {
-	Limit      *int                    `form:"limit,omitempty" json:"limit,omitempty"`
-	Offset     *int                    `form:"offset,omitempty" json:"offset,omitempty"`
-	Name       *string                 `form:"name,omitempty" json:"name,omitempty"`
-	Sort       *string                 `form:"sort,omitempty" json:"sort,omitempty"`
+	// Limit 每页条数（上限 200，超限裁剪到 200）
+	Limit      *ListLimit              `form:"limit,omitempty" json:"limit,omitempty"`
+	Offset     *ListOffset             `form:"offset,omitempty" json:"offset,omitempty"`
+	Name       *ListName               `form:"name,omitempty" json:"name,omitempty"`
+	Sort       *ListSort               `form:"sort,omitempty" json:"sort,omitempty"`
 	Order      *GetAccountsParamsOrder `form:"order,omitempty" json:"order,omitempty"`
-	Status     *string                 `form:"status,omitempty" json:"status,omitempty"`
-	TemplateId *int64                  `form:"template_id,omitempty" json:"template_id,omitempty"`
+	TemplateId *AccountTemplateId      `form:"template_id,omitempty" json:"template_id,omitempty"`
+
+	// Enabled 管理面启停过滤：true = 仅启用，false = 仅禁用；缺省 = 不过滤（与运行时失效 failed_at 无关）
+	Enabled *AccountEnabled `form:"enabled,omitempty" json:"enabled,omitempty"`
 }
 
 // GetAccountsParamsOrder defines parameters for GetAccounts.
@@ -1716,18 +2399,44 @@ type GetAccountsParamsOrder string
 
 // GetAccountsUsageParams defines parameters for GetAccountsUsage.
 type GetAccountsUsageParams struct {
-	AccountIds string     `form:"account_ids" json:"account_ids"`
-	From       *time.Time `form:"from,omitempty" json:"from,omitempty"`
-	To         *time.Time `form:"to,omitempty" json:"to,omitempty"`
+	AccountIds string `form:"account_ids" json:"account_ids"`
+
+	// From 绝对窗口下界（含，RFC3339）。窗口两形态**恰择一**（from+to，或 window 单独）：与 window 同给 / 只给一端 / 都不给 → 400 `reason=window_ambiguous`。给出 from/to 时不做时区改写；服务端按判定把两端向后取整到整点（生效窗口见响应头 X-Stats-Effective-From/To）
+	From *StatsFrom `form:"from,omitempty" json:"from,omitempty"`
+
+	// To 绝对窗口上界（不含，RFC3339）。与 from 同生共死：只给一端 → 400 `reason=window_ambiguous`；from 不早于 to → 400 `reason=window_invalid`
+	To *StatsTo `form:"to,omitempty" json:"to,omitempty"`
+
+	// Window 相对窗口（时长串，Go `time.ParseDuration` 形态，如 `24h`/`168h`/`2160h`）。
+	// 给出它时**必须**省略 `from`/`to`（同时给出 → 400 `reason=window_ambiguous`）。
+	// 服务端自持时钟：`to` = 当前时刻向上取整到 UTC 整点、`from` = `to` − `window`
+	// ⇒ 两端恒整点，命中卷积表的精确分支（零对齐位移、零桶丢失），这就是 UI 预设
+	// 走这条形态的理由。
+	//
+	// **只收时长，不收日历天**：`d` 不是 `time.ParseDuration` 的单位，`7d` → 400
+	// （`reason=window_invalid`）。理由：`24h` 与"一个日历天"在 DST 切换日不相等，
+	// 而本 API 的唯一对齐基准是固定 1h 网格；另立 `AddDate` 日历语义会引入第二套
+	// 窗口长度语义。预设即网格整倍数：24h / 168h / 720h / 2160h。
+	Window *StatsWindow `form:"window,omitempty" json:"window,omitempty"`
 
 	// Timezone IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-	// 仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-	// 其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-	// 等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-	// 客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-	// （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-	// 窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+	// 仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+	// 绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+	// 但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+	// 「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+	//
+	// 窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+	// 卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+	// 取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+	// 分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+	// 8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+	// 截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
 	Timezone *StatsTimezone `form:"timezone,omitempty" json:"timezone,omitempty"`
+}
+
+// PatchAccountsIdParams defines parameters for PatchAccountsId.
+type PatchAccountsIdParams struct {
+	IfMatch *string `json:"If-Match,omitempty"`
 }
 
 // GetErrLogsParams defines parameters for GetErrLogs.
@@ -1748,10 +2457,11 @@ type GetErrLogsParams struct {
 
 // GetGroupsParams defines parameters for GetGroups.
 type GetGroupsParams struct {
-	Limit  *int                  `form:"limit,omitempty" json:"limit,omitempty"`
-	Offset *int                  `form:"offset,omitempty" json:"offset,omitempty"`
-	Name   *string               `form:"name,omitempty" json:"name,omitempty"`
-	Sort   *string               `form:"sort,omitempty" json:"sort,omitempty"`
+	// Limit 每页条数（上限 200，超限裁剪到 200）
+	Limit  *ListLimit            `form:"limit,omitempty" json:"limit,omitempty"`
+	Offset *ListOffset           `form:"offset,omitempty" json:"offset,omitempty"`
+	Name   *ListName             `form:"name,omitempty" json:"name,omitempty"`
+	Sort   *ListSort             `form:"sort,omitempty" json:"sort,omitempty"`
 	Order  *GetGroupsParamsOrder `form:"order,omitempty" json:"order,omitempty"`
 }
 
@@ -1778,12 +2488,17 @@ type GetAdminOverviewParams struct {
 	GroupId *int64 `form:"group_id,omitempty" json:"group_id,omitempty"`
 
 	// Timezone IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-	// 仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-	// 其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-	// 等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-	// 客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-	// （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-	// 窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+	// 仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+	// 绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+	// 但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+	// 「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+	//
+	// 窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+	// 卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+	// 取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+	// 分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+	// 8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+	// 截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
 	Timezone *StatsTimezone `form:"timezone,omitempty" json:"timezone,omitempty"`
 }
 
@@ -1863,6 +2578,37 @@ type GetRedemptionCodesIdUsesParams struct {
 	Offset *int `form:"offset,omitempty" json:"offset,omitempty"`
 }
 
+// GetRoutingFlowParams defines parameters for GetRoutingFlow.
+type GetRoutingFlowParams struct {
+	Route    string    `form:"route" json:"route"`
+	From     time.Time `form:"from" json:"from"`
+	To       time.Time `form:"to" json:"to"`
+	Offset   *int      `form:"offset,omitempty" json:"offset,omitempty"`
+	Limit    *int      `form:"limit,omitempty" json:"limit,omitempty"`
+	Accounts *int      `form:"accounts,omitempty" json:"accounts,omitempty"`
+}
+
+// GetRoutingFrontierParams defines parameters for GetRoutingFrontier.
+type GetRoutingFrontierParams struct {
+	Route  string    `form:"route" json:"route"`
+	From   time.Time `form:"from" json:"from"`
+	To     time.Time `form:"to" json:"to"`
+	Offset *int      `form:"offset,omitempty" json:"offset,omitempty"`
+	Limit  *int      `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
+// GetRoutingPlanParams defines parameters for GetRoutingPlan.
+type GetRoutingPlanParams struct {
+	Search           *string    `form:"search,omitempty" json:"search,omitempty"`
+	Route            *string    `form:"route,omitempty" json:"route,omitempty"`
+	ObservedFrom     *time.Time `form:"observed_from,omitempty" json:"observed_from,omitempty"`
+	ObservedTo       *time.Time `form:"observed_to,omitempty" json:"observed_to,omitempty"`
+	Offset           *int       `form:"offset,omitempty" json:"offset,omitempty"`
+	Limit            *int       `form:"limit,omitempty" json:"limit,omitempty"`
+	CandidatesOffset *int       `form:"candidates_offset,omitempty" json:"candidates_offset,omitempty"`
+	CandidatesLimit  *int       `form:"candidates_limit,omitempty" json:"candidates_limit,omitempty"`
+}
+
 // ListRulesParams defines parameters for ListRules.
 type ListRulesParams struct {
 	Enabled *bool `form:"enabled,omitempty" json:"enabled,omitempty"`
@@ -1870,20 +2616,37 @@ type ListRulesParams struct {
 
 // GetStatsEntityTrendParams defines parameters for GetStatsEntityTrend.
 type GetStatsEntityTrendParams struct {
-	Entity      GetStatsEntityTrendParamsEntity      `form:"entity" json:"entity"`
-	Id          int64                                `form:"id" json:"id"`
-	From        time.Time                            `form:"from" json:"from"`
-	To          time.Time                            `form:"to" json:"to"`
+	Entity GetStatsEntityTrendParamsEntity `form:"entity" json:"entity"`
+	Id     int64                           `form:"id" json:"id"`
+	From   *time.Time                      `form:"from,omitempty" json:"from,omitempty"`
+	To     *time.Time                      `form:"to,omitempty" json:"to,omitempty"`
+
+	// Window 相对窗口（时长串，Go `time.ParseDuration` 形态，如 `24h`/`168h`/`2160h`）。
+	// 给出它时**必须**省略 `from`/`to`（同时给出 → 400 `reason=window_ambiguous`）。
+	// 服务端自持时钟：`to` = 当前时刻向上取整到 UTC 整点、`from` = `to` − `window`
+	// ⇒ 两端恒整点，命中卷积表的精确分支（零对齐位移、零桶丢失），这就是 UI 预设
+	// 走这条形态的理由。
+	//
+	// **只收时长，不收日历天**：`d` 不是 `time.ParseDuration` 的单位，`7d` → 400
+	// （`reason=window_invalid`）。理由：`24h` 与"一个日历天"在 DST 切换日不相等，
+	// 而本 API 的唯一对齐基准是固定 1h 网格；另立 `AddDate` 日历语义会引入第二套
+	// 窗口长度语义。预设即网格整倍数：24h / 168h / 720h / 2160h。
+	Window      *StatsWindow                         `form:"window,omitempty" json:"window,omitempty"`
 	Granularity GetStatsEntityTrendParamsGranularity `form:"granularity" json:"granularity"`
 	Model       *string                              `form:"model,omitempty" json:"model,omitempty"`
 
 	// Timezone IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-	// 仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-	// 其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-	// 等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-	// 客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-	// （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-	// 窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+	// 仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+	// 绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+	// 但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+	// 「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+	//
+	// 窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+	// 卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+	// 取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+	// 分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+	// 8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+	// 截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
 	Timezone *StatsTimezone `form:"timezone,omitempty" json:"timezone,omitempty"`
 }
 
@@ -1902,12 +2665,17 @@ type GetStatsTopParams struct {
 	Limit  *int                    `form:"limit,omitempty" json:"limit,omitempty"`
 
 	// Timezone IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-	// 仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-	// 其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-	// 等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-	// 客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-	// （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-	// 窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+	// 仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+	// 绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+	// 但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+	// 「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+	//
+	// 窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+	// 卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+	// 取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+	// 分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+	// 8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+	// 截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
 	Timezone *StatsTimezone `form:"timezone,omitempty" json:"timezone,omitempty"`
 }
 
@@ -1919,19 +2687,36 @@ type GetStatsTopParamsBy string
 
 // GetStatsTrendParams defines parameters for GetStatsTrend.
 type GetStatsTrendParams struct {
-	From        time.Time                       `form:"from" json:"from"`
-	To          time.Time                       `form:"to" json:"to"`
+	From *time.Time `form:"from,omitempty" json:"from,omitempty"`
+	To   *time.Time `form:"to,omitempty" json:"to,omitempty"`
+
+	// Window 相对窗口（时长串，Go `time.ParseDuration` 形态，如 `24h`/`168h`/`2160h`）。
+	// 给出它时**必须**省略 `from`/`to`（同时给出 → 400 `reason=window_ambiguous`）。
+	// 服务端自持时钟：`to` = 当前时刻向上取整到 UTC 整点、`from` = `to` − `window`
+	// ⇒ 两端恒整点，命中卷积表的精确分支（零对齐位移、零桶丢失），这就是 UI 预设
+	// 走这条形态的理由。
+	//
+	// **只收时长，不收日历天**：`d` 不是 `time.ParseDuration` 的单位，`7d` → 400
+	// （`reason=window_invalid`）。理由：`24h` 与"一个日历天"在 DST 切换日不相等，
+	// 而本 API 的唯一对齐基准是固定 1h 网格；另立 `AddDate` 日历语义会引入第二套
+	// 窗口长度语义。预设即网格整倍数：24h / 168h / 720h / 2160h。
+	Window      *StatsWindow                    `form:"window,omitempty" json:"window,omitempty"`
 	Granularity *GetStatsTrendParamsGranularity `form:"granularity,omitempty" json:"granularity,omitempty"`
 	GroupId     *int64                          `form:"group_id,omitempty" json:"group_id,omitempty"`
 	Model       *string                         `form:"model,omitempty" json:"model,omitempty"`
 
 	// Timezone IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-	// 仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-	// 其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-	// 等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-	// 客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-	// （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-	// 窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+	// 仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+	// 绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+	// 但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+	// 「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+	//
+	// 窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+	// 卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+	// 取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+	// 分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+	// 8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+	// 截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
 	Timezone *StatsTimezone `form:"timezone,omitempty" json:"timezone,omitempty"`
 }
 
@@ -1940,24 +2725,61 @@ type GetStatsTrendParamsGranularity string
 
 // GetStatsTTFTParams defines parameters for GetStatsTTFT.
 type GetStatsTTFTParams struct {
-	From   time.Time                 `form:"from" json:"from"`
-	To     time.Time                 `form:"to" json:"to"`
+	From *time.Time `form:"from,omitempty" json:"from,omitempty"`
+	To   *time.Time `form:"to,omitempty" json:"to,omitempty"`
+
+	// Window 相对窗口（时长串，Go `time.ParseDuration` 形态，如 `24h`/`168h`/`2160h`）。
+	// 给出它时**必须**省略 `from`/`to`（同时给出 → 400 `reason=window_ambiguous`）。
+	// 服务端自持时钟：`to` = 当前时刻向上取整到 UTC 整点、`from` = `to` − `window`
+	// ⇒ 两端恒整点，命中卷积表的精确分支（零对齐位移、零桶丢失），这就是 UI 预设
+	// 走这条形态的理由。
+	//
+	// **只收时长，不收日历天**：`d` 不是 `time.ParseDuration` 的单位，`7d` → 400
+	// （`reason=window_invalid`）。理由：`24h` 与"一个日历天"在 DST 切换日不相等，
+	// 而本 API 的唯一对齐基准是固定 1h 网格；另立 `AddDate` 日历语义会引入第二套
+	// 窗口长度语义。预设即网格整倍数：24h / 168h / 720h / 2160h。
+	Window *StatsWindow              `form:"window,omitempty" json:"window,omitempty"`
 	Entity *GetStatsTTFTParamsEntity `form:"entity,omitempty" json:"entity,omitempty"`
 	Id     *int64                    `form:"id,omitempty" json:"id,omitempty"`
 	Model  *string                   `form:"model,omitempty" json:"model,omitempty"`
 
 	// Timezone IANA 时区名（如 Asia/Shanghai / America/New_York；控制台取浏览器时区）。
-	// 仅影响**分组读**：时间桶按该时区的本地小时/日界聚合、缺省"当天"日界按
-	// 其本地零点计算；显式 from/to 恒为绝对时刻直透，不受时区改写；排行/TTFT
-	// 等无分组数值端点接受并校验该参数但不改变数值。空/缺省 = UTC（兼容旧
-	// 客户端）；未知名 → 400。DST 或 :30/:45 偏移时区的分组读改扫原始明细
-	// （受 usage.log_retention_days / usage.errlog_retention_days 保留期约束，
-	// 窗口上限 8 天，超限 → 400）；UTC 及恒整点无 DST 时区读 180 天卷积表。
+	// 仅影响**分组读**：时间桶按该时区的本地小时/日界聚合。显式 from/to 恒为
+	// 绝对时刻直透，不受时区改写；排行/TTFT 等无分组数值端点接受并校验该参数
+	// 但不改变数值。空/缺省 = UTC（兼容旧客户端）；未知名 → 400。overview 的
+	// 「今日」日界仍按该时区本地零点计算（窗口是 days，不是 from/to）。
+	//
+	// 窗口上限**不是一个固定天数**：界不齐时服务端把两端向后取整到整点以换取
+	// 卷积表快路径（生效窗口用 X-Stats-Effective-From/To 回显），能否用卷积表
+	// 取决于**时区偏移是否恒整点且窗内无 DST 跳变**；DST 或 :30/:45 偏移时区的
+	// 分组读只能扫原始明细行。成本上限是保留期无关的纯常量（分组原始行固定
+	// 8 天、卷积表 90 天），覆盖上限另有 per-table 保留期闸门（起点早于保留
+	// 截止 → 400）。两者的**真实数值见 GET /api/admin/stats/capabilities**。
 	Timezone *StatsTimezone `form:"timezone,omitempty" json:"timezone,omitempty"`
 }
 
 // GetStatsTTFTParamsEntity defines parameters for GetStatsTTFT.
 type GetStatsTTFTParamsEntity string
+
+// GetAdminSupplierBalancesParams defines parameters for GetAdminSupplierBalances.
+type GetAdminSupplierBalancesParams struct {
+	Limit  *int `form:"limit,omitempty" json:"limit,omitempty"`
+	Offset *int `form:"offset,omitempty" json:"offset,omitempty"`
+}
+
+// GetAdminSupplierSettlementsParams defines parameters for GetAdminSupplierSettlements.
+type GetAdminSupplierSettlementsParams struct {
+	Status *GetAdminSupplierSettlementsParamsStatus `form:"status,omitempty" json:"status,omitempty"`
+	Kind   *GetAdminSupplierSettlementsParamsKind   `form:"kind,omitempty" json:"kind,omitempty"`
+	Limit  *int                                     `form:"limit,omitempty" json:"limit,omitempty"`
+	Offset *int                                     `form:"offset,omitempty" json:"offset,omitempty"`
+}
+
+// GetAdminSupplierSettlementsParamsStatus defines parameters for GetAdminSupplierSettlements.
+type GetAdminSupplierSettlementsParamsStatus string
+
+// GetAdminSupplierSettlementsParamsKind defines parameters for GetAdminSupplierSettlements.
+type GetAdminSupplierSettlementsParamsKind string
 
 // GetTempBalancesParams defines parameters for GetTempBalances.
 type GetTempBalancesParams struct {
@@ -1973,10 +2795,11 @@ type GetTempBalancesParamsOrder string
 
 // GetTemplatesParams defines parameters for GetTemplates.
 type GetTemplatesParams struct {
-	Limit  *int                     `form:"limit,omitempty" json:"limit,omitempty"`
-	Offset *int                     `form:"offset,omitempty" json:"offset,omitempty"`
-	Name   *string                  `form:"name,omitempty" json:"name,omitempty"`
-	Sort   *string                  `form:"sort,omitempty" json:"sort,omitempty"`
+	// Limit 每页条数（上限 200，超限裁剪到 200）
+	Limit  *ListLimit               `form:"limit,omitempty" json:"limit,omitempty"`
+	Offset *ListOffset              `form:"offset,omitempty" json:"offset,omitempty"`
+	Name   *ListName                `form:"name,omitempty" json:"name,omitempty"`
+	Sort   *ListSort                `form:"sort,omitempty" json:"sort,omitempty"`
 	Order  *GetTemplatesParamsOrder `form:"order,omitempty" json:"order,omitempty"`
 }
 
@@ -2000,19 +2823,30 @@ type GetUsageLogsParams struct {
 
 // GetUsersParams defines parameters for GetUsers.
 type GetUsersParams struct {
-	Limit  *int                 `form:"limit,omitempty" json:"limit,omitempty"`
-	Offset *int                 `form:"offset,omitempty" json:"offset,omitempty"`
-	Email  *string              `form:"email,omitempty" json:"email,omitempty"`
-	Sort   *string              `form:"sort,omitempty" json:"sort,omitempty"`
-	Order  *GetUsersParamsOrder `form:"order,omitempty" json:"order,omitempty"`
+	Limit           *int                 `form:"limit,omitempty" json:"limit,omitempty"`
+	Offset          *int                 `form:"offset,omitempty" json:"offset,omitempty"`
+	Email           *string              `form:"email,omitempty" json:"email,omitempty"`
+	Sort            *string              `form:"sort,omitempty" json:"sort,omitempty"`
+	Order           *GetUsersParamsOrder `form:"order,omitempty" json:"order,omitempty"`
+	Role            *GetUsersParamsRole  `form:"role,omitempty" json:"role,omitempty"`
+	SupplierSurface *bool                `form:"supplier_surface,omitempty" json:"supplier_surface,omitempty"`
 }
 
 // GetUsersParamsOrder defines parameters for GetUsers.
 type GetUsersParamsOrder string
 
+// GetUsersParamsRole defines parameters for GetUsers.
+type GetUsersParamsRole string
+
 // GetAdminUsersTopParams defines parameters for GetAdminUsersTop.
 type GetAdminUsersTopParams struct {
 	Top *int `form:"top,omitempty" json:"top,omitempty"`
+}
+
+// GetUsersIdBalanceLogsParams defines parameters for GetUsersIdBalanceLogs.
+type GetUsersIdBalanceLogsParams struct {
+	Limit  *int `form:"limit,omitempty" json:"limit,omitempty"`
+	Offset *int `form:"offset,omitempty" json:"offset,omitempty"`
 }
 
 // PostAccountsJSONRequestBody defines body for PostAccounts for application/json ContentType.
@@ -2027,17 +2861,17 @@ type PostAccountsBatchImportCodexOauthJSONRequestBody = CodexOAuthImportBody
 // PostAccountsBatchImportCodexPatJSONRequestBody defines body for PostAccountsBatchImportCodexPat for application/json ContentType.
 type PostAccountsBatchImportCodexPatJSONRequestBody = CodexPATImportBody
 
-// PostAccountsBatchResetCooldownJSONRequestBody defines body for PostAccountsBatchResetCooldown for application/json ContentType.
-type PostAccountsBatchResetCooldownJSONRequestBody = BatchResetCooldownBody
-
 // PostAccountsBatchUpdateJSONRequestBody defines body for PostAccountsBatchUpdate for application/json ContentType.
 type PostAccountsBatchUpdateJSONRequestBody = BatchUpdateAccountsBody
 
-// PutAccountsIdJSONRequestBody defines body for PutAccountsId for application/json ContentType.
-type PutAccountsIdJSONRequestBody = AccountCreate
+// PatchAccountsIdJSONRequestBody defines body for PatchAccountsId for application/json ContentType.
+type PatchAccountsIdJSONRequestBody = AccountConfigPatch
 
 // PutAccountsIdExtJSONRequestBody defines body for PutAccountsIdExt for application/json ContentType.
 type PutAccountsIdExtJSONRequestBody = AccountExt
+
+// PostAccountsIdRecoverJSONRequestBody defines body for PostAccountsIdRecover for application/json ContentType.
+type PostAccountsIdRecoverJSONRequestBody = AccountRecoverBody
 
 // PostGroupsJSONRequestBody defines body for PostGroups for application/json ContentType.
 type PostGroupsJSONRequestBody = GroupCreate
@@ -2087,6 +2921,27 @@ type UpdateRuleJSONRequestBody = RulePatch
 // PutAdminSettingsJSONRequestBody defines body for PutAdminSettings for application/json ContentType.
 type PutAdminSettingsJSONRequestBody = SettingUpdate
 
+// PatchAdminSupplierBalancesUidJSONRequestBody defines body for PatchAdminSupplierBalancesUid for application/json ContentType.
+type PatchAdminSupplierBalancesUidJSONRequestBody = SupplierBalancePatchBody
+
+// PostAdminSupplierSettlementsAdminRequestJSONRequestBody defines body for PostAdminSupplierSettlementsAdminRequest for application/json ContentType.
+type PostAdminSupplierSettlementsAdminRequestJSONRequestBody = AdminRequestSettlementBody
+
+// PostAdminSupplierSettlementsIdApproveJSONRequestBody defines body for PostAdminSupplierSettlementsIdApprove for application/json ContentType.
+type PostAdminSupplierSettlementsIdApproveJSONRequestBody = SettlementTransitionBody
+
+// PostAdminSupplierSettlementsIdClaimJSONRequestBody defines body for PostAdminSupplierSettlementsIdClaim for application/json ContentType.
+type PostAdminSupplierSettlementsIdClaimJSONRequestBody = SettlementClaimBody
+
+// PostAdminSupplierSettlementsIdConfirmFailedJSONRequestBody defines body for PostAdminSupplierSettlementsIdConfirmFailed for application/json ContentType.
+type PostAdminSupplierSettlementsIdConfirmFailedJSONRequestBody = SettlementConfirmFailedBody
+
+// PostAdminSupplierSettlementsIdPaidJSONRequestBody defines body for PostAdminSupplierSettlementsIdPaid for application/json ContentType.
+type PostAdminSupplierSettlementsIdPaidJSONRequestBody = SettlementPaidBody
+
+// PostAdminSupplierSettlementsIdRejectJSONRequestBody defines body for PostAdminSupplierSettlementsIdReject for application/json ContentType.
+type PostAdminSupplierSettlementsIdRejectJSONRequestBody = SettlementRejectBody
+
 // PostTemplatesJSONRequestBody defines body for PostTemplates for application/json ContentType.
 type PostTemplatesJSONRequestBody = TemplateCreate
 
@@ -2128,13 +2983,10 @@ type ServerInterface interface {
 	// 批量导入 codex-pat 凭据（幂等组合键 codex_email + codex_account_id；items ≤100 原始条数；行级失败不毁整批）
 	// (POST /accounts/batch-import-codex-pat)
 	PostAccountsBatchImportCodexPat(w http.ResponseWriter, r *http.Request)
-	// 批量重置账号冷却（事务，全成或全败；status→active + cooldown_until=now）
-	// (POST /accounts/batch-reset-cooldown)
-	PostAccountsBatchResetCooldown(w http.ResponseWriter, r *http.Request)
 	// 批量更新账号（fields 为任意字段子集）
 	// (POST /accounts/batch-update)
 	PostAccountsBatchUpdate(w http.ResponseWriter, r *http.Request)
-	// 账号用量聚合（统一 usage API——批量 ≤100 条；from/to 缺省 = 当天）
+	// 账号用量聚合（统一 usage API——批量 ≤100 条；窗口 from/to 或 window 恰择一）
 	// (GET /accounts/usage)
 	GetAccountsUsage(w http.ResponseWriter, r *http.Request, params GetAccountsUsageParams)
 
@@ -2143,9 +2995,9 @@ type ServerInterface interface {
 
 	// (GET /accounts/{id})
 	GetAccountsId(w http.ResponseWriter, r *http.Request, id int64)
-
-	// (PUT /accounts/{id})
-	PutAccountsId(w http.ResponseWriter, r *http.Request, id int64)
+	// 部分更新账号（三态：缺省=不变；可空标量 null=清空、""=400；不可空标量 null=400；有值=落值）
+	// (PATCH /accounts/{id})
+	PatchAccountsId(w http.ResponseWriter, r *http.Request, id int64, params PatchAccountsIdParams)
 	// 读取账号类型化鉴权扩展（编辑回显；仅 codex-oauth/codex-pat 账号有 ext 行）
 	// (GET /accounts/{id}/ext)
 	GetAccountsIdExt(w http.ResponseWriter, r *http.Request, id int64)
@@ -2155,6 +3007,9 @@ type ServerInterface interface {
 	// 读取账号的全部分组 id（编辑回显；不随账号列表返回）
 	// (GET /accounts/{id}/groups)
 	GetAccountsIdGroups(w http.ResponseWriter, r *http.Request, id int64)
+	// 失效恢复（fenced）：清 failed_at/last_error/failure_source + revision CAS +1 → 新代际置 PROBING 待探针
+	// (POST /accounts/{id}/recover)
+	PostAccountsIdRecover(w http.ResponseWriter, r *http.Request, id int64)
 	// 错误明细分页查询（err_logs 完整错误面：本地拒绝 + 半异常双轨；status_code/error_type 全值）
 	// (GET /err_logs)
 	GetErrLogs(w http.ResponseWriter, r *http.Request, params GetErrLogsParams)
@@ -2245,6 +3100,15 @@ type ServerInterface interface {
 	// 某码的兑换记录（审计；码缺失 → 404）
 	// (GET /redemption-codes/{id}/uses)
 	GetRedemptionCodesIdUses(w http.ResponseWriter, r *http.Request, id int64, params GetRedemptionCodesIdUsesParams)
+	// 路由 flow 聚合（完整链边；按 terminal_at 归属窗口）
+	// (GET /routing/flow)
+	GetRoutingFlow(w http.ResponseWriter, r *http.Request, params GetRoutingFlowParams)
+	// 质量-成本前沿（rollup 质量 × 当前计划候选目录连接）
+	// (GET /routing/frontier)
+	GetRoutingFrontier(w http.ResponseWriter, r *http.Request, params GetRoutingFrontierParams)
+	// 当前发布路由计划解释（只读投影，无历史 generation 参数）
+	// (GET /routing/plan)
+	GetRoutingPlan(w http.ResponseWriter, r *http.Request, params GetRoutingPlanParams)
 	// 规则列表（enabled 过滤，priority 升序）
 	// (GET /rules)
 	ListRules(w http.ResponseWriter, r *http.Request, params ListRulesParams)
@@ -2266,18 +3130,48 @@ type ServerInterface interface {
 	// 更新设置（类型化校验：switch 必须 true/false、number 必须数字）
 	// (PUT /settings)
 	PutAdminSettings(w http.ResponseWriter, r *http.Request)
+	// 统计能力（本部署能查多久——per-deployment 常量）
+	// (GET /stats/capabilities)
+	GetStatsCapabilities(w http.ResponseWriter, r *http.Request)
 	// 实体趋势（entity 卷积）
 	// (GET /stats/entity-trend)
 	GetStatsEntityTrend(w http.ResponseWriter, r *http.Request, params GetStatsEntityTrendParams)
 	// Top 排行（entity 卷积）
 	// (GET /stats/top)
 	GetStatsTop(w http.ResponseWriter, r *http.Request, params GetStatsTopParams)
-	// 趋势聚合（cube/原始行——按 timezone 路由）
+	// 趋势聚合（cube/原始行——按请求时区判定）
 	// (GET /stats/trend)
 	GetStatsTrend(w http.ResponseWriter, r *http.Request, params GetStatsTrendParams)
 	// TTFT 聚合（sketch 或 exact）
 	// (GET /stats/ttft)
 	GetStatsTTFT(w http.ResponseWriter, r *http.Request, params GetStatsTTFTParams)
+	// 余额列表（含最晚 available_at / bucket_rows）
+	// (GET /supplier/balances)
+	GetAdminSupplierBalances(w http.ResponseWriter, r *http.Request, params GetAdminSupplierBalancesParams)
+	// 仅 share_bp / freeze_hours（不接受金额）
+	// (PATCH /supplier/balances/{uid})
+	PatchAdminSupplierBalancesUid(w http.ResponseWriter, r *http.Request, uid int64)
+	// 结算单列表（按 status / kind 过滤；pending 是工作台）
+	// (GET /supplier/settlements)
+	GetAdminSupplierSettlements(w http.ResponseWriter, r *http.Request, params GetAdminSupplierSettlementsParams)
+	// 代申请（kind=admin_request；复用同一通道，目标须已有余额行）
+	// (POST /supplier/settlements/admin-request)
+	PostAdminSupplierSettlementsAdminRequest(w http.ResponseWriter, r *http.Request)
+	// pending → approved（CAS）
+	// (POST /supplier/settlements/{id}/approve)
+	PostAdminSupplierSettlementsIdApprove(w http.ResponseWriter, r *http.Request, id int64)
+	// approved → paying（认领 CAS；付款风控门 + 固定收款快照 + payment_key）
+	// (POST /supplier/settlements/{id}/claim)
+	PostAdminSupplierSettlementsIdClaim(w http.ResponseWriter, r *http.Request, id int64)
+	// paying → approved（仅接受「确定未支付」的核验结果；留证）
+	// (POST /supplier/settlements/{id}/confirm-failed)
+	PostAdminSupplierSettlementsIdConfirmFailed(w http.ResponseWriter, r *http.Request, id int64)
+	// 仅 paying → paid（lifetime_paid 累加；不重做风控门）
+	// (POST /supplier/settlements/{id}/paid)
+	PostAdminSupplierSettlementsIdPaid(w http.ResponseWriter, r *http.Request, id int64)
+	// pending|approved → rejected（退还 available；paying 不可 reject）
+	// (POST /supplier/settlements/{id}/reject)
+	PostAdminSupplierSettlementsIdReject(w http.ResponseWriter, r *http.Request, id int64)
 	// 临时额度列表（platform_admin 专属；全量视角含过期/用尽/负扣减行；user_id 筛选；sort 白名单 expires_at/amount/created_at，默认 expires_at asc——FEFO 同序）
 	// (GET /temp-balances)
 	GetTempBalances(w http.ResponseWriter, r *http.Request, params GetTempBalancesParams)
@@ -2323,6 +3217,9 @@ type ServerInterface interface {
 	// 更新用户（role/status/max_concurrency/balance；变更即时生效——Auth 快照刷新）
 	// (PUT /users/{id})
 	PutUsersId(w http.ResponseWriter, r *http.Request, id int64)
+	// 某用户的余额变动记录（platform_admin 专属；永久余额的非 usage 变动：注册默认/管理面创建/管理面调整/兑换码；分页）
+	// (GET /users/{id}/balance-logs)
+	GetUsersIdBalanceLogs(w http.ResponseWriter, r *http.Request, id int64, params GetUsersIdBalanceLogsParams)
 	// 读取用户被授予的分组与各专属倍率（platform_admin；用户视角，与 /groups/{id}/assignments 对称）
 	// (GET /users/{id}/groups)
 	GetUsersIdGroups(w http.ResponseWriter, r *http.Request, id int64)
@@ -2365,19 +3262,13 @@ func (_ Unimplemented) PostAccountsBatchImportCodexPat(w http.ResponseWriter, r 
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
-// 批量重置账号冷却（事务，全成或全败；status→active + cooldown_until=now）
-// (POST /accounts/batch-reset-cooldown)
-func (_ Unimplemented) PostAccountsBatchResetCooldown(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusNotImplemented)
-}
-
 // 批量更新账号（fields 为任意字段子集）
 // (POST /accounts/batch-update)
 func (_ Unimplemented) PostAccountsBatchUpdate(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
-// 账号用量聚合（统一 usage API——批量 ≤100 条；from/to 缺省 = 当天）
+// 账号用量聚合（统一 usage API——批量 ≤100 条；窗口 from/to 或 window 恰择一）
 // (GET /accounts/usage)
 func (_ Unimplemented) GetAccountsUsage(w http.ResponseWriter, r *http.Request, params GetAccountsUsageParams) {
 	w.WriteHeader(http.StatusNotImplemented)
@@ -2393,8 +3284,9 @@ func (_ Unimplemented) GetAccountsId(w http.ResponseWriter, r *http.Request, id 
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
-// (PUT /accounts/{id})
-func (_ Unimplemented) PutAccountsId(w http.ResponseWriter, r *http.Request, id int64) {
+// 部分更新账号（三态：缺省=不变；可空标量 null=清空、""=400；不可空标量 null=400；有值=落值）
+// (PATCH /accounts/{id})
+func (_ Unimplemented) PatchAccountsId(w http.ResponseWriter, r *http.Request, id int64, params PatchAccountsIdParams) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -2413,6 +3305,12 @@ func (_ Unimplemented) PutAccountsIdExt(w http.ResponseWriter, r *http.Request, 
 // 读取账号的全部分组 id（编辑回显；不随账号列表返回）
 // (GET /accounts/{id}/groups)
 func (_ Unimplemented) GetAccountsIdGroups(w http.ResponseWriter, r *http.Request, id int64) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// 失效恢复（fenced）：清 failed_at/last_error/failure_source + revision CAS +1 → 新代际置 PROBING 待探针
+// (POST /accounts/{id}/recover)
+func (_ Unimplemented) PostAccountsIdRecover(w http.ResponseWriter, r *http.Request, id int64) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -2592,6 +3490,24 @@ func (_ Unimplemented) GetRedemptionCodesIdUses(w http.ResponseWriter, r *http.R
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
+// 路由 flow 聚合（完整链边；按 terminal_at 归属窗口）
+// (GET /routing/flow)
+func (_ Unimplemented) GetRoutingFlow(w http.ResponseWriter, r *http.Request, params GetRoutingFlowParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// 质量-成本前沿（rollup 质量 × 当前计划候选目录连接）
+// (GET /routing/frontier)
+func (_ Unimplemented) GetRoutingFrontier(w http.ResponseWriter, r *http.Request, params GetRoutingFrontierParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// 当前发布路由计划解释（只读投影，无历史 generation 参数）
+// (GET /routing/plan)
+func (_ Unimplemented) GetRoutingPlan(w http.ResponseWriter, r *http.Request, params GetRoutingPlanParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
 // 规则列表（enabled 过滤，priority 升序）
 // (GET /rules)
 func (_ Unimplemented) ListRules(w http.ResponseWriter, r *http.Request, params ListRulesParams) {
@@ -2634,6 +3550,12 @@ func (_ Unimplemented) PutAdminSettings(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
+// 统计能力（本部署能查多久——per-deployment 常量）
+// (GET /stats/capabilities)
+func (_ Unimplemented) GetStatsCapabilities(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
 // 实体趋势（entity 卷积）
 // (GET /stats/entity-trend)
 func (_ Unimplemented) GetStatsEntityTrend(w http.ResponseWriter, r *http.Request, params GetStatsEntityTrendParams) {
@@ -2646,7 +3568,7 @@ func (_ Unimplemented) GetStatsTop(w http.ResponseWriter, r *http.Request, param
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
-// 趋势聚合（cube/原始行——按 timezone 路由）
+// 趋势聚合（cube/原始行——按请求时区判定）
 // (GET /stats/trend)
 func (_ Unimplemented) GetStatsTrend(w http.ResponseWriter, r *http.Request, params GetStatsTrendParams) {
 	w.WriteHeader(http.StatusNotImplemented)
@@ -2655,6 +3577,60 @@ func (_ Unimplemented) GetStatsTrend(w http.ResponseWriter, r *http.Request, par
 // TTFT 聚合（sketch 或 exact）
 // (GET /stats/ttft)
 func (_ Unimplemented) GetStatsTTFT(w http.ResponseWriter, r *http.Request, params GetStatsTTFTParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// 余额列表（含最晚 available_at / bucket_rows）
+// (GET /supplier/balances)
+func (_ Unimplemented) GetAdminSupplierBalances(w http.ResponseWriter, r *http.Request, params GetAdminSupplierBalancesParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// 仅 share_bp / freeze_hours（不接受金额）
+// (PATCH /supplier/balances/{uid})
+func (_ Unimplemented) PatchAdminSupplierBalancesUid(w http.ResponseWriter, r *http.Request, uid int64) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// 结算单列表（按 status / kind 过滤；pending 是工作台）
+// (GET /supplier/settlements)
+func (_ Unimplemented) GetAdminSupplierSettlements(w http.ResponseWriter, r *http.Request, params GetAdminSupplierSettlementsParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// 代申请（kind=admin_request；复用同一通道，目标须已有余额行）
+// (POST /supplier/settlements/admin-request)
+func (_ Unimplemented) PostAdminSupplierSettlementsAdminRequest(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// pending → approved（CAS）
+// (POST /supplier/settlements/{id}/approve)
+func (_ Unimplemented) PostAdminSupplierSettlementsIdApprove(w http.ResponseWriter, r *http.Request, id int64) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// approved → paying（认领 CAS；付款风控门 + 固定收款快照 + payment_key）
+// (POST /supplier/settlements/{id}/claim)
+func (_ Unimplemented) PostAdminSupplierSettlementsIdClaim(w http.ResponseWriter, r *http.Request, id int64) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// paying → approved（仅接受「确定未支付」的核验结果；留证）
+// (POST /supplier/settlements/{id}/confirm-failed)
+func (_ Unimplemented) PostAdminSupplierSettlementsIdConfirmFailed(w http.ResponseWriter, r *http.Request, id int64) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// 仅 paying → paid（lifetime_paid 累加；不重做风控门）
+// (POST /supplier/settlements/{id}/paid)
+func (_ Unimplemented) PostAdminSupplierSettlementsIdPaid(w http.ResponseWriter, r *http.Request, id int64) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// pending|approved → rejected（退还 available；paying 不可 reject）
+// (POST /supplier/settlements/{id}/reject)
+func (_ Unimplemented) PostAdminSupplierSettlementsIdReject(w http.ResponseWriter, r *http.Request, id int64) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -2745,6 +3721,12 @@ func (_ Unimplemented) PutUsersId(w http.ResponseWriter, r *http.Request, id int
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
+// 某用户的余额变动记录（platform_admin 专属；永久余额的非 usage 变动：注册默认/管理面创建/管理面调整/兑换码；分页）
+// (GET /users/{id}/balance-logs)
+func (_ Unimplemented) GetUsersIdBalanceLogs(w http.ResponseWriter, r *http.Request, id int64, params GetUsersIdBalanceLogsParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
 // 读取用户被授予的分组与各专属倍率（platform_admin；用户视角，与 /groups/{id}/assignments 对称）
 // (GET /users/{id}/groups)
 func (_ Unimplemented) GetUsersIdGroups(w http.ResponseWriter, r *http.Request, id int64) {
@@ -2814,19 +3796,19 @@ func (siw *ServerInterfaceWrapper) GetAccounts(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// ------------- Optional query parameter "status" -------------
-
-	err = runtime.BindQueryParameter("form", true, false, "status", r.URL.Query(), &params.Status)
-	if err != nil {
-		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "status", Err: err})
-		return
-	}
-
 	// ------------- Optional query parameter "template_id" -------------
 
 	err = runtime.BindQueryParameter("form", true, false, "template_id", r.URL.Query(), &params.TemplateId)
 	if err != nil {
 		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "template_id", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "enabled" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "enabled", r.URL.Query(), &params.Enabled)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "enabled", Err: err})
 		return
 	}
 
@@ -2897,20 +3879,6 @@ func (siw *ServerInterfaceWrapper) PostAccountsBatchImportCodexPat(w http.Respon
 	handler.ServeHTTP(w, r)
 }
 
-// PostAccountsBatchResetCooldown operation middleware
-func (siw *ServerInterfaceWrapper) PostAccountsBatchResetCooldown(w http.ResponseWriter, r *http.Request) {
-
-	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.PostAccountsBatchResetCooldown(w, r)
-	}))
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		handler = middleware(handler)
-	}
-
-	handler.ServeHTTP(w, r)
-}
-
 // PostAccountsBatchUpdate operation middleware
 func (siw *ServerInterfaceWrapper) PostAccountsBatchUpdate(w http.ResponseWriter, r *http.Request) {
 
@@ -2961,6 +3929,14 @@ func (siw *ServerInterfaceWrapper) GetAccountsUsage(w http.ResponseWriter, r *ht
 	err = runtime.BindQueryParameter("form", true, false, "to", r.URL.Query(), &params.To)
 	if err != nil {
 		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "to", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "window" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "window", r.URL.Query(), &params.Window)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "window", Err: err})
 		return
 	}
 
@@ -3033,8 +4009,8 @@ func (siw *ServerInterfaceWrapper) GetAccountsId(w http.ResponseWriter, r *http.
 	handler.ServeHTTP(w, r)
 }
 
-// PutAccountsId operation middleware
-func (siw *ServerInterfaceWrapper) PutAccountsId(w http.ResponseWriter, r *http.Request) {
+// PatchAccountsId operation middleware
+func (siw *ServerInterfaceWrapper) PatchAccountsId(w http.ResponseWriter, r *http.Request) {
 
 	var err error
 
@@ -3047,8 +4023,32 @@ func (siw *ServerInterfaceWrapper) PutAccountsId(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// Parameter object where we will unmarshal all parameters from the context
+	var params PatchAccountsIdParams
+
+	headers := r.Header
+
+	// ------------- Optional header parameter "If-Match" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("If-Match")]; found {
+		var IfMatch string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "If-Match", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "If-Match", valueList[0], &IfMatch, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "If-Match", Err: err})
+			return
+		}
+
+		params.IfMatch = &IfMatch
+
+	}
+
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.PutAccountsId(w, r, id)
+		siw.Handler.PatchAccountsId(w, r, id, params)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -3124,6 +4124,31 @@ func (siw *ServerInterfaceWrapper) GetAccountsIdGroups(w http.ResponseWriter, r 
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetAccountsIdGroups(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PostAccountsIdRecover operation middleware
+func (siw *ServerInterfaceWrapper) PostAccountsIdRecover(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "id" -------------
+	var id int64
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PostAccountsIdRecover(w, r, id)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -4152,6 +5177,257 @@ func (siw *ServerInterfaceWrapper) GetRedemptionCodesIdUses(w http.ResponseWrite
 	handler.ServeHTTP(w, r)
 }
 
+// GetRoutingFlow operation middleware
+func (siw *ServerInterfaceWrapper) GetRoutingFlow(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetRoutingFlowParams
+
+	// ------------- Required query parameter "route" -------------
+
+	if paramValue := r.URL.Query().Get("route"); paramValue != "" {
+
+	} else {
+		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "route"})
+		return
+	}
+
+	err = runtime.BindQueryParameter("form", true, true, "route", r.URL.Query(), &params.Route)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "route", Err: err})
+		return
+	}
+
+	// ------------- Required query parameter "from" -------------
+
+	if paramValue := r.URL.Query().Get("from"); paramValue != "" {
+
+	} else {
+		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "from"})
+		return
+	}
+
+	err = runtime.BindQueryParameter("form", true, true, "from", r.URL.Query(), &params.From)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "from", Err: err})
+		return
+	}
+
+	// ------------- Required query parameter "to" -------------
+
+	if paramValue := r.URL.Query().Get("to"); paramValue != "" {
+
+	} else {
+		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "to"})
+		return
+	}
+
+	err = runtime.BindQueryParameter("form", true, true, "to", r.URL.Query(), &params.To)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "to", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "offset" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "offset", r.URL.Query(), &params.Offset)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "offset", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "limit", r.URL.Query(), &params.Limit)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "accounts" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "accounts", r.URL.Query(), &params.Accounts)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "accounts", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetRoutingFlow(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetRoutingFrontier operation middleware
+func (siw *ServerInterfaceWrapper) GetRoutingFrontier(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetRoutingFrontierParams
+
+	// ------------- Required query parameter "route" -------------
+
+	if paramValue := r.URL.Query().Get("route"); paramValue != "" {
+
+	} else {
+		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "route"})
+		return
+	}
+
+	err = runtime.BindQueryParameter("form", true, true, "route", r.URL.Query(), &params.Route)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "route", Err: err})
+		return
+	}
+
+	// ------------- Required query parameter "from" -------------
+
+	if paramValue := r.URL.Query().Get("from"); paramValue != "" {
+
+	} else {
+		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "from"})
+		return
+	}
+
+	err = runtime.BindQueryParameter("form", true, true, "from", r.URL.Query(), &params.From)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "from", Err: err})
+		return
+	}
+
+	// ------------- Required query parameter "to" -------------
+
+	if paramValue := r.URL.Query().Get("to"); paramValue != "" {
+
+	} else {
+		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "to"})
+		return
+	}
+
+	err = runtime.BindQueryParameter("form", true, true, "to", r.URL.Query(), &params.To)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "to", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "offset" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "offset", r.URL.Query(), &params.Offset)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "offset", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "limit", r.URL.Query(), &params.Limit)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetRoutingFrontier(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetRoutingPlan operation middleware
+func (siw *ServerInterfaceWrapper) GetRoutingPlan(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetRoutingPlanParams
+
+	// ------------- Optional query parameter "search" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "search", r.URL.Query(), &params.Search)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "search", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "route" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "route", r.URL.Query(), &params.Route)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "route", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "observed_from" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "observed_from", r.URL.Query(), &params.ObservedFrom)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "observed_from", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "observed_to" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "observed_to", r.URL.Query(), &params.ObservedTo)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "observed_to", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "offset" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "offset", r.URL.Query(), &params.Offset)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "offset", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "limit", r.URL.Query(), &params.Limit)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "candidates_offset" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "candidates_offset", r.URL.Query(), &params.CandidatesOffset)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "candidates_offset", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "candidates_limit" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "candidates_limit", r.URL.Query(), &params.CandidatesLimit)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "candidates_limit", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetRoutingPlan(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // ListRules operation middleware
 func (siw *ServerInterfaceWrapper) ListRules(w http.ResponseWriter, r *http.Request) {
 
@@ -4285,6 +5561,20 @@ func (siw *ServerInterfaceWrapper) PutAdminSettings(w http.ResponseWriter, r *ht
 	handler.ServeHTTP(w, r)
 }
 
+// GetStatsCapabilities operation middleware
+func (siw *ServerInterfaceWrapper) GetStatsCapabilities(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetStatsCapabilities(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // GetStatsEntityTrend operation middleware
 func (siw *ServerInterfaceWrapper) GetStatsEntityTrend(w http.ResponseWriter, r *http.Request) {
 
@@ -4323,33 +5613,27 @@ func (siw *ServerInterfaceWrapper) GetStatsEntityTrend(w http.ResponseWriter, r 
 		return
 	}
 
-	// ------------- Required query parameter "from" -------------
+	// ------------- Optional query parameter "from" -------------
 
-	if paramValue := r.URL.Query().Get("from"); paramValue != "" {
-
-	} else {
-		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "from"})
-		return
-	}
-
-	err = runtime.BindQueryParameter("form", true, true, "from", r.URL.Query(), &params.From)
+	err = runtime.BindQueryParameter("form", true, false, "from", r.URL.Query(), &params.From)
 	if err != nil {
 		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "from", Err: err})
 		return
 	}
 
-	// ------------- Required query parameter "to" -------------
+	// ------------- Optional query parameter "to" -------------
 
-	if paramValue := r.URL.Query().Get("to"); paramValue != "" {
-
-	} else {
-		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "to"})
+	err = runtime.BindQueryParameter("form", true, false, "to", r.URL.Query(), &params.To)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "to", Err: err})
 		return
 	}
 
-	err = runtime.BindQueryParameter("form", true, true, "to", r.URL.Query(), &params.To)
+	// ------------- Optional query parameter "window" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "window", r.URL.Query(), &params.Window)
 	if err != nil {
-		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "to", Err: err})
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "window", Err: err})
 		return
 	}
 
@@ -4498,33 +5782,27 @@ func (siw *ServerInterfaceWrapper) GetStatsTrend(w http.ResponseWriter, r *http.
 	// Parameter object where we will unmarshal all parameters from the context
 	var params GetStatsTrendParams
 
-	// ------------- Required query parameter "from" -------------
+	// ------------- Optional query parameter "from" -------------
 
-	if paramValue := r.URL.Query().Get("from"); paramValue != "" {
-
-	} else {
-		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "from"})
-		return
-	}
-
-	err = runtime.BindQueryParameter("form", true, true, "from", r.URL.Query(), &params.From)
+	err = runtime.BindQueryParameter("form", true, false, "from", r.URL.Query(), &params.From)
 	if err != nil {
 		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "from", Err: err})
 		return
 	}
 
-	// ------------- Required query parameter "to" -------------
+	// ------------- Optional query parameter "to" -------------
 
-	if paramValue := r.URL.Query().Get("to"); paramValue != "" {
-
-	} else {
-		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "to"})
+	err = runtime.BindQueryParameter("form", true, false, "to", r.URL.Query(), &params.To)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "to", Err: err})
 		return
 	}
 
-	err = runtime.BindQueryParameter("form", true, true, "to", r.URL.Query(), &params.To)
+	// ------------- Optional query parameter "window" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "window", r.URL.Query(), &params.Window)
 	if err != nil {
-		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "to", Err: err})
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "window", Err: err})
 		return
 	}
 
@@ -4579,33 +5857,27 @@ func (siw *ServerInterfaceWrapper) GetStatsTTFT(w http.ResponseWriter, r *http.R
 	// Parameter object where we will unmarshal all parameters from the context
 	var params GetStatsTTFTParams
 
-	// ------------- Required query parameter "from" -------------
+	// ------------- Optional query parameter "from" -------------
 
-	if paramValue := r.URL.Query().Get("from"); paramValue != "" {
-
-	} else {
-		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "from"})
-		return
-	}
-
-	err = runtime.BindQueryParameter("form", true, true, "from", r.URL.Query(), &params.From)
+	err = runtime.BindQueryParameter("form", true, false, "from", r.URL.Query(), &params.From)
 	if err != nil {
 		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "from", Err: err})
 		return
 	}
 
-	// ------------- Required query parameter "to" -------------
+	// ------------- Optional query parameter "to" -------------
 
-	if paramValue := r.URL.Query().Get("to"); paramValue != "" {
-
-	} else {
-		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "to"})
+	err = runtime.BindQueryParameter("form", true, false, "to", r.URL.Query(), &params.To)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "to", Err: err})
 		return
 	}
 
-	err = runtime.BindQueryParameter("form", true, true, "to", r.URL.Query(), &params.To)
+	// ------------- Optional query parameter "window" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "window", r.URL.Query(), &params.Window)
 	if err != nil {
-		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "to", Err: err})
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "window", Err: err})
 		return
 	}
 
@@ -4643,6 +5915,256 @@ func (siw *ServerInterfaceWrapper) GetStatsTTFT(w http.ResponseWriter, r *http.R
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetStatsTTFT(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetAdminSupplierBalances operation middleware
+func (siw *ServerInterfaceWrapper) GetAdminSupplierBalances(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetAdminSupplierBalancesParams
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "limit", r.URL.Query(), &params.Limit)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "offset" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "offset", r.URL.Query(), &params.Offset)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "offset", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetAdminSupplierBalances(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PatchAdminSupplierBalancesUid operation middleware
+func (siw *ServerInterfaceWrapper) PatchAdminSupplierBalancesUid(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "uid" -------------
+	var uid int64
+
+	err = runtime.BindStyledParameterWithOptions("simple", "uid", chi.URLParam(r, "uid"), &uid, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "uid", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PatchAdminSupplierBalancesUid(w, r, uid)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetAdminSupplierSettlements operation middleware
+func (siw *ServerInterfaceWrapper) GetAdminSupplierSettlements(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetAdminSupplierSettlementsParams
+
+	// ------------- Optional query parameter "status" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "status", r.URL.Query(), &params.Status)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "status", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "kind" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "kind", r.URL.Query(), &params.Kind)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "kind", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "limit", r.URL.Query(), &params.Limit)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "offset" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "offset", r.URL.Query(), &params.Offset)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "offset", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetAdminSupplierSettlements(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PostAdminSupplierSettlementsAdminRequest operation middleware
+func (siw *ServerInterfaceWrapper) PostAdminSupplierSettlementsAdminRequest(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PostAdminSupplierSettlementsAdminRequest(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PostAdminSupplierSettlementsIdApprove operation middleware
+func (siw *ServerInterfaceWrapper) PostAdminSupplierSettlementsIdApprove(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "id" -------------
+	var id int64
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PostAdminSupplierSettlementsIdApprove(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PostAdminSupplierSettlementsIdClaim operation middleware
+func (siw *ServerInterfaceWrapper) PostAdminSupplierSettlementsIdClaim(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "id" -------------
+	var id int64
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PostAdminSupplierSettlementsIdClaim(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PostAdminSupplierSettlementsIdConfirmFailed operation middleware
+func (siw *ServerInterfaceWrapper) PostAdminSupplierSettlementsIdConfirmFailed(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "id" -------------
+	var id int64
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PostAdminSupplierSettlementsIdConfirmFailed(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PostAdminSupplierSettlementsIdPaid operation middleware
+func (siw *ServerInterfaceWrapper) PostAdminSupplierSettlementsIdPaid(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "id" -------------
+	var id int64
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PostAdminSupplierSettlementsIdPaid(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PostAdminSupplierSettlementsIdReject operation middleware
+func (siw *ServerInterfaceWrapper) PostAdminSupplierSettlementsIdReject(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "id" -------------
+	var id int64
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PostAdminSupplierSettlementsIdReject(w, r, id)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -5106,6 +6628,22 @@ func (siw *ServerInterfaceWrapper) GetUsers(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// ------------- Optional query parameter "role" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "role", r.URL.Query(), &params.Role)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "role", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "supplier_surface" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "supplier_surface", r.URL.Query(), &params.SupplierSurface)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "supplier_surface", Err: err})
+		return
+	}
+
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetUsers(w, r, params)
 	}))
@@ -5174,6 +6712,50 @@ func (siw *ServerInterfaceWrapper) PutUsersId(w http.ResponseWriter, r *http.Req
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.PutUsersId(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetUsersIdBalanceLogs operation middleware
+func (siw *ServerInterfaceWrapper) GetUsersIdBalanceLogs(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "id" -------------
+	var id int64
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetUsersIdBalanceLogsParams
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "limit", r.URL.Query(), &params.Limit)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "offset" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "offset", r.URL.Query(), &params.Offset)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "offset", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetUsersIdBalanceLogs(w, r, id, params)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -5362,9 +6944,6 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 		r.Post(options.BaseURL+"/accounts/batch-import-codex-pat", wrapper.PostAccountsBatchImportCodexPat)
 	})
 	r.Group(func(r chi.Router) {
-		r.Post(options.BaseURL+"/accounts/batch-reset-cooldown", wrapper.PostAccountsBatchResetCooldown)
-	})
-	r.Group(func(r chi.Router) {
 		r.Post(options.BaseURL+"/accounts/batch-update", wrapper.PostAccountsBatchUpdate)
 	})
 	r.Group(func(r chi.Router) {
@@ -5377,7 +6956,7 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 		r.Get(options.BaseURL+"/accounts/{id}", wrapper.GetAccountsId)
 	})
 	r.Group(func(r chi.Router) {
-		r.Put(options.BaseURL+"/accounts/{id}", wrapper.PutAccountsId)
+		r.Patch(options.BaseURL+"/accounts/{id}", wrapper.PatchAccountsId)
 	})
 	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/accounts/{id}/ext", wrapper.GetAccountsIdExt)
@@ -5387,6 +6966,9 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 	})
 	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/accounts/{id}/groups", wrapper.GetAccountsIdGroups)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/accounts/{id}/recover", wrapper.PostAccountsIdRecover)
 	})
 	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/err_logs", wrapper.GetErrLogs)
@@ -5479,6 +7061,15 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 		r.Get(options.BaseURL+"/redemption-codes/{id}/uses", wrapper.GetRedemptionCodesIdUses)
 	})
 	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/routing/flow", wrapper.GetRoutingFlow)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/routing/frontier", wrapper.GetRoutingFrontier)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/routing/plan", wrapper.GetRoutingPlan)
+	})
+	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/rules", wrapper.ListRules)
 	})
 	r.Group(func(r chi.Router) {
@@ -5500,6 +7091,9 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 		r.Put(options.BaseURL+"/settings", wrapper.PutAdminSettings)
 	})
 	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/stats/capabilities", wrapper.GetStatsCapabilities)
+	})
+	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/stats/entity-trend", wrapper.GetStatsEntityTrend)
 	})
 	r.Group(func(r chi.Router) {
@@ -5510,6 +7104,33 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 	})
 	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/stats/ttft", wrapper.GetStatsTTFT)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/supplier/balances", wrapper.GetAdminSupplierBalances)
+	})
+	r.Group(func(r chi.Router) {
+		r.Patch(options.BaseURL+"/supplier/balances/{uid}", wrapper.PatchAdminSupplierBalancesUid)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/supplier/settlements", wrapper.GetAdminSupplierSettlements)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/supplier/settlements/admin-request", wrapper.PostAdminSupplierSettlementsAdminRequest)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/supplier/settlements/{id}/approve", wrapper.PostAdminSupplierSettlementsIdApprove)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/supplier/settlements/{id}/claim", wrapper.PostAdminSupplierSettlementsIdClaim)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/supplier/settlements/{id}/confirm-failed", wrapper.PostAdminSupplierSettlementsIdConfirmFailed)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/supplier/settlements/{id}/paid", wrapper.PostAdminSupplierSettlementsIdPaid)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/supplier/settlements/{id}/reject", wrapper.PostAdminSupplierSettlementsIdReject)
 	})
 	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/temp-balances", wrapper.GetTempBalances)
@@ -5555,6 +7176,9 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 	})
 	r.Group(func(r chi.Router) {
 		r.Put(options.BaseURL+"/users/{id}", wrapper.PutUsersId)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/users/{id}/balance-logs", wrapper.GetUsersIdBalanceLogs)
 	})
 	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/users/{id}/groups", wrapper.GetUsersIdGroups)

@@ -21,18 +21,28 @@ func (Account) Fields() []ent.Field {
 		// 回填：旧行 NULL = 继承模板（旧行为天然成立）。
 		field.String("base_url").Optional().Nillable(),
 		field.String("upstream_key"),
-		field.Enum("status").
-			Values("active", "unhealthy", "429", "disabled").
-			Default("active"),
-		field.Time("cooldown_until").Optional().Nillable(),
-		field.Int("weight").Default(100),
 		field.Int("max_concurrency").Default(8),
 		field.String("last_error").Optional().Nillable(),
 		field.Time("last_used_at").Optional().Nillable(),
 		// failed_at SDK 上报的运行时失效时刻（SDK 接入 T1——用户裁决 2026-08-13：
 		// 仅此一列；失效原因复用既有 last_error，两原因字段并存会漂移）。nil =
-		// 未失效；与 status=disabled（管理面手动禁用）语义分离，两者可并存。
+		// 未失效；与 enabled=false（管理面手动禁用）语义分离，两者可并存。
 		field.Time("failed_at").Optional().Nillable(),
+		field.String("failure_source").Optional().Nillable(),
+		field.Bool("enabled").Default(true),
+		field.Int64("lifecycle_revision").Default(1),
+		// identity_revision 身份纪元（K，spec §5.2）：仅管理面身份类字段写入
+		// （§2.1，含可轮换凭据）使其 +1；SDK 自动 token 刷新不推进。
+		// Default(1) 必需：非空列在 schema 创建/ADD COLUMN 时需要默认值，
+		// 且定义"新行初值 = 1"（§3.2 创建默认 identity_revision=1）。
+		field.Int64("identity_revision").Default(1),
+		field.Int("upstream_cost_multiplier_bp").Default(10000),
+		field.String("cache_domain").Optional().Nillable(),
+		// supplier_user_id 账号归属（spec 2026-10-09 §3.2）：NULL = 平台自有。
+		// Identity = false：归属变更是账务属性，不推进 identity_revision（K）。
+		// 无迁移逻辑——ent auto-migrate 自动加列（accounts 非分区表），旧行
+		// NULL = 平台自有。
+		field.Int64("supplier_user_id").Optional().Nillable(),
 		field.Time("updated_at").Default(time.Now).UpdateDefault(time.Now),
 		field.Time("deleted_at").Optional().Nillable(), // 软删除时间戳（nil = 存活）；null 语义 = 未删除
 		field.Time("created_at").Default(time.Now),

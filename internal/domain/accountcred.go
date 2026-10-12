@@ -10,10 +10,10 @@ import (
 	"github.com/is7qin/c3api/internal/credential"
 )
 
-// AccountCredential 网关侧凭据传递形态（SDK 接入契约，T1 §4）：每次调用必传
+// AccountCredential 网关侧凭据传递形态（SDK 接入契约，§4）：每次调用必传
 // （调度器按请求选账号）。从 AccountExt 派生（CredentialFromExt）——codex-oauth
 // → OAuthToken/OAuthRefreshToken/OAuthExpiresAt；codex-pat → PATKey。适配层
-// （T2 起）把 cred 转成 SDK Auth 账号级缓存键：同账号复用、失效剔除。Codex
+// （此后）把 cred 转成 SDK Auth 账号级缓存键：同账号复用、失效剔除。Codex
 // 数据面 URL 归 SDK 官方默认所有，网关不再派生或传递 BaseURL。
 type AccountCredential struct {
 	AccountID         int64
@@ -21,6 +21,9 @@ type AccountCredential struct {
 	OAuthRefreshToken string
 	OAuthExpiresAt    *time.Time
 	PATKey            string
+	// CodexAccountID 上游账号/空间标识（ChatGPT-Account-ID 头——SDK 内部注入面；
+	// 空 = 不发头，向后兼容）。落库点定值（导入行/单账号保存派生），热路径只读。
+	CodexAccountID string
 }
 
 // CredentialFromExt 从账号扩展行派生每次调用必传的凭据（投影语义：按类型取
@@ -32,6 +35,13 @@ func CredentialFromExt(e *AccountExt) AccountCredential {
 		return AccountCredential{}
 	}
 	c := AccountCredential{AccountID: e.AccountID}
+	// 账号标识 codex 两类型统一投影（非 codex 类型不带——调用方按类型分流，
+	// 非本类型的列不触达）。
+	if e.CredentialType.IsCodex() {
+		if e.CodexAccountID != nil {
+			c.CodexAccountID = *e.CodexAccountID
+		}
+	}
 	switch e.CredentialType {
 	case credential.TypeCodexOAuth:
 		if e.CodexOAuthToken != nil {

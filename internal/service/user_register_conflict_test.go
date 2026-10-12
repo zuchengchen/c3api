@@ -28,8 +28,12 @@ type registerRaceStore struct {
 }
 
 func newRegisterRaceStore() *registerRaceStore {
+	fs := newFakeStore()
+	// RegisterUser 现走 WithTx：事务内 CreateUser 需强制 email 唯一（镜像
+	// user_repo.go CreateUser 对 23505 的映射形态）——竞态双插入必现一者冲突。
+	fs.createUserUnique = true
 	return &registerRaceStore{
-		fakeStore: newFakeStore(),
+		fakeStore: fs,
 		arrived:   make(chan struct{}, 2),
 		release:   make(chan struct{}),
 	}
@@ -66,7 +70,7 @@ func TestRegisterUserConcurrentDuplicateEmail(t *testing.T) {
 	fs := newRegisterRaceStore()
 	// New 直接装配（newSnapshotSvc 收 *fakeStore，raceStore 是嵌入式 store）：
 	// settings 快照默认 signup_enabled=true、temp_balance=0（不插赠品行）。
-	svc := New(fs, nil, NopInvalidator{}, nil, nil, nil, nil)
+	svc := New(Deps{Store: fs, Scheduler: nil, Invalidate: NopInvalidator{}, Publisher: nil, RuleReload: nil, Auth: nil, Log: nil, EmailCodeStore: testEmailCodes})
 	ctx := context.Background()
 
 	const email = "race@example.com"

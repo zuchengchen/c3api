@@ -2,8 +2,8 @@
 // Dual-licensed: AGPL-3.0-or-later (open source) or commercial license (closed-source
 // deployment exemption); see LICENSE and LICENSE.commercial. Copyright (c) 2026 is7Qin.
 
-// Package server 装配 chi 路由：/api/admin/*（静态 token OR platform_admin JWT）+
-// /api/user/*（JWT 保护，register/login 公开）+ 三个 AI 端点 + /healthz。
+// Package server 装配 chi 路由：/api/admin/*（platform_admin JWT 或该身份的管理
+// key mk-）+ /api/user/*（身份鉴权，register/login 公开）+ 三个 AI 端点 + /healthz。
 // 架构约束：所有 API 统一收口于 /api/*，前端 SPA 占用根及 /api/user/*、/app/*，
 // 两者无前缀重叠，SPA fallback 可无歧义地回 index.html。
 package server
@@ -23,17 +23,24 @@ import (
 )
 
 type Options struct {
-	AdminToken        string
-	JWTIssuer         *auth.Issuer            // platform_admin JWT 鉴权（/api/admin 扩展）
-	UserStatus        auth.UserStatusProvider // 用户快照 status+role（JWT 鉴权路径禁用/降权即拒；nil = JWT 路径全拒）
+	JWTIssuer *auth.Issuer // platform_admin JWT 鉴权（/api/admin 扩展）
+	// Auth 单一鉴权快照面（users + mgmt 合并，proxy.Auth 实现）：adminAuth 的
+	// JWT 分支查用户快照（status+role+token_version），mk- 分支查管理 key + owner
+	// 快照；nil = 两条路径全拒（fail-closed）。
+	Auth              auth.SnapshotProvider
 	MaxInflight       int64
 	ReadHeaderTimeout time.Duration
 	MaxHeaderBytes    int
 	AdminHandler      http.Handler // 已挂 /api/admin/* 路由
-	UserHandler       http.Handler // 已挂 /api/user/* 路由（内部完成公开/JWT 分流）
-	AIHandler         http.Handler // proxy 三个端点
-	WebFS             fs.FS        // 前端构建产物（nil = 不挂静态资源）
-	Logger            *logx.Logger
+	UserHandler       http.Handler // 已挂 /api/user/* 路由（内部完成公开/身份分流）
+	// SupplierHandler 供应商面（/api/user/supplier/*）：RequireJWT + 快照基
+	// RequireRole(supplier|platform_admin) + 作用域注入 + **契约生成路由**
+	// （openapi 里 tag `supplier` 的 path；未登记者未注册 ⇒ 404），账号/分组(只读)/
+	// 模板(只读) op 转发到管理面同一批 handler（§2.5/§2.6）。nil = 不挂载。
+	SupplierHandler http.Handler
+	AIHandler       http.Handler // proxy 三个端点
+	WebFS           fs.FS        // 前端构建产物（nil = 不挂静态资源）
+	Logger          *logx.Logger
 }
 
 type Server struct {
@@ -49,13 +56,10 @@ func NewServer(opts Options) *Server {
 	if opts.MaxHeaderBytes == 0 {
 		opts.MaxHeaderBytes = 1 << 20
 	}
-	if opts.MaxInflight == 0 {
-		opts.MaxInflight = 50000
-	}
 	s := &Server{opts: opts}
 
 	r := chi.NewRouter()
-	// 顺序：accessLog 最外层、recoverer 内层（F4）——recoverer 的 w 即
+	// 顺序：accessLog 最外层、recoverer 内层——recoverer 的 w 即
 	// statusWriter，已写头判定（headersWritten）与 500 状态回写都经同一包装；
 	// 旧序（recoverer 外层）recoverer 只见裸 writer，无法感知已写头。
 	r.Use(accessLog(opts.Logger))
@@ -72,9 +76,9 @@ func NewServer(opts Options) *Server {
 	})
 
 	r.Group(func(r chi.Router) {
-		// 管理面鉴权（adminAuth，定义见 middleware.go）：静态 admin token OR
-		// platform_admin JWT（两个都过才拒）。/api/admin/ops/workers 运维观测在
-		// AdminHandler 内（生成路由），同组鉴权。
+		// 管理面鉴权（adminAuth，定义见 middleware.go）：platform_admin JWT 或
+		// platform_admin 身份的管理 key mk-（两者都过才拒）。/api/admin/ops/workers
+		// 运维观测在 AdminHandler 内（生成路由），同组鉴权。
 		r.Use(adminAuth(opts))
 		if opts.AdminHandler != nil {
 			// 用 Handle 而非 Mount：chi v5.3.1 对同一 pattern 重复 Mount 会 panic，
@@ -84,6 +88,13 @@ func NewServer(opts Options) *Server {
 		}
 	})
 
+	// 供应商面：挂在 /api/user 之前——更具体的静态前缀 /api/user/supplier/*
+	// 优先于 /api/user/*（chi 路由树按最长静态匹配）。门控/作用域/**暴露面
+	// （openapi tag supplier 的登记）**在 SupplierHandler 内部完成
+	// （handler.NewSupplierSurface）。
+	if opts.SupplierHandler != nil {
+		r.Handle("/api/user/supplier/*", opts.SupplierHandler)
+	}
 	// /api/user 组：内部完成公开（register/login）与 JWT 保护分流。
 	if opts.UserHandler != nil {
 		r.Handle("/api/user/*", opts.UserHandler)
@@ -92,14 +103,21 @@ func NewServer(opts Options) *Server {
 	r.Group(func(r chi.Router) {
 		r.Use(inflightLimiter(opts.MaxInflight, &s.inflight))
 		if opts.AIHandler != nil {
-			r.Mount("/", opts.AIHandler)
+			// AI 面路由全部位于 /v1/*（proxy.AIRouter）。必须用 Handle 静态前缀
+			// 挂载而非 Mount("/", …)：Mount("/") 注册 /* 通配吞掉一切未匹配路径，
+			// SPA 深链（/app、/user）与任意非 API 路径会误入 AI 组——冷启动
+			// 未发布计划时经 planReadyGate 变 503（控制台不可达）、计划就绪后落
+			// AI 子路由默认 404；且 planReadyGate 包装后不再是 *chi.Mux，chi 的
+			// NotFound 子路由传播（updateSubRoutes 的 Routes 断言）失效，根 SPA
+			// fallback 永远不可达。
+			r.Handle("/v1/*", opts.AIHandler)
 		}
 	})
 
 	// 静态资源 + SPA fallback：必须在 admin/AI/healthz 之后注册。
-	// 说明：chi 的 NotFound() 会向已 Mount 的子路由传播（updateSubRoutes），
-	// 因此这里在 Mount("/", AIHandler) 之后设置 NotFound，AI 路由的未匹配
-	// 路径会进入同一 fallback；/api/admin/* 经 Handle 注册不受影响。
+	// AI 面无通配挂载（见上），未匹配路径到达本层 NotFound：未知 API（/api/*
+	// 除 admin/user 外）直接 404，其余路径仅对浏览器导航（Accept: text/html）
+	// 回 index.html；/v1/*、/assets/*、/favicon.svg 由各自静态路由吸收。
 	if opts.WebFS != nil {
 		web := webFSNoDirs{fs: opts.WebFS} // 目录请求 → 404（不渲染 HTML 目录列表）
 		r.Handle("/assets/*", http.FileServerFS(web))

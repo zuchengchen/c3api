@@ -20,42 +20,54 @@ import (
 	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/handler/httpface"
 	"github.com/is7qin/c3api/pkg/logx"
+	"github.com/is7qin/c3api/pkg/sserelay"
 )
 
 // adminUserIDKey /admin 认证中间件写入的 platform_admin 用户 id（created_by 用，
-// 决策 5：0 = 系统）。静态 admin token 路径不写入（handler 读到 0）。
+// 决策 5：0 = 系统）。管理 key（mk-）路径同样写入 owner id。
 type adminUserIDKey struct{}
 
-// UserIDFromContext 取 /admin JWT 鉴权路径注入的用户 id（兑换码生成 created_by
-// 用）；静态 admin token 路径未注入 → (0, false)。
+// UserIDFromContext 取 /admin 鉴权路径注入的用户 id（JWT 或管理 key mk- 皆注入；
+// 兑换码生成 created_by 用）；未注入 → (0, false)。
 func UserIDFromContext(ctx context.Context) (int64, bool) {
 	id, ok := ctx.Value(adminUserIDKey{}).(int64)
 	return id, ok
 }
 
-// adminAuth 管理面鉴权（/admin 组，含 /api/admin/ops/workers 运维观测）= 静态
-// admin token OR platform_admin JWT（两个都过才拒）。JWT 路径校验快照
-// status+role（F1）：**快照 role 覆盖 claims.Role**——降权（platform_admin →
-// user）后旧 JWT 立即失效（快照刷新 ≤Reload 周期），claims 24h 长时效不作
-// 角色信任源；快照缺失 → fail-closed 拒绝（启动首刷失败/Reload 失败保留旧
-// 快照/NOTIFY 丢失同纪律）；**opts.UserStatus == nil → JWT 路径整体拒绝**
-// （行为变化：旧实现 nil 提供者放行——无快照角色可校验，fail-closed 语义
-// 一致；生产恒装配无实害）。
-// admin.token 可空（spec 2026-08-15）：空 = 不启用静态 token 鉴权，/admin
-// 仅接受 platform_admin JWT。空守卫使静态路径永不匹配——理由 = 语义显式化
-// + h2/TLS 纵深防御：h1 下 Go textproto 修剪头值两端 OWS，"Bearer 尾空击穿"
-// 不存在（实测见 spec 背景 6）；Go http2 server 不修剪头值，未来启用 h2 后
-// 守卫防击穿。
+// adminAuth 管理面鉴权（/admin 组，含 /api/admin/ops/workers 运维观测）=
+// platform_admin JWT 或 platform_admin 身份的**管理 key mk-**（两个都过才拒）。
+// JWT 路径校验快照 status+role：**快照 role 覆盖 claims.Role**——降权
+// （platform_admin → user）后旧 JWT 立即失效（快照刷新 ≤Reload 周期），claims 24h
+// 长时效不作角色信任源；快照缺失 → fail-closed 拒绝（启动首刷失败/Reload 失败
+// 保留旧快照/NOTIFY 丢失同纪律）；**opts.Auth == nil → JWT/mk- 路径整体
+// 拒绝**（fail-closed）。
+//
+// 管理 key 分支（spec 2026-10-09 §4.4）：Bearer mk-… → 快照查表（前缀先判、失败
+// 不回退 JWT）→ owner UserSnapshot；`role==platform_admin && status==active` 才
+// 放行（降权后该 key 立即失去 /api/admin 可达，仍是其 user 面 key），注入
+// adminUserIDKey + FundsActor{TokenVersion: sn.TokenVersion}；否则 401。
+// 静态管理面 token 机制已全量删除（spec §4.7）；缺失/空凭证
+// 绝不放行（无匹配即 401）。
 func adminAuth(opts Options) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			authz := req.Header.Get("Authorization")
-			if opts.AdminToken != "" && authz == "Bearer "+opts.AdminToken {
-				// 静态 admin token 路径不注入 UserID（决策 5：handler 读到 0 = 系统）
-				next.ServeHTTP(w, req)
+			// 管理 key 分支：仅 mk- 前缀进入；失败/非 platform_admin 直接 401
+			// （不得回落 JWT——前缀先判、失败不回退）。
+			if opts.Auth != nil && strings.HasPrefix(authz, "Bearer mk-") {
+				if meta, ok := opts.Auth.AuthenticateManagement(req); ok {
+					if sn, ok := opts.Auth.UserSnapshot(meta.UserID); ok &&
+						sn.Role == domain.RolePlatformAdmin && sn.Status == domain.UserStatusActive {
+						ctx := context.WithValue(req.Context(), adminUserIDKey{}, meta.UserID)
+						ctx = domain.WithFundsActor(ctx, domain.FundsActor{UserID: meta.UserID, TokenVersion: sn.TokenVersion})
+						next.ServeHTTP(w, req.WithContext(ctx))
+						return
+					}
+				}
+				httpface.WriteJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 				return
 			}
-			if opts.JWTIssuer != nil && opts.UserStatus != nil && strings.HasPrefix(authz, "Bearer ") {
+			if opts.JWTIssuer != nil && opts.Auth != nil && strings.HasPrefix(authz, "Bearer ") {
 				claims, err := opts.JWTIssuer.Verify(strings.TrimPrefix(authz, "Bearer "))
 				if err == nil {
 					// 快照 role 覆盖 claims.Role + 快照状态校验（单次查找零分配）
@@ -63,11 +75,14 @@ func adminAuth(opts Options) func(http.Handler) http.Handler {
 					// platform_admin 改密后旧 JWT 同样立即失效——快照源与 RequireJWT
 					// 同一 auth.UserStatusProvider，UserSnapshot.TokenVersion 由
 					// repository.LoadUsers 透传）。
-					if sn, ok := opts.UserStatus.UserSnapshot(claims.UserID); ok &&
+					if sn, ok := opts.Auth.UserSnapshot(claims.UserID); ok &&
 						sn.Role == domain.RolePlatformAdmin && sn.Status == domain.UserStatusActive &&
 						sn.TokenVersion == claims.Ver {
 						// JWT 路径注入 claims.UserID（兑换码 created_by 用，决策 5）
 						ctx := context.WithValue(req.Context(), adminUserIDKey{}, claims.UserID)
+						// 资金操作者（spec 2026-10-09 §6.5 I5）：具名 uid + 签名请求的
+						// token_version——资金写命令在写事务内据它复核。
+						ctx = domain.WithFundsActor(ctx, domain.FundsActor{UserID: claims.UserID, TokenVersion: claims.Ver})
 						next.ServeHTTP(w, req.WithContext(ctx))
 						return
 					}
@@ -156,11 +171,25 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 // Flush 委托给内层 writer（SSE 事件级冲刷必需）。
 // 嵌入 http.ResponseWriter 只提升 Header/Write/WriteHeader 三个方法，
 // 不带 Flush——包装层不透传的话，下游 sseWriter 拿到的 Flusher 是 nil，
-// 流只能攒 4KB 缓冲批量放出，首字节延迟实测 ~145ms（Task 9 压测发现）。
+// 流只能攒 4KB 缓冲批量放出，首字节延迟实测 ~145ms（压测发现）。
 func (w *statusWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// FlushError 转发 flush 到内层（单一探测链实现见 sserelay.FlushWriter：
+// FlushError→Flusher→Unwrap，与 http.ResponseController 一致）；并在 flush 成功
+// 引发隐式写头（net/http 语义 = 首次 flush 前自动 WriteHeader(200)）时同步置
+// status/headersWritten——否则 recoverer 误判 "未写头" 仍写 500 body 污染已开始
+// 的流（与 Write 覆写同款）。flush 失败（如 ErrNotSupported，未真正写头）不置标志。
+func (w *statusWriter) FlushError() error {
+	err := sserelay.FlushWriter(w.ResponseWriter)
+	if err == nil && !w.headersWritten {
+		w.status = http.StatusOK
+		w.headersWritten = true
+	}
+	return err
 }
 
 // Hijack 委托给内层 writer（WS 升级必需——coder/websocket Accept 要求
@@ -179,7 +208,7 @@ func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // Unwrap 暴露内层 ResponseWriter（与 Hijack 同款的纯转发模式）：
 // http.ResponseController 的 SetWriteDeadline/EnableFullDuplex 等沿
 // Unwrap 链下探到真实 writer 才能生效——无此转发全链 ErrNotSupported
-// （C-P2-1 写侧 deadline 与 ctx 取消联动的前置修复：accessLog 包裹后
+// （写侧 deadline 与 ctx 取消联动的前置修复：accessLog 包裹后
 // sserelay 的取消联动 deadline 必须能穿透本层）。
 func (w *statusWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
@@ -192,7 +221,7 @@ func recoverer(log *logx.Logger) func(http.Handler) http.Handler {
 				if rec := recover(); rec != nil {
 					if log != nil {
 						// debug.Stack()：panic 定位靠栈——无栈日志只有 message 无法
-						// 溯源（F4；栈在错误路径才物化，热路径零成本）。
+						// 溯源（；栈在错误路径才物化，热路径零成本）。
 						log.Error("panic recovered",
 							logx.Any("panic", rec),
 							logx.String("stack", string(debug.Stack())),

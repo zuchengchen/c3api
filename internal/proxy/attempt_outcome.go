@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 package proxy
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/is7qin/c3api/internal/scheduler"
+)
 
 // AttemptID is a per-attempt identifier. Dispatched metadata
-// (RouteClassID/Fingerprint/Lane/Generation/LifecycleRevision) currently
-// uses placeholder values; canonical stable IDs will be provided by Task4/7/11
-// (RouteClass/QualityClass/candidate fingerprint) and wired in Task13. Do
-// not loosen to legacy Selection fields.
+// (RouteClassID/QualityClassID/Fingerprint/Lane/Generation/IdentityRevision)
+// is plan-canonical: it comes from the scheduler.Attempt recorded by
+// ReserveAttempt (pipelineBase), never from placeholder values.
 type AttemptID string
 
 func (a AttemptID) Validate() error {
@@ -21,7 +24,14 @@ type RouteClassID string
 
 type CandidateFingerprint string
 
-type LifecycleRevision int64
+type QualityClassID string
+
+type OperationTag string
+
+// IdentityRevision is the account identity generation (K) carried by an
+// attempt: the same K the plan attempt was compiled with. It is NOT the
+// lifecycle token (C), which only fences client writes.
+type IdentityRevision int64
 
 type LaneID string
 
@@ -166,10 +176,24 @@ func (c CallerCategory) Valid() bool {
 }
 
 type AttemptOutcome struct {
-	ID                AttemptID
-	RouteClassID      RouteClassID
-	Fingerprint       CandidateFingerprint
-	LifecycleRevision LifecycleRevision
+	ID             AttemptID
+	RouteClassID   RouteClassID
+	QualityClassID QualityClassID
+	Fingerprint    CandidateFingerprint
+	TemplateID     int64
+	AccountID      int64
+	RequestedModel string
+	MappedModel    string
+	CallerCategory CallerCategory
+	OperationTag   OperationTag
+	Ordinal        uint8
+	// IdentityRevision carries K on dispatched outcomes (plan-canonical, copied
+	// from scheduler.Attempt). Values built by the synthetic caller/WS/retry
+	// constructors are a placeholder (1): those outcomes never dispatched through
+	// a plan attempt, feed only the observation/wire surface, and do not take part
+	// in the continuation (I,K) comparison (contPin compares the plan-canonical
+	// Attempt), so the placeholder cannot become a wrong judgement.
+	IdentityRevision  IdentityRevision
 	Lane              LaneID
 	Generation        Generation
 	Commit            CommitState
@@ -241,9 +265,6 @@ func (o AttemptOutcome) Validate() error {
 	if o.Commit == CommitNotSent && o.BusinessFrameSent {
 		return fmt.Errorf("not_sent cannot have BusinessFrameSent")
 	}
-	if o.BusinessFrameSent && o.Commit == CommitNotSent {
-		return fmt.Errorf("BusinessFrameSent requires commit != not_sent")
-	}
 	if (o.Commit == CommitResponseStarted || o.Commit == CommitClientCommitted) && !o.BusinessFrameSent {
 		return fmt.Errorf("response_started/client_committed requires BusinessFrameSent")
 	}
@@ -253,26 +274,56 @@ func (o AttemptOutcome) Validate() error {
 	if o.Commit == CommitSentAmbiguous && !o.BusinessFrameSent {
 		return fmt.Errorf("sent_ambiguous requires BusinessFrameSent")
 	}
-	// Generation / LifecycleRevision >0 for dispatched (placeholder zero rejected; canonical values from Task4/7/11)
+	// Generation / IdentityRevision >0 for dispatched (placeholder zero rejected; canonical values from routing dispatch)
 	if o.IsDispatched() {
 		if o.RouteClassID == "" {
 			return fmt.Errorf("RouteClassID required for dispatched attempt")
 		}
+		if o.QualityClassID == "" {
+			return fmt.Errorf("QualityClassID required for dispatched attempt")
+		}
 		if o.Fingerprint == "" {
 			return fmt.Errorf("Fingerprint required for dispatched attempt")
+		}
+		if o.TemplateID == 0 {
+			return fmt.Errorf("TemplateID required for dispatched attempt")
+		}
+		if o.AccountID == 0 {
+			return fmt.Errorf("AccountID required for dispatched attempt")
+		}
+		if o.RequestedModel == "" {
+			return fmt.Errorf("RequestedModel required for dispatched attempt")
+		}
+		if o.MappedModel == "" {
+			return fmt.Errorf("MappedModel required for dispatched attempt")
+		}
+		if !o.CallerCategory.Valid() {
+			return fmt.Errorf("CallerCategory required and must be valid for dispatched attempt")
+		}
+		if o.OperationTag == "" {
+			return fmt.Errorf("OperationTag required for dispatched attempt")
 		}
 		if !o.Lane.Valid() {
 			return fmt.Errorf("Lane required and must be valid for dispatched attempt")
 		}
+		if o.Ordinal == 0 {
+			return fmt.Errorf("Ordinal must be >0 for dispatched attempt")
+		}
 		if o.Generation <= 0 {
 			return fmt.Errorf("Generation must be >0")
 		}
-		if o.LifecycleRevision <= 0 {
-			return fmt.Errorf("LifecycleRevision must be >0")
+		if o.IdentityRevision <= 0 {
+			return fmt.Errorf("IdentityRevision must be >0")
+		}
+		if o.Ordinal == 1 && o.PreviousAttemptID != nil {
+			return fmt.Errorf("PreviousAttemptID must be nil for ordinal 1")
+		}
+		if o.Ordinal > 1 && (o.PreviousAttemptID == nil || *o.PreviousAttemptID == "") {
+			return fmt.Errorf("PreviousAttemptID required for ordinal >1")
 		}
 	} else {
 		// non-dispatched must have no dispatch metadata and status0 not_sent
-		if o.RouteClassID != "" || o.Fingerprint != "" || o.Lane != "" || o.Generation != 0 || o.LifecycleRevision != 0 {
+		if o.RouteClassID != "" || o.QualityClassID != "" || o.Fingerprint != "" || o.TemplateID != 0 || o.AccountID != 0 || o.RequestedModel != "" || o.MappedModel != "" || o.CallerCategory != "" || o.OperationTag != "" || o.Lane != "" || o.Generation != 0 || o.IdentityRevision != 0 || o.Ordinal != 0 || o.PreviousAttemptID != nil {
 			return fmt.Errorf("non-dispatched must have no dispatch metadata")
 		}
 		if o.Commit != CommitNotSent {
@@ -382,15 +433,24 @@ func (o AttemptOutcome) Validate() error {
 				return fmt.Errorf("5xx must be terminal")
 			}
 		case o.HTTPStatus == 0:
-			// network: only not_sent or sent_ambiguous
-			if o.Commit != CommitNotSent && o.Commit != CommitSentAmbiguous {
-				return fmt.Errorf("status0 network must be not_sent or sent_ambiguous")
-			}
-			if o.Commit == CommitSentAmbiguous && !o.Terminal {
-				return fmt.Errorf("sent_ambiguous must be terminal")
-			}
-			if o.Commit == CommitNotSent && o.Terminal {
-				return fmt.Errorf("not_sent network must not be terminal")
+			switch o.Commit {
+			case CommitNotSent:
+				if o.Terminal {
+					return fmt.Errorf("not_sent network must not be terminal")
+				}
+			case CommitSentAmbiguous:
+				if !o.Terminal {
+					return fmt.Errorf("sent_ambiguous must be terminal")
+				}
+			case CommitResponseStarted, CommitClientCommitted:
+				if !o.Terminal {
+					return fmt.Errorf("response_started/client_committed network must be terminal")
+				}
+				if !o.BusinessFrameSent {
+					return fmt.Errorf("response_started/client_committed requires BusinessFrameSent")
+				}
+			default:
+				return fmt.Errorf("status0 network must be not_sent, sent_ambiguous or response_started/client_committed")
 			}
 		case o.HTTPStatus >= 200 && o.HTTPStatus <= 299:
 			return fmt.Errorf("failed cannot have 2xx status")
@@ -411,18 +471,6 @@ func (o AttemptOutcome) Validate() error {
 		default:
 			return fmt.Errorf("client_cancel has invalid commit %v", o.Commit)
 		}
-		if o.Commit == CommitNotSent && o.BusinessFrameSent {
-			return fmt.Errorf("client_cancel not_sent cannot have BusinessFrameSent")
-		}
-		if (o.Commit == CommitResponseStarted || o.Commit == CommitClientCommitted) && !o.BusinessFrameSent {
-			return fmt.Errorf("client_cancel response_started/committed requires BusinessFrameSent")
-		}
-		if o.Commit == CommitSentAmbiguous && !o.BusinessFrameSent {
-			return fmt.Errorf("client_cancel sent_ambiguous requires BusinessFrameSent")
-		}
-		if o.Commit == CommitUpstreamResponded {
-			return fmt.Errorf("client_cancel cannot be upstream_responded")
-		}
 		if !o.Terminal {
 			return fmt.Errorf("client_cancel must be terminal")
 		}
@@ -439,4 +487,93 @@ func (o AttemptOutcome) Validate() error {
 		return fmt.Errorf("success cannot be upstream_responded")
 	}
 	return nil
+}
+
+// outcomeParams 是 buildOutcome 的逐字段入参：只覆盖各 caller/WS/转换 outcome
+// 构造器里会变化的字段；派发元数据（Ordinal/IdentityRevision/Lane/Generation）
+// 由 buildOutcome 统一钉为 plan-canonical 常量（=1/Primary），杜绝逐构造器重复
+// 的字面量字段（B2 收敛）。行为与原实现逐字段等价。
+type outcomeParams struct {
+	reqID          AttemptID
+	routeClassID   RouteClassID
+	qualityClassID QualityClassID
+	fingerprint    CandidateFingerprint
+	templateID     int64
+	accountID      int64
+	requestedModel string
+	mappedModel    string
+	timing         AttemptTiming
+	usage          AttemptUsage
+	commit         CommitState
+	result         AttemptResult
+	status         AttemptStatus
+	businessSent   bool
+	terminal       bool
+	malformed      bool
+}
+
+// buildOutcome 是所有「已派发尝试」outcome 的单一构造点：caller/op 由调用方
+// 显式传入，其余字段经 outcomeParams 传递。构造器只承担各自差异字段的装箱
+// （fingerprint 回退、route/quality id 派生等），派发元数据统一在此填充。
+func buildOutcome(caller CallerCategory, op OperationTag, p outcomeParams) AttemptOutcome {
+	return AttemptOutcome{
+		ID:                p.reqID,
+		RouteClassID:      p.routeClassID,
+		QualityClassID:    p.qualityClassID,
+		Fingerprint:       p.fingerprint,
+		TemplateID:        p.templateID,
+		AccountID:         p.accountID,
+		RequestedModel:    p.requestedModel,
+		MappedModel:       p.mappedModel,
+		CallerCategory:    caller,
+		OperationTag:      op,
+		Ordinal:           1,
+		IdentityRevision:  1,
+		Lane:              LanePrimary,
+		Generation:        1,
+		Commit:            p.commit,
+		Result:            p.result,
+		HTTPStatus:        p.status,
+		Timing:            p.timing,
+		Usage:             p.usage,
+		BusinessFrameSent: p.businessSent,
+		Terminal:          p.terminal,
+		IsMalformed:       p.malformed,
+	}
+}
+
+// syntheticFingerprint buildOutcome 调用方的 fingerprint 装箱助手：候选取值
+// 优先，缺失回退「fp-<reqID>」（复现 images/codex-images/converted 构造器原有的
+// reqID 派生回退；chat/search 各自的占位回退仍由各自构造器提供）。
+func syntheticFingerprint(sel *scheduler.Selection, reqID string) CandidateFingerprint {
+	fp := sel.CandidateFingerprint
+	if fp == "" {
+		fp = "fp-" + reqID
+	}
+	return CandidateFingerprint(fp)
+}
+
+// syntheticOutcome 组装 images / codex-images / images-stream / converted 四个
+// caller 共用的 AttemptOutcome：四者字段装箱逐字相同、仅 CallerCategory 不同
+// （原 imagesStreamOutcome 与 codexImagesOutcome 逐字重复，imagesOutcome 与
+// convertedOutcome 仅差类别）。收敛为单一来源，指纹统一走 syntheticFingerprint。
+func syntheticOutcome(caller CallerCategory, reqID string, sel *scheduler.Selection, reqModel string, op OperationTag, timing AttemptTiming, usage AttemptUsage, result AttemptResult, status AttemptStatus, commit CommitState, businessSent, terminal, malformed bool) AttemptOutcome {
+	return buildOutcome(caller, op, outcomeParams{
+		reqID:          AttemptID(reqID),
+		routeClassID:   RouteClassID("rc-" + reqID),
+		qualityClassID: QualityClassID("qc-" + reqID),
+		fingerprint:    syntheticFingerprint(sel, reqID),
+		templateID:     sel.TemplateID,
+		accountID:      sel.AccountID,
+		requestedModel: reqModel,
+		mappedModel:    sel.Model,
+		timing:         timing,
+		usage:          usage,
+		commit:         commit,
+		result:         result,
+		status:         status,
+		businessSent:   businessSent,
+		terminal:       terminal,
+		malformed:      malformed,
+	})
 }

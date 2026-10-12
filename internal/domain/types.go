@@ -25,7 +25,7 @@ const (
 	FormatAnthropic         RequestFormat = "anthropic"
 	// FormatOpenAIImages 图片生成（/v1/images/generations|edits，spec §4.3）：
 	// JSON + multipart 双协议；预检查统一价格快照 image 分量（跳过 chat
-	// 价预检——P1-1 预检按格式切换）。落库 format = openai-images——usage_logs.format
+	// 价预检——预检按格式切换）。落库 format = openai-images——usage_logs.format
 	// 无 DB enum（varchar），ent 生成 FormatValidator 客户端面校验（COPY 逐行
 	// 校验前置——不扩展则图片行 COPY 恒失败回灌）。
 	FormatOpenAIImages RequestFormat = "openai-images"
@@ -45,6 +45,9 @@ func (f RequestFormat) Valid() bool {
 	return false
 }
 
+// AccountStatus 账号运行时状态（纯内存调度视图——持久 status 列已随
+// intelligent-routing cutover 删除；生命周期 = enabled/failed_at fenced 面，
+// 临时健康 = typed throttle/RuntimeHealth）。
 type AccountStatus string
 
 const (
@@ -54,20 +57,71 @@ const (
 	StatusDisabled  AccountStatus = "disabled"
 )
 
-// Role 用户角色（两级：platform_admin | user）。
+// Role 用户角色（三级：platform_admin | supplier | user）。spec 2026-10-09：
+// supplier 是消费能力的超集（/v1/* 鉴权走 key 快照，与 role 无关）；供应商面
+// 可达集 = {supplier, platform_admin}（见 SupplierSurfaceRoles）。
 type Role string
 
 const (
 	RolePlatformAdmin Role = "platform_admin"
+	RoleSupplier      Role = "supplier"
 	RoleUser          Role = "user"
 )
 
 func (r Role) Valid() bool {
 	switch r {
-	case RolePlatformAdmin, RoleUser:
+	case RolePlatformAdmin, RoleSupplier, RoleUser:
 		return true
 	}
 	return false
+}
+
+// SupplierSurfaceRoles 供应商面可达角色集（**单一事实源**，spec 2026-10-09
+// §2.6）：门控（RequireRole）与账号归属值域校验（§2.5）共用同一导出值/函数——
+// **不得**在任一处重抄角色名（否则「管理員也可以是供應商」会造成静默囚笼，
+// 且新增可达角色时会漂移）。含 platform_admin：管理员要能进入供应商面查看/
+// 管理**自己名下**的账号与收益（作用域仍以 JWT 自身 user_id 为准，不互放大）。
+func SupplierSurfaceRoles() []Role {
+	return []Role{RoleSupplier, RolePlatformAdmin}
+}
+
+// CanAccessSupplierSurface 报告角色是否可访问供应商面（= 可达集成员）。
+// 门控与归属值域校验的能力谓词。
+func CanAccessSupplierSurface(r Role) bool {
+	for _, rr := range SupplierSurfaceRoles() {
+		if r == rr {
+			return true
+		}
+	}
+	return false
+}
+
+// roleRank 角色层级秩（user < supplier < platform_admin）；非法角色返回 -1。
+// AtLeast 的唯一事实源。角色是**层级**而非互斥（spec 2026-10-09 §2.1）。
+func roleRank(r Role) int {
+	switch r {
+	case RoleUser:
+		return 0
+	case RoleSupplier:
+		return 1
+	case RolePlatformAdmin:
+		return 2
+	}
+	return -1
+}
+
+// AtLeast 报告 role 是否达到 min 的层级（user ⊂ supplier ⊂ platform_admin；
+// spec 2026-10-09 §2.1）。管理 key 的可达面 = owner 角色在该层级下的闭包：
+// 供应商面 = AtLeast(supplier)、admin 面 = AtLeast(platform_admin)、user 面无门槛。
+// 非法角色 fail-closed：任一实参非法（!Role.Valid()）⇒ 返回 false。
+// **禁止**用 role == RoleSupplier 精确判等作面门槛（会错误拒绝 platform_admin）；
+// 仅最高级 RolePlatformAdmin 可用相等判定。
+func AtLeast(role, min Role) bool {
+	r, m := roleRank(role), roleRank(min)
+	if r < 0 || m < 0 {
+		return false
+	}
+	return r >= m
 }
 
 // UserStatus 用户状态。
@@ -107,6 +161,23 @@ const (
 func (s KeyStatus) Valid() bool {
 	switch s {
 	case KeyStatusActive, KeyStatusDisabled:
+		return true
+	}
+	return false
+}
+
+// ManagementKeyStatus 管理 key（mk-）状态。active = 可用；disabled = 软禁用
+// （快照即时 401，可再启用），区别于删除（软删，不可逆撤销）。
+type ManagementKeyStatus string
+
+const (
+	ManagementKeyStatusActive   ManagementKeyStatus = "active"
+	ManagementKeyStatusDisabled ManagementKeyStatus = "disabled"
+)
+
+func (s ManagementKeyStatus) Valid() bool {
+	switch s {
+	case ManagementKeyStatusActive, ManagementKeyStatusDisabled:
 		return true
 	}
 	return false
@@ -271,11 +342,8 @@ func (e *ModelMappingEntry) UnmarshalJSON(data []byte) error {
 type ModelMapping map[string]ModelMappingEntry
 
 func (m *ModelMapping) UnmarshalJSON(data []byte) error {
-	// JSON null：HTTP 面仍由 handler 400；读路径（Ent 扫描存量行）把 null 当空对象。
-	// 根因：nil map 经 encoding/json 落库为 JSON null，列表 Unmarshal 失败会整页 500。
 	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
-		*m = ModelMapping{}
-		return nil
+		return fmt.Errorf("model_mapping must not be null")
 	}
 	type raw ModelMapping
 	var tmp raw
@@ -314,7 +382,7 @@ type Template struct {
 	FormatModels     map[RequestFormat][]string // 格式 → 该格式支持的模型列表；未配置 = 全部 Models
 	ModelMapping     ModelMapping
 	// StripImageTools 模板级图像 tool 剥离开关（template_ext.strip_image_tools
-	// 快照合并，W4 消费；三类型 responses-special/codex-oauth/codex-pat 公共
+	// 快照合并 消费；三类型 responses-special/codex-oauth/codex-pat 公共
 	// 能力）：true = response.create 帧出口剥离图像工具（tools 数组 +
 	// tool_choice 悬挂；input 内嵌 v1 图像内容不做）。热路径快照布尔读 + 分支
 	// 零开销；false = 未配置/关闭（nil 与 false 同语义，快照收敛为 bool）。
@@ -361,6 +429,15 @@ func (t *Template) HasModelSpace() bool {
 	return len(t.Models) > 0 || len(t.FormatModels) > 0 || len(t.ModelMapping) > 0
 }
 
+// 账号失效来源（account.failure_source 列）：SDK 运行时判死（凭据经 SDK 权威
+// 分类为 fatal）vs 规则引擎判死（依据流量/错误率等，凭据本身未必失效）。usage
+// 查询面对失效账号的 upstream_error 标记按来源区分（Q2：sdk → auth_expired；
+// rule 非凭据失效 → 不标）。
+const (
+	FailureSourceSDK  = "sdk"
+	FailureSourceRule = "rule"
+)
+
 type Account struct {
 	ID         int64
 	Name       string
@@ -372,32 +449,67 @@ type Account struct {
 	// nil|非空两种形态（create 路径空串归一 nil、批量 "" 落 NULL）。
 	BaseURL        *string
 	UpstreamKey    string
-	Status         AccountStatus
-	CooldownUntil  *time.Time
-	Weight         int
 	MaxConcurrency int
 	LastError      *string
 	LastUsedAt     *time.Time
-	// FailedAt SDK 上报的运行时失效时刻（account.failed_at 列，SDK 接入 T1——
+	// FailedAt SDK 上报的运行时失效时刻（account.failed_at 列，SDK 接入——
 	// 用户裁决 2026-08-13：仅此一列；失效原因复用既有 LastError，两原因字段
 	// 并存会漂移）：nil = 未失效；非 nil = 账号级终止（凭据永久失效/上游封禁/
-	// 判死）的上报时刻。与 Status=disabled 语义分离：disabled = 管理面手动禁用；
+	// 判死）的上报时刻。与 Enabled=false 语义分离：disabled = 管理面手动禁用；
 	// failed_at = 运行时失效，两者可并存（失效后管理员仍可手动处理；恢复 =
-	// 清 failed_at + last_error + 恢复调度，T5 细化）。调度器选号不读本字段
-	//（pickFrom 只跳 disabled——摘除必须落库 status）。
-	FailedAt  *time.Time
-	CreatedAt time.Time
-	UpdatedAt time.Time
-	DeletedAt *time.Time // 软删除时间戳；nil = 存活（列表/消费路径过滤；GET 单个可查已删）
+	// 经 /accounts/{id}/recover fenced 端点清 failed_at + last_error）。调度器
+	// 快照装载以 failed_at 置运行时 disabled（持久 status 列已删除，摘除的
+	// 持久化事实 = failed_at 本身）。
+	FailedAt      *time.Time
+	FailureSource *string
+	Enabled       bool
+	// LifecycleRevision 账号生命周期代际（CAS fencing：每次生命周期变化及管理员
+	// 凭据替换必须 CAS expectedRevision 并 +1；SDK 内部 OAuth 刷新不增）。
+	LifecycleRevision int64
+	// IdentityRevision 身份纪元（K）：仅管理面身份类字段写入（spec §2.1 身份类，
+	// 含可轮换凭据：上游 key / base_url / template_id / account_ext 凭据面）使
+	// 其 +1；SDK 自动 token 刷新（OAuth access token）**不**推进。与
+	// LifecycleRevision（C：每次成功写入无条件 +1）职责分离——在途工件
+	// （失效持久化/latch/健康门槛/continuation）以 (指纹, K) 判定，纯配置写入
+	// 只动 C，不得作废在途判断。
+	IdentityRevision int64
+	// UpstreamCostMultiplierBp 采购成本倍率（basis points：10000 = 1.0x；0 = 免费）。
+	// 指针即**写入意图**（与 AccountPatch 同款存在性语义）：nil = 未显式提供 →
+	// 落存储默认 ×1（10000）；非 nil = 精确落值——含 0（免费），0 与"未提供"必须
+	// 可区分。从存储读回的账号恒非 nil（列为 NOT NULL + 默认），读取走 MultBp。
+	UpstreamCostMultiplierBp *int
+	CacheDomain              *string
+	// SupplierUserID 供应商归属（账号写面 spec 2026-10-09 §2.5）：
+	// 0 = 平台自有；非 0 = 归属该 supplier uid。**非身份类**（不推进
+	// IdentityRevision）——归属是账务属性，不是路由目标身份（§2.5）。但它是
+	// **供给准入门**（§4.6）的静态判据：带归属账号在财务快照未就绪时不得入选
+	// 调度 ⇒ 落在静态键（planKey.supplierUserID）内，归属变更即换新叶子。
+	SupplierUserID int64
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	DeletedAt      *time.Time // 软删除时间戳；nil = 存活（列表/消费路径过滤；GET 单个可查已删）
 	// GroupIDs 写路径（创建/更新）专用：nil = 不设置/不变；非 nil = 替换账号
 	// 全部分组（含空数组 = 清空）。读路径忽略——编辑回显走 GetAccountGroups
 	// 独立查询（toDomainAccount 不填充该字段）。
 	GroupIDs *[]int64
 	// Ext 账号类型化鉴权扩展（account_ext 1:1 边；调度器快照加载
 	// LoadGroupsAccounts/LoadGroupAccounts 合并——与 Template.StripImageTools
-	// 同款快照合并先例，sdk-wiring T4 P3-4 定死路线；T2 起 codex 路由按 Ext
+	// 同款快照合并先例，sdk-wiring 定死路线；此后 codex 路由按 Ext
 	// 派生 AccountCredential）。其余路径（管理面账号 CRUD 等）无 ext 边 → nil。
 	Ext *AccountExt
+}
+
+// MultBp 账号采购成本倍率的**读**形态（basis points）：nil（未显式提供）→ 存储
+// 默认 ×1；从存储读回的账号恒非 nil，nil 只出现在尚未落库的构造值上。
+//
+// 刻意做成入参形态而非 *Account 方法：调度器的静态读闭包门按 AST 选择子枚举读路径
+// （$S.acc.UpstreamCostMultiplierBp 必须落在 planKey 的字段上），方法调用会把该读
+// 路径从门里抹掉，等于让键漏掉一个真实决策输入。
+func MultBp(v *int) int {
+	if v == nil {
+		return 10000
+	}
+	return *v
 }
 
 // TemplateExt 模板类型化扩展配置（template_ext 子表，1:1）：credential_type
@@ -408,31 +520,31 @@ type Account struct {
 type TemplateExt struct {
 	TemplateID      int64
 	CredentialType  credential.Type
-	StripImageTools *bool // 三类型公共能力开关：模板级图像 tool 剥离（W4 消费）
+	StripImageTools *bool // 三类型公共能力开关：模板级图像 tool 剥离（消费）
 }
 
-// CodexIdentity codex 账号身份四元组（对齐真实客户端语义：installation_id
-// 安装级永久；session/thread 会话级恒等；window = {thread_id}:{n} 起始 :0）——
-// account_ext.codex_identity jsonb 序列化契约类型（json tag 即落库形态）。
-// 空字段 = 未提供（service 归一：全空 → 自动生成/沿用存量；identity 无清空
-// 路径——账号存在期间稳定）。
+// CodexIdentity codex 账号持久身份（account_ext.codex_identity jsonb 序列化
+// 契约类型——json tag 即落库形态）。仅保留安装级 installation_id：账号存在
+// 期间稳定、运行时唯一被消费的身份项（安装级永久；internal/proxy/scheduler
+// 注入源）。会话级 session/thread/window 已退役为运行时槽状态（scheduler
+// 槽位池按完成轮数演化——见 internal/scheduler/identity_pool.go），不再是持久身份，
+// 故不在此结构承载；旧行 jsonb 内的多余键读取时被忽略（jsonb blob 反序列化
+// 丢弃未知键），写侧恒只落 installation_id。空字段 = 未提供（service 归一：
+// 空 → 自动生成/沿用存量；identity 无清空路径——账号存在期间稳定）。
 type CodexIdentity struct {
 	InstallationID string `json:"installation_id"`
-	SessionID      string `json:"session_id"`
-	ThreadID       string `json:"thread_id"`
-	WindowID       string `json:"window_id"`
 }
 
 // AccountExt 账号类型化鉴权扩展（account_ext 子表，1:1）：credential_type
 // ∈ {codex-oauth, codex-pat}（账号只两种 codex 类型）。字段按作用分组：
-// 标识 → 身份（codex_identity jsonb 单列）→ 凭据 → 管理标识。身份四元组
-// （对齐真实 codex 客户端语义，导入时 service NewCodexIdentity() 自动生成并
-// 持久化、账号存在期间稳定）：InstallationID 必存（UUIDv4 安装级永久）；
-// SessionID/ThreadID UUIDv7 会话级（恒等 thread==session）；WindowID =
-// {thread_id}:0（导入时生成后恒定不变——零递增零状态）。nil = 未配置。
+// 标识 → 身份（codex_identity jsonb 单列）→ 凭据 → 管理标识。身份只含安装级
+// InstallationID（UUIDv4 安装级永久；导入时 service NewCodexIdentity() 自动
+// 生成并持久化、账号存在期间稳定）；会话级 session/thread/window 已退役为
+// 运行时槽状态（不再持久化）。nil = 未配置。
 // 凭据列组按类型约束（service 校验）：oauth 只允许 CodexOAuth* 列组；pat
-// 只允许 CodexPATKey。CodexAccountID 为上游账号/空间标识（Task B 批量导入
-// 必填；本 task 仅建结构——管理面写入能力 Task B 接线）。
+// 只允许 CodexPATKey。CodexAccountID 为上游账号/空间标识（可留空：导入/单账号
+// 保存时自动识别——OAuth token claims 离线解析 / PAT whoami；识别失败时导入行
+// 拒绝、单账号保存留空并下次重试）。
 type AccountExt struct {
 	AccountID              int64
 	CredentialType         credential.Type
@@ -442,14 +554,23 @@ type AccountExt struct {
 	CodexOAuthExpiresAt    *time.Time     // 凭据：oauth 访问令牌过期时间
 	CodexPATKey            *string        // 凭据：pat
 	CodexEmail             *string        // 管理标识：账号登录邮箱（导入时人工/上游提供，非自动生成，可空）
-	CodexAccountID         *string        // 上游账号/空间标识（Task B 导入必填；可空）
+	CodexAccountID         *string        // 上游账号/空间标识（可留空——导入/保存时自动识别；识别失败：导入行拒绝、保存留空）
 }
 
-// CodexOAuthImportItem 批量导入 codex-oauth 单行（Task B——组合幂等键
+// CodexImportConfig 导入面 body 级账号配置（作用于本次**新建**账号——已存在
+// 行的凭据更新不改配置，与 max_concurrency 同款"仅创建生效"语义）。
+// 三字段皆可选：nil = 取创建默认（enabled=true / 账号私有域 / ×1）。
+type CodexImportConfig struct {
+	Enabled                  *bool
+	CacheDomain              *string
+	UpstreamCostMultiplierBp *int // 万分数（10000 = ×1）
+}
+
+// CodexOAuthImportItem 批量导入 codex-oauth 单行（组合幂等键
 // codex_email + codex_account_id；token+refresh 成对必填；expires_at 可选
 // 原始 RFC3339 字符串（service 逐行解析——格式错误 → 行级 failed 非整批
-// 400；nil = 过期未知 → 401 自愈）；max_concurrency/weight 配置面——nil =
-// 缺省 25/100（导入面裁决覆盖账号表默认 8））。
+// 400；nil = 过期未知 → 401 自愈）；max_concurrency 配置面——nil =
+// 缺省 25（导入面裁决覆盖账号表默认 8））。
 type CodexOAuthImportItem struct {
 	CodexEmail             string
 	CodexAccountID         string
@@ -457,7 +578,6 @@ type CodexOAuthImportItem struct {
 	CodexOAuthRefreshToken string
 	CodexOAuthExpiresAt    *string
 	MaxConcurrency         *int
-	Weight                 *int
 }
 
 // CodexPATImportItem 批量导入 codex-pat 单行（组合键同上；pat_key 必填）。
@@ -466,7 +586,6 @@ type CodexPATImportItem struct {
 	CodexAccountID string
 	CodexPATKey    string
 	MaxConcurrency *int
-	Weight         *int
 }
 
 // ImportFailedItem 行级失败条目（index = items 原始下标——行级定位契约；
@@ -485,7 +604,7 @@ type ImportResult struct {
 }
 
 // CodexUsageSnapshot 账号 codex 额度快照（白名单收敛契约——spec 2026-08-18
-// Task 3：SDK UsageStatus 五块砍四留四——RateLimitReachedType（与 allowed=false
+// SDK UsageStatus 五块砍四留四——RateLimitReachedType（与 allowed=false
 // 重复的派生状态）与瞬时布尔（Allowed/LimitReached/HasCredits/Unlimited/
 // OverageLimitReached——5min 缓存下已过时）与 ApproxLocalMessages/
 // ApproxCloudMessages（[]any 未定型数组——不进契约）一律不出现）。每块 nil →
@@ -535,7 +654,7 @@ type UsageAgg struct {
 }
 
 // AccountUsageUpstreamError 上游快照失败分类标记（upstream_error 枚举——
-// task 3 sdkbridge 错误分类即映射输入：ErrAuthExpired → auth_expired、
+// sdkbridge 错误分类即映射输入：ErrAuthExpired → auth_expired、
 // ErrUpstream → upstream_unavailable；api-key 无凭据/"缺失"恒 nil，不进
 // auth_expired）。
 type AccountUsageUpstreamError string
@@ -547,7 +666,7 @@ const (
 
 // AccountUsage 账号 usage 视图 item（/api/admin/accounts/usage 统一 usage API 查询
 // 面）：Gateway 恒全量（无记录全 0——前端免补零）；Upstream 为 codex 额度快照
-// （task 3 sdkbridge；api-key/无凭据账号恒 nil）；UpstreamError 为快照失败标记
+// （sdkbridge；api-key/无凭据账号恒 nil）；UpstreamError 为快照失败标记
 // （成功/nil 上游恒 nil——"无上游能力"与"快照挂了"区分）。
 type AccountUsage struct {
 	AccountID     int64
@@ -557,15 +676,18 @@ type AccountUsage struct {
 }
 
 type Group struct {
-	ID         int64
-	Name       string
-	Visibility GroupVisibility
-	// PriceMultiplier 万分数（T3.5 价格倍率）：组默认 10000 = ×1；0 = 免费。
+	ID   int64
+	Name string
+	// Description 分组描述（自由文本，向用户说明该分组用途）。空串 = 无描述
+	// （无三态；用户面空描述不渲染次行）。与 name 同口径不设长度上限。
+	Description string
+	Visibility  GroupVisibility
+	// PriceMultiplier 万分数（价格倍率）：组默认 10000 = ×1；0 = 免费。
 	// 写路径语义：Create 缺省（nil，service 归一为 10000）恒写入；Update 恒写入
 	// （PUT 全量替换）。API 边界（handler/convert.go）与正常值 float64 换算
 	// （1.5 ↔ 15000）。
 	PriceMultiplier int
-	// ProtocolConverts 分组级协议转换方向集合（只补差，W5 消费；多方向并存按
+	// ProtocolConverts 分组级协议转换方向集合（只补差 消费；多方向并存按
 	// 客户端格式命中——chat 请求走 chat_to_*、anthropic 请求走 mess_to_resp、
 	// resp 请求走 resp_to_mess）：空集合 = off = 不转换（off 不进数组）。
 	// 写路径语义：Create 缺省（handler 归一为空数组）恒写入；Update 恒写入
@@ -605,11 +727,35 @@ func (p ProtocolConvert) Valid() bool {
 	return false
 }
 
+// Client 方向的客户端协议格式（未知/off 方向 → 零值 ""，仅防御）。
+func (p ProtocolConvert) Client() RequestFormat {
+	switch p {
+	case ProtocolConvertChatToResp, ProtocolConvertChatToMess:
+		return FormatOpenAIChat
+	case ProtocolConvertMessToResp:
+		return FormatAnthropic
+	case ProtocolConvertRespToMess:
+		return FormatOpenAIResponses
+	}
+	return ""
+}
+
+// Target 方向映射的模板（上游）协议格式（未知/off 方向 → 零值 ""，仅防御）。
+func (p ProtocolConvert) Target() RequestFormat {
+	switch p {
+	case ProtocolConvertChatToResp, ProtocolConvertMessToResp:
+		return FormatOpenAIResponses
+	case ProtocolConvertRespToMess, ProtocolConvertChatToMess:
+		return FormatAnthropic
+	}
+	return ""
+}
+
 // User 用户（顶层实体，无租户）。标识 = 邮箱；PasswordHash 为 bcrypt
 // DefaultCost(10)（与 sub2api 同参数，存量 hash 可迁移验证）。
-// Balance 最小单位（毫分；1 USD = 100,000 毫分，Phase 5 计费统一单位，
+// Balance 最小单位（毫分；1 USD = 100,000 毫分 计费统一单位，
 // 管理面 API 展示/输入换算 USD）。
-// 价格倍率按组（T3.5 修正）：挂在 group_assignment 上（GroupAssignment.
+// 价格倍率按组：挂在 group_assignment 上（GroupAssignment.
 // PriceMultiplier），用户不同组可有不同倍率——User 无倍率字段。
 type User struct {
 	ID           int64
@@ -629,9 +775,12 @@ type User struct {
 
 // Key 客户端 API key（独立表，重建 group 内嵌 key 语义）。
 type Key struct {
-	ID             int64
-	UserID         int64
-	GroupID        int64
+	ID      int64
+	UserID  int64
+	GroupID int64
+	// GroupName 归属分组名（只读投影）：读路径经过滤式 eager-load 回填
+	// （组存活时非空；组非存活/未预加载 → 空串，前端回退 `#<GroupID>`）。
+	GroupName      string
 	Name           string
 	KeyRaw         string // 明文常驻（长期可查看/复制；DB 泄露即明文暴露——自托管权衡）
 	Status         KeyStatus
@@ -646,8 +795,31 @@ type Key struct {
 // HasQuota 是否有额度上限（quota > 0）。热路径门禁/扣减短路标志。
 func (k *Key) HasQuota() bool { return k.Quota > 0 }
 
+// ManagementKey 管理 API key（前缀 mk-，独立表；spec 2026-10-09）：管理面
+// （/api/user、/api/user/supplier、/api/admin）鉴权，等价于「以 owner 身份登录」——
+// 可达 API = owner 角色闭包。明文常驻 key_raw（自托管权衡，与客户端 key 一致，
+// 列表页可见）。与 ck- 客户端 key 并存、互不通用。
+type ManagementKey struct {
+	ID        int64
+	UserID    int64 // owner（management_keys.user_id）
+	Name      string
+	KeyRaw    string // 明文，前缀 mk-
+	Status    ManagementKeyStatus
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	DeletedAt *time.Time // 软删除时间戳；nil = 存活（鉴权/列表过滤；GET 单个可查已删）
+}
+
+// ManagementKeyMeta 管理 key 鉴权快照条目（Auth 内存表元素：热路径零 DB，
+// 仅既有快照读锁；owner 状态由 UserSnapshot 统一校验，fail-closed）。
+type ManagementKeyMeta struct {
+	ID     int64
+	UserID int64
+	Status ManagementKeyStatus
+}
+
 // GroupAssignment private 组的授予记录（用户 ↔ 组多对多）。
-// PriceMultiplier 该用户在该组的专属价格倍率（万分数，T3.5 修正：按组——
+// PriceMultiplier 该用户在该组的专属价格倍率（万分数 修正：按组——
 // 用户在不同组可有不同倍率）；nil = 未设置 → 用组倍率；0 = 免费。
 type GroupAssignment struct {
 	ID              int64
@@ -659,7 +831,7 @@ type GroupAssignment struct {
 
 // Setting 类型化配置（key/type/value；signup_enabled 注册开关等）。
 // Min/Max 数值值域（含边界；nil = 无限制）、PolicyValues 字符串枚举值域
-// （空 = 不限）——仅注册表条目携带（管理面 UpdateSetting 校验用，A-P2-11 护栏
+// （空 = 不限）——仅注册表条目携带（管理面 UpdateSetting 校验用，护栏
 // 前置）；DB 行不落库（读路径由注册表默认兜底合并，见 SettingRepo.GetAll）。
 type Setting struct {
 	ID           int64
@@ -685,7 +857,7 @@ type KeyMeta struct {
 	HasQuota    bool
 	Quota       int64 // 累计最终计费金额上限（毫分，1 USD = 100,000 毫分）；0 = 不限
 	QuotaUsed   int64 // 快照值（已消耗计费金额毫分，reload 时从 DB 读）；在途扣减走内存计数
-	// ProtocolConverts 组级协议转换方向集合快照值（W5）：空 = 不转换（热路径
+	// ProtocolConverts 组级协议转换方向集合快照值：空 = 不转换（热路径
 	// 分支零开销）；元素 = 客户端协议 → 模板协议（补差语义，转换器
 	// internal/protoconv；多方向按客户端格式命中，同客户端格式多方向已被
 	// 创建/更新校验拒绝）。
@@ -693,7 +865,7 @@ type KeyMeta struct {
 }
 
 // UsageLog 用量日志：user_id/key_id 为鉴权归属（context 传递，0 = 无）。
-// 计费列（Phase 5）：Cost 毫分（1 USD = 100,000 毫分）；BillingTier 请求
+// 计费列：Cost 毫分（1 USD = 100,000 毫分）；BillingTier 请求
 // service_tier 归一化值（priority/flex/fast/auto，空 = 未计费路径）；AboveHit
 // 任一分量超 above 阈值命中分段；Overdraft 本次扣费透支（负余额）。
 // ErrorMessage 错误文本（部署故障修复）：连接级 err.Error() / 4xx+ 上游 body，
@@ -741,22 +913,31 @@ type UsageLog struct {
 	PricePerCallMillis       *int64 // 按单元价快照（**毫分/单元**——search 每次 / 图片每张；例外单位，例外于上文"毫分/1M"口径——per-call 计费不走 /1e6 除法）；nil = 无按单元分量
 	Cost                     int64  // 毫分；错误请求（402/4xx）为 0
 	// RawCost 乘倍率前的原始成本（毫分；免费组 cost=0 但 raw 有值——"实际消耗"
-	// 只有 raw 能看）。回显面投影归 Task 2（本字段无 json tag，对齐 domain 全
+	// 只有 raw 能看）。回显面投影（本字段无 json tag，对齐 domain 全
 	// 结构惯例）。
 	RawCost     int64  // 毫分；bill 未装配/无价防御路径恒 0
 	BillingTier string // priority/flex/fast/auto；空 = 未计费路径
 	AboveHit    bool
 	Overdraft   bool
-	// Billed 扣费收敛标记（F2 ledger-cursor，spec 2026-08-23）：false=待对账
+	// Billed 扣费收敛标记（ledger-cursor，spec 2026-08-23）：false=待对账
 	// 消费者扣减；true=扣费事务已完成（或出生吸收态——计费关闭/匿名行）。
 	// 出生标记由 proxy.routeLog 按 NOT BillingCapture OR UserID<=0 盖章；
 	// 翻转为 true 只发生在对账事务内（与 FEFO 扣减同事务原子）。
-	Billed    bool
-	CreatedAt time.Time
+	Billed bool
+	// 供应商收益快照（spec 2026-10-09 §3.3，三列，**无 share_bp**）：
+	//   - SupplierUserID：归属 uid 快照（请求选中账号时点捕获），NULL = 平台自有；
+	//   - SupplierEarnMillis：收益额快照（毫分），floor(cost × share_bp / 10000)；
+	//   - SupplierCredited：记账游标出生定态——earn<=0 出生 true（不入消费游标），
+	//     否则 false（唯一消费者在自己事务内翻 true）。
+	// 归属随选中固定（"归属随选中固定"，非收尾重查）——转属/删除不改在途请求归属。
+	SupplierUserID     int64
+	SupplierEarnMillis int64
+	SupplierCredited   bool
+	CreatedAt          time.Time
 }
 
 // LedgerRow 计费游标消费行（usage_logs 未扣子集的瘦身投影；spec-f2-ledger-cursor
-// ABI-1 冻结契约）：FetchUnbilledBatch 返回、结算语句按 UserID 聚合消费。
+// 冻结契约）：FetchUnbilledBatch 返回、结算语句按 UserID 聚合消费。
 type LedgerRow struct {
 	ID          int64
 	UserID      int64
@@ -768,7 +949,7 @@ type LedgerRow struct {
 }
 
 // UserBalance 定向余额对（结算语句 debited/forced RETURNING (uid, balance_after)；
-// spec-f2opt-settlement §一 oracle 必改 #3）：保住 Balances 定向 Set 的预检
+// spec-f2opt-settlement §一 oracle 必改）：保住 Balances 定向 Set 的预检
 // 新鲜度（10s Reload 间隙 fail-closed 预检依赖它）。
 type UserBalance struct {
 	UserID  int64
@@ -778,7 +959,7 @@ type UserBalance struct {
 // SettlementSummary 单车道结算语句结果（spec-f2opt-settlement 三车道拓扑；计数
 // 守卫 + 定向余额对）。BatchRows/Marked 由仓库侧做 marked==batch 计数比对守卫
 // （不齐 = 并发标记 → 整事务回滚重放）；Quarantined 为幽灵用户行数（跳扣仍标记
-// ——不变量 #1 尾语义）；Balances 为真实用户的 (uid, balance_after) 对。
+// ——不变量 尾语义）；Balances 为真实用户的 (uid, balance_after) 对。
 type SettlementSummary struct {
 	BatchRows       int64 // 批行数（usage_logs 取出）
 	DebitedUsers    int64 // 条件扣命中用户数
@@ -795,7 +976,7 @@ type SettlementSummary struct {
 // ttft_total_ms/ttft_count/ttft_max_ms/ttft_hist 四列承载（avg 在查询侧 Go 除；
 // ttft_hist 10 档直方图见 stat_repo.go ttftHistBounds）。ttft_hist 为 PG bigint[]
 // 数组列——ent 无数组类型（field.Ints 是 JSON 语义），不进 ent schema（carve-out，
-// 评审 P1-1；统计读取面走 pgx 直查扫描）。v2 瘦身（spec 2026-08-23）：维度
+// 统计读取面走 pgx 直查扫描）。v2 瘦身（spec 2026-08-23）：维度
 // 7→3——account_id/template_id/user_id/is_error 四维删除（实体视角由
 // EntityStatBucket/usage_entity_stats 承载；is_error 降为 error_count 测量列
 // 语义），唯一键 = (bucket_time, group_id, model)。
@@ -878,15 +1059,34 @@ type RuleWhen struct {
 	RatioFailureGE *float64 `json:"ratio_failure_ge,omitempty"`
 }
 
+type ThrottleScope string
+
+const (
+	ThrottleScopeAccount      ThrottleScope = "account"
+	ThrottleScopeAccountRoute ThrottleScope = "account_route"
+)
+
+type ThrottleMode string
+
+const (
+	ThrottleModeRetryAfter ThrottleMode = "retry_after"
+	ThrottleModeOpen       ThrottleMode = "open"
+)
+
+type ThrottleAction struct {
+	Scope      ThrottleScope `json:"scope"`
+	Mode       ThrottleMode  `json:"mode"`
+	DurationMs *int64        `json:"duration_ms,omitempty"`
+	UseReset   bool          `json:"use_reset"`
+}
+
 type RuleThen struct {
-	Status   *AccountStatus `json:"status,omitempty"`
-	Cooldown *string        `json:"cooldown,omitempty"` // time.ParseDuration 可解析的时长，如 "30s"、"5h"
-	Weight   *int           `json:"weight,omitempty"`   // 0-100
 	// ResponseCode nil=透传上游码，non-nil=覆写为指定码（400-599）；指针即意图（fresh setup，无旧 Transmit 兼容）。
 	ResponseCode *int `json:"response_code,omitempty"`
 	// CustomMessage nil=透传上游文，non-nil=覆写为固定文案（禁止空串）；指针即意图。
-	CustomMessage *string `json:"custom_message,omitempty"`
-	// 启动 guard 检测旧列 Transmit：fresh setup 哲学，用户裁决；旧列存在则 fail-fast 需重建（本 Task 仅注释占位，DB 检测由后续迁移承载）。
+	CustomMessage *string         `json:"custom_message,omitempty"`
+	Throttle      *ThrottleAction `json:"throttle,omitempty"`
+	FailAccount   bool            `json:"fail_account,omitempty"`
 }
 
 type Rule struct {

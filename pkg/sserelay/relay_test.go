@@ -64,42 +64,42 @@ func TestRelayVeryLongFrame(t *testing.T) {
 	require.Equal(t, src, rec.Body.String())
 }
 
-// TestRelayEOFFlushesFinalFrameWithoutBlankLine C-P1-1 回归：EOF 双返回
+// TestRelayEOFFlushesFinalFrameWithoutBlankLine 回归：EOF 双返回
 // （"数据+io.EOF"，无末尾空行的关闭风格——第三方兼容上游）时末帧必须 flush
-// ——否则 Observer 看不到 completed 帧 → usage 提取落空 → cost=0 落账；
+// ——否则 OnEvent 看不到 completed 帧 → usage 提取落空 → cost=0 落账；
 // 输出字节必须完整原样（EOF 中途截断按 WHATWG 视同空行派发直写）。
 func TestRelayEOFFlushesFinalFrameWithoutBlankLine(t *testing.T) {
 	src := "data: {\"type\":\"response.completed\",\"usage\":{\"total_tokens\":9}}\n"
 	var got []Event
 	rec := httptest.NewRecorder()
 	require.NoError(t, relayStream(rec, src, Config{
-		Observer: func(e Event) { got = append(got, e) },
+		OnEvent: func(e Event) { got = append(got, e) },
 	}))
-	require.Len(t, got, 1, "EOF 无空行帧必须派发给 Observer（丢帧 = 计费为零）")
+	require.Len(t, got, 1, "EOF 无空行帧必须派发给 OnEvent（丢帧 = 计费为零）")
 	require.Equal(t, `{"type":"response.completed","usage":{"total_tokens":9}}`, string(got[0].Data))
 	require.Equal(t, src, rec.Body.String(), "输出字节必须完整原样转发")
 }
 
-// TestRelayEOFFlushesLongLineWithoutNewline C-P1-1 顺带覆盖：ErrBufferFull
+// TestRelayEOFFlushesLongLineWithoutNewline 顺带覆盖：ErrBufferFull
 // + EOF 双返回的长行（> 8KiB bufio buffer、无末尾换行）——末帧由多段累积，
-// EOF 时必须整体 flush（字节完整 + Observer 可见），不可丢。
+// EOF 时必须整体 flush（字节完整 + OnEvent 可见），不可丢。
 func TestRelayEOFFlushesLongLineWithoutNewline(t *testing.T) {
 	long := strings.Repeat("x", 1<<20) // 1 MiB 单行
 	src := "data: " + long             // 无 \n
 	var got []Event
 	rec := httptest.NewRecorder()
 	require.NoError(t, relayStream(rec, src, Config{
-		Observer: func(e Event) { got = append(got, e) },
+		OnEvent: func(e Event) { got = append(got, e) },
 	}))
 	require.Len(t, got, 1, "ErrBufferFull+EOF 长行必须派发为末帧")
 	require.Equal(t, long, string(got[0].Data), "长行 Data 必须全量命中（旧实现截断于首 chunk）")
 	require.Equal(t, src, rec.Body.String(), "长行字节必须完整原样转发")
 }
 
-// TestRelayLongLineDataFull spec 2026-08-16 sserelay-lines #1：>8KB 单行 data
+// TestRelayLongLineDataFull spec 2026-08-16 sserelay-lines >8KB 单行 data
 // （响应对象 JSON：output 数组 + 尾部 usage——真实 response.completed 帧形状，
 // usage 位于 8192B 截断区外）。旧实现 Data 在首 chunk 处截断 → usage 提取落空
-// → 计费归零。续片内容含冒号（"usage":{...}）不得被误判为字段行（#2 同场景）。
+// → 计费归零。续片内容含冒号（"usage":{...}）不得被误判为字段行（同场景）。
 func TestRelayLongLineDataFull(t *testing.T) {
 	var sb strings.Builder
 	sb.WriteString(`{"type":"response.completed","response":{"id":"r","output":[`)
@@ -117,7 +117,7 @@ func TestRelayLongLineDataFull(t *testing.T) {
 	var got []Event
 	rec := httptest.NewRecorder()
 	require.NoError(t, relayStream(rec, src, Config{
-		Observer: func(e Event) { got = append(got, e) },
+		OnEvent: func(e Event) { got = append(got, e) },
 	}))
 	require.Len(t, got, 1, "长行帧不得拆出多余空帧")
 	require.Equal(t, payload, string(got[0].Data), "Data 必须全量命中（截断 = usage 提取落空 = 计费归零）")
@@ -125,7 +125,7 @@ func TestRelayLongLineDataFull(t *testing.T) {
 	require.Equal(t, src, rec.Body.String(), "原始字节转发零变化")
 }
 
-// TestRelayLongLineColonInContinuation spec #2：续片 chunk 含冒号不得被当作
+// TestRelayLongLineColonInContinuation spec 续片 chunk 含冒号不得被当作
 // 字段行丢弃——内容判据（按冒号/字段名解析续片）会把 "aaaa:bbb…" chunk 当
 // 新字段行；state-based 判据下续片恒归 data 行。
 func TestRelayLongLineColonInContinuation(t *testing.T) {
@@ -134,46 +134,46 @@ func TestRelayLongLineColonInContinuation(t *testing.T) {
 	var got []Event
 	rec := httptest.NewRecorder()
 	require.NoError(t, relayStream(rec, src, Config{
-		Observer: func(e Event) { got = append(got, e) },
+		OnEvent: func(e Event) { got = append(got, e) },
 	}))
 	require.Len(t, got, 1)
 	require.Equal(t, payload, string(got[0].Data), "续片含冒号必须原样并入 data")
 	require.Equal(t, src, rec.Body.String())
 }
 
-// TestRelayCommentLinesNotInData spec #3：注释行回归——": c" 行（非续片状态）
+// TestRelayCommentLinesNotInData spec 注释行回归——": c" 行（非续片状态）
 // 不得出现在 Data 中（splitField 注释行返回 nil；state-based 判据不得改变）。
 func TestRelayCommentLinesNotInData(t *testing.T) {
 	src := ": c\n: not data\ndata: x\n\n"
 	var got []Event
 	rec := httptest.NewRecorder()
 	require.NoError(t, relayStream(rec, src, Config{
-		Observer: func(e Event) { got = append(got, e) },
+		OnEvent: func(e Event) { got = append(got, e) },
 	}))
 	require.Len(t, got, 1)
 	require.Equal(t, "x", string(got[0].Data), "注释行不得进入 Data")
 	require.Equal(t, src, rec.Body.String())
 }
 
-// TestRelayLongLineForkPoint8186 spec #4：精确分叉点——payload=8186B 时行总长
-// 8193B（"data: " 6B + 8186B + "\n"）：chunk1 = 8192B（ErrBufferFull、无 \n），
-// chunk2 = 孤立 "\n" 尾 chunk。孤立 \n 是续行终止符而非帧分隔空行——空行
-// flush 必须 gating 于 !inLine，否则尾 chunk 触发一次空帧 flush
-// （flushes=2+空帧）。断言单帧 flush、Data 全量、无多余空帧。
+// TestRelayLongLineForkPoint8186 spec 精确分叉点——payload=8186B 时行总长
+// 8193B（"data: " 6B + 8186B + "\n"）：头 8192B 恰为缓冲整数倍（4KB 读缓冲
+// 分两段 ErrBufferFull、均无 \n），尾 chunk = 孤立 "\n"。孤立 \n 是续行终止符
+// 而非帧分隔空行——空行 flush 必须 gating 于 !inLine，否则尾 chunk 触发一次
+// 空帧 flush（flushes=2+空帧）。断言单帧 flush、Data 全量、无多余空帧。
 func TestRelayLongLineForkPoint8186(t *testing.T) {
 	payload := strings.Repeat("x", 8186)
 	src := "data: " + payload + "\n\n"
 	var got []Event
 	rec := httptest.NewRecorder()
 	require.NoError(t, relayStream(rec, src, Config{
-		Observer: func(e Event) { got = append(got, e) },
+		OnEvent: func(e Event) { got = append(got, e) },
 	}))
 	require.Len(t, got, 1, "孤立 \n 尾 chunk 不得触发空帧 flush（gating 失效 = flushes=2+空帧）")
 	require.Equal(t, payload, string(got[0].Data))
 	require.Equal(t, src, rec.Body.String())
 }
 
-// TestRelayLongLineCRLF spec #5：CRLF 长行——续片含 \r\n 尾部剥离（Data 不含
+// TestRelayLongLineCRLF spec CRLF 长行——续片含 \r\n 尾部剥离（Data 不含
 // 行终止符），CRLF 空行正常分帧。
 func TestRelayLongLineCRLF(t *testing.T) {
 	payload := strings.Repeat("x", 10000)
@@ -181,14 +181,14 @@ func TestRelayLongLineCRLF(t *testing.T) {
 	var got []Event
 	rec := httptest.NewRecorder()
 	require.NoError(t, relayStream(rec, src, Config{
-		Observer: func(e Event) { got = append(got, e) },
+		OnEvent: func(e Event) { got = append(got, e) },
 	}))
 	require.Len(t, got, 1)
 	require.Equal(t, payload, string(got[0].Data), "CRLF 行终止符必须剥离")
 	require.Equal(t, src, rec.Body.String())
 }
 
-// TestRelayMultiDataAndLongLineMixed spec #6：多 data 行 + 长行混合——\n 合并
+// TestRelayMultiDataAndLongLineMixed spec 多 data 行 + 长行混合——\n 合并
 // 语义逐位不变（"a\n" + 长行 + "\nb"），续片不得插入多余 \n 或丢失边界。
 func TestRelayMultiDataAndLongLineMixed(t *testing.T) {
 	long := strings.Repeat("y", 10000)
@@ -196,18 +196,18 @@ func TestRelayMultiDataAndLongLineMixed(t *testing.T) {
 	var got []Event
 	rec := httptest.NewRecorder()
 	require.NoError(t, relayStream(rec, src, Config{
-		Observer: func(e Event) { got = append(got, e) },
+		OnEvent: func(e Event) { got = append(got, e) },
 	}))
 	require.Len(t, got, 1)
 	require.Equal(t, "a\n"+long+"\nb", string(got[0].Data), "\n 合并语义不得被续片破坏")
 	require.Equal(t, src, rec.Body.String())
 }
 
-func TestRelayObserverReceivesTypedEvent(t *testing.T) {
+func TestRelayOnEventReceivesTypedEvent(t *testing.T) {
 	var got []Event
 	rec := httptest.NewRecorder()
 	require.NoError(t, relayStream(rec, "event: message_delta\ndata: {\"usage\":{\"output_tokens\":5}}\n\n", Config{
-		Observer: func(e Event) { got = append(got, e) },
+		OnEvent: func(e Event) { got = append(got, e) },
 	}))
 	require.Len(t, got, 1)
 	require.Equal(t, "message_delta", string(got[0].Event))
@@ -215,22 +215,22 @@ func TestRelayObserverReceivesTypedEvent(t *testing.T) {
 	require.Contains(t, string(got[0].Raw), "event: message_delta")
 }
 
-func TestRelayObserverReceivesDone(t *testing.T) {
+func TestRelayOnEventReceivesDone(t *testing.T) {
 	var got []Event
 	rec := httptest.NewRecorder()
 	require.NoError(t, relayStream(rec, "data: [DONE]\n\n", Config{
-		Observer: func(e Event) { got = append(got, e) },
+		OnEvent: func(e Event) { got = append(got, e) },
 	}))
 	require.Len(t, got, 1)
 	require.Equal(t, "", string(got[0].Event))
 	require.Equal(t, "[DONE]", string(got[0].Data))
 }
 
-func TestRelayMultiLineDataMergedInObserver(t *testing.T) {
+func TestRelayMultiLineDataMergedInOnEvent(t *testing.T) {
 	var got []Event
 	rec := httptest.NewRecorder()
 	require.NoError(t, relayStream(rec, "data: a\ndata: b\n\n", Config{
-		Observer: func(e Event) { got = append(got, e) },
+		OnEvent: func(e Event) { got = append(got, e) },
 	}))
 	require.Len(t, got, 1)
 	require.Equal(t, "a\nb", string(got[0].Data)) // SSE 规范：多行 data 以 \n 连接
@@ -242,7 +242,7 @@ func TestEventNamePrefersEventField(t *testing.T) {
 }
 
 func TestEventNameInfersFromDataType(t *testing.T) {
-	// 缺 event: 名的 data-only 帧（非规范上游，P3）：data JSON 的 type 与事件名同值
+	// 缺 event: 名的 data-only 帧（非规范上游）：data JSON 的 type 与事件名同值
 	e := Event{Data: []byte(`{"type":"response.output_text.delta","delta":"x"}`)}
 	require.Equal(t, "response.output_text.delta", string(e.EventName()))
 }
@@ -254,7 +254,7 @@ func TestEventNameEmptyWhenUninferrable(t *testing.T) {
 }
 
 // TestEventNameAnchorPath 字节锚定路径（spec 2026-08-16-single-pass-parse-design
-// E2）：帧首 `{"type":"` 形态 → 值区间直切片（零拷贝零分配）。
+// ）：帧首 `{"type":"` 形态 → 值区间直切片（零拷贝零分配）。
 func TestEventNameAnchorPath(t *testing.T) {
 	e := Event{Data: []byte(`{"type":"response.output_text.delta","delta":"x"}`)}
 	got := e.EventName()
@@ -311,7 +311,7 @@ func TestEventNameAnchorZeroAlloc(t *testing.T) {
 
 func TestRelayFirstEventFlushesImmediately(t *testing.T) {
 	fr := &flusherRecorder{ResponseRecorder: httptest.NewRecorder()}
-	require.NoError(t, relayStream(fr, "data: {\"a\":1}\n\n", Config{FlushBytes: 4096, FlushInterval: time.Hour}))
+	require.NoError(t, relayStream(fr, "data: {\"a\":1}\n\n", Config{FlushBytes: 4096}))
 	require.True(t, fr.Flushed, "首个事件必须触发 Flush")
 	require.Equal(t, int32(1), fr.flushed.Load())
 }
@@ -326,13 +326,13 @@ func TestRelayBatchesUntilThreshold(t *testing.T) {
 		src.WriteString(strings.Repeat("y", 2048))
 		src.WriteString("\n\n")
 	}
-	require.NoError(t, relayStream(fr, src.String(), Config{FlushBytes: 4096, FlushInterval: time.Hour}))
+	require.NoError(t, relayStream(fr, src.String(), Config{FlushBytes: 4096}))
 	// 首事件 1 次 + 第 2 事件攒满阈值 1 次 + 流结束残余 1 次
 	require.Equal(t, int32(3), fr.flushed.Load())
 }
 
 // stagedReader 依次返回 chunks，之后阻塞在 block 上：用于构造"流仍存活、
-// 停在 Read 上、没有下一帧"的场景，让 timer 成为唯一可能的 flush 来源。
+// 停在 Read 上、没有下一帧"的场景。
 type stagedReader struct {
 	chunks [][]byte
 	block  chan struct{}
@@ -349,23 +349,29 @@ func (s *stagedReader) Read(p []byte) (int, error) {
 	return 0, io.EOF
 }
 
-func TestRelayTimerFlushesWithoutNextEvent(t *testing.T) {
+// TestRelayFlushedBeforeBlockingRead 钉住 flush-on-drain 语义：源在发出帧后
+// 阻塞时，帧字节必须在 relay 阻塞于下一次 Read 之前就已 flush——阻塞发生在
+// drain（读缓冲边界同步 flush）之后；逐帧 timer 机制已删，不存在"等一次
+// timer 火才把字节推出"的路径（旧测试 TestRelayTimerFlushesWithoutNextEvent
+// 钉的正是那种 timer 兜底，机制删除后该空 flush 不再存在）。
+func TestRelayFlushedBeforeBlockingRead(t *testing.T) {
 	fr := &flusherRecorder{ResponseRecorder: httptest.NewRecorder()}
 	src := &stagedReader{chunks: [][]byte{[]byte("data: x\n\n")}, block: make(chan struct{})}
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- Relay(context.Background(), fr, src, Config{FlushBytes: 4096, FlushInterval: 20 * time.Millisecond})
+		errCh <- Relay(context.Background(), fr, src, Config{FlushBytes: 4096})
 	}()
-	// 首事件立即 flush
+	// 首事件即时 flush。
 	require.Eventually(t, func() bool { return fr.flushed.Load() >= 1 }, time.Second, time.Millisecond)
-	// 源仍阻塞在 Read、relay 未退出：期间没有下一帧，2nd flush 只能来自 timer
+	// 源阻塞在 Read 上：relay 未退出。
 	select {
 	case err := <-errCh:
-		t.Fatalf("relay 在源阻塞期间提前退出: %v", err)
+		t.Fatalf("relay exited while source was still blocked: %v", err)
 	default:
 	}
-	require.Eventually(t, func() bool { return fr.flushed.Load() >= 2 }, 200*time.Millisecond, 5*time.Millisecond)
-	// 解除阻塞，流正常结束
+	// 静置窗口内不得再出现任何 flush（没有 timer，也没有第二次空 flush）。
+	time.Sleep(60 * time.Millisecond)
+	require.Equal(t, int32(1), fr.flushed.Load(), "no flush source may fire while blocked")
 	close(src.block)
 	require.NoError(t, <-errCh)
 }
@@ -393,6 +399,34 @@ func (w *errorWriter) Header() http.Header         { return http.Header{} }
 func (w *errorWriter) Write(p []byte) (int, error) { return 0, errors.New("client gone") }
 func (w *errorWriter) WriteHeader(int)             {}
 
+// failAfterFirstWriteWriter 首次 Write 成功、其后失败：构造「首帧即时 flush 成功后，
+// 末次 drain flush 失败」的收尾路径。
+type failAfterFirstWriteWriter struct {
+	err   error
+	calls int
+}
+
+func (w *failAfterFirstWriteWriter) Header() http.Header { return http.Header{} }
+func (w *failAfterFirstWriteWriter) WriteHeader(int)     {}
+func (w *failAfterFirstWriteWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.calls > 1 {
+		return 0, w.err
+	}
+	return len(p), nil
+}
+
+// TestRelayFinalDrainErrorPropagates §3.8 解耦：Config{} 无 Cancel、首帧成功、
+// EOF 残帧入缓冲、末次 drain 失败 → Relay 返回非 nil（drain 错不丢弃、不依赖
+// 是否自取消）。
+func TestRelayFinalDrainErrorPropagates(t *testing.T) {
+	werr := errors.New("drain boom")
+	wr := &failAfterFirstWriteWriter{err: werr}
+	err := Relay(context.Background(), wr, strings.NewReader("data: a\n\ndata: b"), Config{})
+	require.ErrorIs(t, err, werr, "末次 drain 失败必须传播（即便 Config{} 无 Cancel）")
+	require.Equal(t, 2, wr.calls, "首帧写成功 + 末次 drain 写失败")
+}
+
 func TestRelayContextCancelStops(t *testing.T) {
 	rec := httptest.NewRecorder()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -418,9 +452,17 @@ func (r *blockingReader) Read(p []byte) (int, error) { <-r.ch; return 0, io.EOF 
 type ctxBlockingReader struct {
 	ctx context.Context
 	ch  chan struct{}
+	// entered 非空时 Read 入口非阻塞投递一次（测试等它再取消的确定性屏障）。
+	entered chan struct{}
 }
 
 func (r *ctxBlockingReader) Read(p []byte) (int, error) {
+	if r.entered != nil {
+		select {
+		case r.entered <- struct{}{}:
+		default:
+		}
+	}
 	select {
 	case <-r.ctx.Done():
 		return 0, r.ctx.Err()
@@ -429,7 +471,7 @@ func (r *ctxBlockingReader) Read(p []byte) (int, error) {
 	}
 }
 
-// TestRelayTimeoutClassifiesAsDeadlineExceeded C-P2-2 回归：子 ctx 超时
+// TestRelayTimeoutClassifiesAsDeadlineExceeded 回归：子 ctx 超时
 // （UpstreamStreamTimeout）必须分类为 context.DeadlineExceeded 而非被折叠
 // 成 context.Canceled——调用方据此区分"客户端断开"与"上游停滞超时"
 // （5 个 caller 的 r.Context().Err() 补丁已删，靠 normalize 的三类可区分）。
@@ -442,15 +484,20 @@ func TestRelayTimeoutClassifiesAsDeadlineExceeded(t *testing.T) {
 	require.NotErrorIs(t, err, context.Canceled, "超时不得折叠为 Canceled（否则被记成 200+ErrAbort）")
 }
 
-// TestRelayCancelClassifiesAsCanceled C-P2-2 对称断言：父 ctx 取消（客户端
+// TestRelayCancelClassifiesAsCanceled 对称断言：父 ctx 取消（客户端
 // 断开）必须分类为 context.Canceled——与超时区分开（errors.Is 断言）。
 func TestRelayCancelClassifiesAsCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rd := &ctxBlockingReader{ctx: ctx, ch: make(chan struct{})}
+	entered := make(chan struct{}, 1)
+	rd := &ctxBlockingReader{ctx: ctx, ch: make(chan struct{}), entered: entered}
 	errCh := make(chan error, 1)
 	go func() { errCh <- Relay(ctx, httptest.NewRecorder(), rd, Config{}) }()
-	time.Sleep(10 * time.Millisecond) // 确保已阻塞在 Read 后再取消（读侧取消路径）
+	select {
+	case <-entered: // 确定性屏障：Relay 已进入 Read 阻塞后再取消（读侧取消路径）
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "relay 未进入 Read")
+	}
 	cancel()
 	select {
 	case err := <-errCh:
@@ -463,8 +510,8 @@ func TestRelayCancelClassifiesAsCanceled(t *testing.T) {
 // deadClientWriter 模拟半开客户端（进程死亡、无 FIN/RST 收包）：Write 永久
 // 阻塞，直到 SetWriteDeadline 被调用（ctx 取消联动）才失败返回——"取消 =
 // 写失败 = 正常退出"的唯一路径。实现退化（deadline 无独立 watcher，永不被
-// 设置）时 Write 永不返回 → Relay 挂死 → 测试超时失败（兜底抓住方案 2 类
-// 失效：timer goroutine 阻塞在 r.mu 上时 ctx.Done 无法唤醒锁等待者）。
+// 设置）时 Write 永不返回 → Relay 挂死 → 测试超时失败（兜底抓住联动失效类
+// 缺陷：阻塞写持 r.mu、无 ctx 感知）。
 type deadClientWriter struct {
 	entered    chan struct{} // Write 已进入阻塞（测试等它再取消）
 	deadlineCh chan struct{} // SetWriteDeadline 已调用 → 放行 Write
@@ -488,9 +535,9 @@ func (w *deadClientWriter) SetWriteDeadline(time.Time) error {
 	return nil
 }
 
-// TestRelayCancelUnblocksDeadClientWrite C-P2-1 回归：半开客户端（写阻塞）
-// → ctx 取消后必须写失败退出且无 goroutine 泄漏（run + timer + watcher
-// 全汇合——Relay 返回即 stopFlushTimer 已 join 全部内部 goroutine）。
+// TestRelayCancelUnblocksDeadClientWrite 回归：半开客户端（写阻塞）
+// → ctx 取消后必须写失败退出且无 goroutine 泄漏（run + watcher 全汇合——
+// Relay 返回即 stopWatcher 已 join 全部内部 goroutine）。
 func TestRelayCancelUnblocksDeadClientWrite(t *testing.T) {
 	wr := &deadClientWriter{entered: make(chan struct{}, 1), deadlineCh: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -512,6 +559,32 @@ func TestRelayCancelUnblocksDeadClientWrite(t *testing.T) {
 	close(src.block)
 }
 
+// TestRelayTerminalFrameWriteProtectedByDeadlineWatcher 回归：Config.Terminal
+// 注入的流末协议终止帧在 deadline watcher 停止**之前**写出——半开客户端
+// （写阻塞）时取消必须解阻 Relay 退出；若补帧写在 watcher 停止之后，阻塞写
+// 永久挂起（泄漏 goroutine）。空源 → 唯一写出即终止帧，隔离该路径。
+func TestRelayTerminalFrameWriteProtectedByDeadlineWatcher(t *testing.T) {
+	wr := &deadClientWriter{entered: make(chan struct{}, 1), deadlineCh: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Relay(ctx, wr, strings.NewReader(""),
+			Config{Terminal: func() []byte { return []byte("data: [DONE]\n\n") }})
+	}()
+	select {
+	case <-wr.entered:
+	case <-time.After(time.Second):
+		t.Fatal("流末终止帧未进入底层写（测试前置失败：Terminal 未被调用或未写出）")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		require.Error(t, err, "取消后阻塞的终止帧写必须以写错误失败退出")
+	case <-time.After(2 * time.Second):
+		t.Fatal("终止帧阻塞写未受 watcher 解阻：Relay 未退出（补帧写在 watcher 停止之后）")
+	}
+}
+
 // plainWriter 只实现 http.ResponseWriter 的 Header/Write/WriteHeader，
 // 刻意不提供 Flush 方法，用于覆盖 dst 无 Flusher 的路径。
 type plainWriter struct{ buf bytes.Buffer }
@@ -526,14 +599,6 @@ func TestRelayNoFlusherStillWrites(t *testing.T) {
 	require.Equal(t, "data: x\n\n", wr.buf.String())
 }
 
-func TestRelayTimerGoroutineExits(t *testing.T) {
-	// 大量短流：每流 timer 必须退出，-race 下无泄漏/竞争
-	for i := 0; i < 200; i++ {
-		rec := httptest.NewRecorder()
-		require.NoError(t, relayStream(rec, "data: x\n\n", Config{FlushInterval: time.Millisecond}))
-	}
-}
-
 func TestRelayConcurrentStreams(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
@@ -541,8 +606,38 @@ func TestRelayConcurrentStreams(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			rec := httptest.NewRecorder()
-			require.NoError(t, relayStream(rec, "data: x\n\ndata: y\n\n", Config{FlushBytes: 1024, FlushInterval: time.Millisecond}))
+			require.NoError(t, relayStream(rec, "data: x\n\ndata: y\n\n", Config{FlushBytes: 1024}))
 		}()
 	}
 	wg.Wait()
+}
+
+// TestRelayDrainFlushCoalescesFrames 钉住 flush-on-drain 契约：同一读批的
+// 多帧在缓冲耗尽时合并为至多 2 次 flush（首帧即时 flush + drain flush），
+// 而非逐帧 flush；已无任何定时 flush 来源（timer 机制整体删除）。
+func TestRelayDrainFlushCoalescesFrames(t *testing.T) {
+	var sb strings.Builder
+	const frames = 64
+	for i := 0; i < frames; i++ {
+		sb.WriteString("data: {\"i\":1}\n\n")
+	}
+	rec := &flusherRecorder{ResponseRecorder: httptest.NewRecorder()}
+	require.NoError(t, relayStream(rec, sb.String(), Config{}))
+	require.Equal(t, sb.String(), rec.Body.String())
+	require.LessOrEqual(t, rec.flushed.Load(), int32(2), "batch must coalesce to <=2 flushes")
+	require.GreaterOrEqual(t, rec.flushed.Load(), int32(1), "bytes must be flushed")
+}
+
+// TestRelayPooledFrameBufferDoesNotLeak 帧缓冲池化后的隔离 pin：前一条流的
+// 长帧不得残留在后继短流的输出里（Reset + 池复用正确性）。
+func TestRelayPooledFrameBufferDoesNotLeak(t *testing.T) {
+	long := "data: " + strings.Repeat("x", 3000) + "\n\n"
+	rec1 := httptest.NewRecorder()
+	require.NoError(t, relayStream(rec1, long, Config{}))
+	require.Equal(t, long, rec1.Body.String())
+
+	short := "data: s\n\n"
+	rec2 := httptest.NewRecorder()
+	require.NoError(t, relayStream(rec2, short, Config{}))
+	require.Equal(t, short, rec2.Body.String(), "pooled frame buffer must be reset per stream")
 }

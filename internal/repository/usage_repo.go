@@ -46,7 +46,7 @@ type UsageRepo struct {
 }
 
 // usageAggMaxAccountIDs ScanUsageAgg 批量 ids 上限（= handler account_ids
-// ≤100 契约——repo 层防御 handler 之外调用方，N5）。
+// ≤100 契约——repo 层防御 handler 之外调用方）。
 const usageAggMaxAccountIDs = 100
 
 func (r *UsageRepo) InsertBatch(ctx context.Context, logs []*domain.UsageLog) error {
@@ -88,10 +88,10 @@ func mapPartitionError(err error) error {
 	return err
 }
 
-// buildUsageLogCreate 构建单条 usagelog 插入构建器（F2 单写点：usage flusher
+// buildUsageLogCreate 构建单条 usagelog 插入构建器（单写点：usage flusher
 // InsertBatch 是 usage_logs 唯一写者——计费游标消费面只翻 billed/overdraft，
 // 不再插日志）。
-// 计费列（Phase 5）：Cost 毫分（0 = 未计费/错误路径）；BillingTier 空 = 未计费
+// 计费列：Cost 毫分（0 = 未计费/错误路径）；BillingTier 空 = 未计费
 // 路径（落库 NULL）；AboveHit/Overdraft 布尔直接落。RawCost（spec 2026-08-18）
 // 乘倍率前原始成本——恒落（对齐 SetCost，ent 缺省 0 无妨），COPY 路径
 // usageLogRowValues 同序（两路径列集合锚定）。
@@ -105,7 +105,7 @@ func mapPartitionError(err error) error {
 // InputTokens/OutputTokens（TotalTokens 口径不变）。
 // 用户裁决（err_logs 分表）：StatusCode/ErrorMessage 为域内瞬态审计字段
 // （err_logs 承载），不再写 usage_logs（该两列已从表移除——瘦身）。
-// billed（F2 ledger-cursor，spec 2026-08-23）：出生标记直接透传（false=待对账
+// billed（ledger-cursor，spec 2026-08-23）：出生标记直接透传（false=待对账
 // 消费；true=关闭计费/匿名行出生吸收态），翻转只发生在对账事务内。
 func buildUsageLogCreate(client *ent.Client, l *domain.UsageLog) *ent.UsageLogCreate {
 	c := client.UsageLog.Create().
@@ -125,6 +125,11 @@ func buildUsageLogCreate(client *ent.Client, l *domain.UsageLog) *ent.UsageLogCr
 		SetAboveHit(l.AboveHit).
 		SetOverdraft(l.Overdraft).
 		SetBilled(l.Billed).
+		// 供应商收益快照（spec 2026-10-09 §3.3）：earning 与 credited 恒落
+		// （对齐 SetCost/SetBilled——credited 显式透传，**不依赖 ent Default(false)**；
+		// 先例 SetBilled）。
+		SetSupplierEarnMillis(l.SupplierEarnMillis).
+		SetSupplierCredited(l.SupplierCredited).
 		SetCreatedAt(l.CreatedAt)
 	// client_ip（S-E 2026-08-17）：非空才 Set（ent 只落被 Set 的列——空 = NULL
 	// 不写该列，与 COPY 路径 usageLogRowValues 条件赋值一一对应）。
@@ -170,6 +175,9 @@ func buildUsageLogCreate(client *ent.Client, l *domain.UsageLog) *ent.UsageLogCr
 	if l.PricePerCallMillis != nil {
 		c = c.SetPricePerCallMillis(*l.PricePerCallMillis)
 	}
+	if l.SupplierUserID > 0 {
+		c = c.SetSupplierUserID(l.SupplierUserID)
+	}
 	return c
 }
 
@@ -180,9 +188,9 @@ func buildUsageLogCreate(client *ent.Client, l *domain.UsageLog) *ent.UsageLogCr
 // （image tokens/count + 3 价格快照）已删，加 call_count/price_per_call_millis。
 // S-E（2026-08-17）：加 client_ip（紧随 request_id，与分区表列定义一致）。
 // spec 2026-08-18：加 raw_cost（紧随 cost——恒落可 0，对齐 cost 恒落语义）。
-// F2 ledger-cursor（spec 2026-08-23）：加 billed（紧随 overdraft——与分区表
+// ledger-cursor（spec 2026-08-23）：加 billed（紧随 overdraft——与分区表
 // 列定义同位；恒落布尔，出生标记由调用方盖章）。（自 billing_repo.go 整体
-// 搬迁：COPY 事实源归 usage 写入面所有，billing_repo.go 归 F2 T3 独占。）
+// 搬迁：COPY 事实源归 usage 写入面所有，billing_repo.go 归 独占。）
 var usageLogCopyColumns = []string{
 	usagelog.FieldRequestID, usagelog.FieldClientIP, usagelog.FieldGroupID,
 	usagelog.FieldAccountID, usagelog.FieldTemplateID, usagelog.FieldUserID,
@@ -196,6 +204,7 @@ var usageLogCopyColumns = []string{
 	usagelog.FieldRawCost,
 	usagelog.FieldBillingTier, usagelog.FieldAboveHit, usagelog.FieldOverdraft,
 	usagelog.FieldBilled,
+	usagelog.FieldSupplierUserID, usagelog.FieldSupplierEarnMillis, usagelog.FieldSupplierCredited,
 	usagelog.FieldCreatedAt,
 }
 
@@ -204,7 +213,7 @@ var usageLogCopyColumns = []string{
 // cost/raw_cost 恒落（spec 2026-08-18——乘倍率前原始成本，可 0）；
 // client_ip 非空才赋值，否则 NULL；billed 恒落布尔——出生标记透传）。
 func usageLogRowValues(l *domain.UsageLog) []any {
-	var groupID, accountID, templateID, userID, keyID, mappedModel, billingTier, clientIP any
+	var groupID, accountID, templateID, userID, keyID, mappedModel, billingTier, clientIP, supplierUserID any
 	var ttft, priceIn, priceOut, priceCR, priceCC, pricePerCall any
 	if l.ClientIP != "" {
 		clientIP = l.ClientIP
@@ -248,13 +257,17 @@ func usageLogRowValues(l *domain.UsageLog) []any {
 	if l.PricePerCallMillis != nil {
 		pricePerCall = *l.PricePerCallMillis
 	}
+	if l.SupplierUserID > 0 {
+		supplierUserID = l.SupplierUserID
+	}
 	return []any{
 		l.RequestID, clientIP, groupID, accountID, templateID, userID, keyID,
 		l.Model, mappedModel, string(l.Format), string(l.ErrorType), l.LatencyMS, ttft,
 		l.InputTokens, priceIn, l.OutputTokens, priceOut, l.TotalTokens,
 		l.CacheReadTokens, priceCR, l.CacheCreationTokens, priceCC,
 		l.CallCount, pricePerCall,
-		l.Cost, l.RawCost, billingTier, l.AboveHit, l.Overdraft, l.Billed, l.CreatedAt,
+		l.Cost, l.RawCost, billingTier, l.AboveHit, l.Overdraft, l.Billed,
+		supplierUserID, l.SupplierEarnMillis, l.SupplierCredited, l.CreatedAt,
 	}
 }
 
@@ -295,10 +308,8 @@ func (r *UsageRepo) QueryUsages(ctx context.Context, q UsageQuery) ([]*domain.Us
 	if q.Cursor > 0 {
 		pred = pred.Where(usagelog.IDLT(q.Cursor))
 	}
-	if q.Limit <= 0 {
-		q.Limit = 20
-	}
-	rows, err := pred.Order(ent.Desc(usagelog.FieldID)).Limit(q.Limit + 1).All(ctx)
+	limit := logQueryLimit(q.Limit)
+	rows, err := pred.Order(ent.Desc(usagelog.FieldID)).Limit(limit + 1).All(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -327,32 +338,20 @@ func (r *UsageRepo) QueryUsages(ctx context.Context, q UsageQuery) ([]*domain.Us
 			RawCost:                  row.RawCost,
 			AboveHit:                 row.AboveHit,
 			Overdraft:                row.Overdraft,
+			Billed:                   row.Billed,
+			SupplierEarnMillis:       row.SupplierEarnMillis,
+			SupplierCredited:         row.SupplierCredited,
 			CreatedAt:                row.CreatedAt,
 		}
-		if row.GroupID != nil {
-			l.GroupID = *row.GroupID
-		}
-		if row.AccountID != nil {
-			l.AccountID = *row.AccountID
-		}
-		if row.TemplateID != nil {
-			l.TemplateID = *row.TemplateID
-		}
-		if row.UserID != nil {
-			l.UserID = *row.UserID
-		}
-		if row.KeyID != nil {
-			l.KeyID = *row.KeyID
-		}
-		if row.MappedModel != nil {
-			l.MappedModel = *row.MappedModel
-		}
-		if row.BillingTier != nil {
-			l.BillingTier = *row.BillingTier
-		}
-		if row.ClientIP != nil {
-			l.ClientIP = *row.ClientIP
-		}
+		l.GroupID = logValueOrZero(row.GroupID)
+		l.AccountID = logValueOrZero(row.AccountID)
+		l.TemplateID = logValueOrZero(row.TemplateID)
+		l.UserID = logValueOrZero(row.UserID)
+		l.KeyID = logValueOrZero(row.KeyID)
+		l.MappedModel = logValueOrZero(row.MappedModel)
+		l.BillingTier = logValueOrZero(row.BillingTier)
+		l.ClientIP = logValueOrZero(row.ClientIP)
+		l.SupplierUserID = logValueOrZero(row.SupplierUserID)
 		out = append(out, l)
 	}
 	return out, nil
@@ -361,11 +360,11 @@ func (r *UsageRepo) QueryUsages(ctx context.Context, q UsageQuery) ([]*domain.Us
 // ScanUsageAgg 批量账号 usage_logs 区间聚合（/api/admin/accounts/usage 查询面——
 // 统一 usage API spec 2026-08-18）：单连接单查询，`ANY($1)` 100 ids 参数数组
 // 规模内 + created_at 半开区间 [from, to)（分区键——RANGE 分区剪枝 + 既有
-// account_id/created_at 索引）。SQL 侧 GROUP BY 聚合（F-P2-2 形态：服务端
+// account_id/created_at 索引）。SQL 侧 GROUP BY 聚合（形态：服务端
 // 聚合，不拉全行客户端算）；SUM 毫分 int64 原样（USD 换算在 handler 展示
 // 边界）。返回 map[account_id]agg——无记录账号无键（补零由 service 层按 ids
 // 全量组装）。pool 未注入（New 构造）→ 显式错误（与 StatRepo 同纪律）。
-// 数量防御（N5）：>usageAggMaxAccountIDs → 显式错误（防御 handler 之外调用
+// 数量防御：>usageAggMaxAccountIDs → 显式错误（防御 handler 之外调用
 // 方——ANY 参数数组规模上限）。
 func (r *UsageRepo) ScanUsageAgg(ctx context.Context, accountIDs []int64, from, to time.Time) (map[int64]*domain.UsageAgg, error) {
 	if len(accountIDs) > usageAggMaxAccountIDs {
@@ -377,11 +376,24 @@ func (r *UsageRepo) ScanUsageAgg(ctx context.Context, accountIDs []int64, from, 
 	// sum(bigint) → numeric，显式 ::bigint 回落（pgx 扫描 int64 不受 numeric
 	// 精度语义干扰——statSummarySQL 同款）；GROUP BY 行必有行 → sum 非 NULL，
 	// COALESCE 归零仅为形态防御。
-	rows, err := r.pool.Query(ctx, `SELECT account_id, count(*)::bigint,
-		COALESCE(sum(cost), 0)::bigint, COALESCE(sum(raw_cost), 0)::bigint,
-		COALESCE(sum(total_tokens), 0)::bigint
-		FROM usage_logs WHERE account_id = ANY($1) AND created_at >= $2 AND created_at < $3
-		GROUP BY account_id`, accountIDs, from, to)
+	//
+	// **作用域（§2.5）**：供应商面（domain.AccountScopeFrom(ctx).Set）时 owner 谓词
+	// 直接 AND 进聚合 SQL 的 JOIN 条件（`JOIN accounts`）——越域 id 的 usage_logs
+	// 行被 SQL 侧过滤掉，不存在「先聚合再应用层比归属」。管理面（scope 未设）走
+	// 单表形态，谓词与索引使用与旧实现逐字一致（不引入 JOIN 的成本回归）。
+	args := []any{accountIDs, from, to}
+	query := `SELECT u.account_id, count(*)::bigint,
+		COALESCE(sum(u.cost), 0)::bigint, COALESCE(sum(u.raw_cost), 0)::bigint,
+		COALESCE(sum(u.total_tokens), 0)::bigint
+		FROM usage_logs u WHERE u.account_id = ANY($1) AND u.created_at >= $2 AND u.created_at < $3`
+	if s := domain.AccountScopeFrom(ctx); s.Set {
+		args = append(args, s.OwnerUID)
+		query += fmt.Sprintf(`
+		AND EXISTS (SELECT 1 FROM accounts a WHERE a.id = u.account_id AND a.supplier_user_id = $%d)`, len(args))
+	}
+	query += `
+		GROUP BY u.account_id`
+	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

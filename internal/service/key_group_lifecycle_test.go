@@ -16,12 +16,12 @@ import (
 	"github.com/is7qin/c3api/internal/repository"
 )
 
-// TestSoftDeletedKeyNotResurrectable F2 红绿：软删 key 全路 404（fake 已建模
+// TestSoftDeletedKeyNotResurrectable 红绿：软删 key 全路 404（fake 已建模
 // 软删——GetKey 仍返回行且 DeletedAt 置值，删除前 ownedKey 放行则测试失败）；
 // 删除后 Auth 快照增量剔除（keys.deleted 含明文，不可鉴权）、列表过滤、不再
 // 注册（不复活）。
 func TestSoftDeletedKeyNotResurrectable(t *testing.T) {
-	svc, fs, keys := newTask4Svc()
+	svc, fs, keys := newUserGroupService()
 	ctx := context.Background()
 
 	u, err := fs.CreateUser(ctx, &domain.User{Email: "sd-k@example.com", Role: domain.RoleUser, Status: domain.UserStatusActive})
@@ -38,7 +38,7 @@ func TestSoftDeletedKeyNotResurrectable(t *testing.T) {
 	_, err = svc.GetKey(ctx, u.ID, k.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 	st := domain.KeyStatusDisabled
-	_, err = svc.UpdateKey(ctx, u.ID, k.ID, nil, &st, nil, nil)
+	_, err = svc.UpdateKey(ctx, u.ID, k.ID, nil, &st, nil, nil, nil)
 	require.ErrorIs(t, err, ErrNotFound, "已删 key PUT → 404（修复前可复活）")
 	_, err = svc.RotateKey(ctx, u.ID, k.ID)
 	require.ErrorIs(t, err, ErrNotFound, "已删 key rotate → 404（修复前可复活）")
@@ -53,11 +53,11 @@ func TestSoftDeletedKeyNotResurrectable(t *testing.T) {
 	require.Len(t, keys.upserted, 1, "删除后无任何增量注册（不复活）")
 }
 
-// TestSoftDeletedGroupUnusable F3 红绿：软删组三调用点 404（建 key/授
+// TestSoftDeletedGroupUnusable 红绿：软删组三调用点 404（建 key/授
 // assignment/SetUserGroups 逐组）；管理面 GET 详情与 GetGroupAssignments 仍
-// 200（R2 收窄——repo GET 单个不过滤的既有语义不动）。
+// 200（收窄——repo GET 单个不过滤的既有语义不动）。
 func TestSoftDeletedGroupUnusable(t *testing.T) {
-	svc, fs, _ := newTask4Svc()
+	svc, fs, _ := newUserGroupService()
 	ctx := context.Background()
 
 	u, err := fs.CreateUser(ctx, &domain.User{Email: "sd-g@example.com", Role: domain.RoleUser, Status: domain.UserStatusActive})
@@ -81,7 +81,7 @@ func TestSoftDeletedGroupUnusable(t *testing.T) {
 	got, err := svc.GetGroup(ctx, g.ID)
 	require.NoError(t, err)
 	require.NotNil(t, got.DeletedAt, "软删后 deleted_at 置值")
-	// GetGroupAssignments 仍 200（R2：读面不动——授予行照常可读）
+	// GetGroupAssignments 仍 200（读面不动——授予行照常可读）
 	ids, _, err := svc.GetGroupAssignments(ctx, g.ID)
 	require.NoError(t, err)
 	require.Equal(t, []int64{u.ID}, ids, "软删组授予行照常可读（读面语义不变）")
@@ -93,11 +93,11 @@ func TestSoftDeletedGroupUnusable(t *testing.T) {
 	require.Empty(t, rows)
 }
 
-// TestDeleteGroupWithAccountsConflict F1 单删红绿：含账号组删除 → 409 +
+// TestDeleteGroupWithAccountsConflict 单删红绿：含账号组删除 → 409 +
 // "group has accounts"；组未被删（deleted_at 仍 nil）、组内 key 未被删（校验
 // 在删 key 前）。
 func TestDeleteGroupWithAccountsConflict(t *testing.T) {
-	svc, fs, keys := newTask4Svc()
+	svc, fs, keys := newUserGroupService()
 	ctx := context.Background()
 
 	u, err := fs.CreateUser(ctx, &domain.User{Email: "f1@example.com", Role: domain.RoleUser, Status: domain.UserStatusActive})
@@ -107,15 +107,18 @@ func TestDeleteGroupWithAccountsConflict(t *testing.T) {
 		SupportedFormats: []domain.RequestFormat{domain.FormatOpenAIChat},
 	})
 	require.NoError(t, err)
-	emptyG, err := svc.CreateGroup(ctx, "f1-empty", domain.GroupVisibilityPublic, nil, nil)
+	emptyG, err := svc.CreateGroup(ctx, "f1-empty", "", domain.GroupVisibilityPublic, nil, nil)
 	require.NoError(t, err)
-	g, err := svc.CreateGroup(ctx, "f1-acc", domain.GroupVisibilityPublic, nil, nil)
+	g, err := svc.CreateGroup(ctx, "f1-acc", "", domain.GroupVisibilityPublic, nil, nil)
 	require.NoError(t, err)
 	k, err := svc.CreateKey(ctx, u.ID, "k", g.ID, 0, 0)
 	require.NoError(t, err)
 	gids := []int64{g.ID}
-	_, err = svc.CreateAccount(ctx, &domain.Account{
-		Name: "f1-a", TemplateID: tpl.ID, UpstreamKey: "sk-1", GroupIDs: &gids,
+	_, err = svc.CreateAccount(ctx, repository.AccountPatch{
+		Name:        strPtr("f1-a"),
+		TemplateID:  int64Ptr(tpl.ID),
+		UpstreamKey: strPtr("sk-1"),
+		GroupIDs:    &gids,
 	})
 	require.NoError(t, err)
 
@@ -135,11 +138,11 @@ func TestDeleteGroupWithAccountsConflict(t *testing.T) {
 	require.Empty(t, keys.deleted, "409 拒绝时 Auth 快照零清理")
 }
 
-// TestDeleteGroupsBatchPreScanConflict F1 批删 R1 红绿：多组中含账号组 →
+// TestDeleteGroupsBatchPreScanConflict 批删红绿：多组中含账号组 →
 // 整批拒绝（预扫描先全量校验后删 key——组存 key 亡的中间态不发生）：无 key
 // 被删、组全部未被删、Auth 快照零清理。
 func TestDeleteGroupsBatchPreScanConflict(t *testing.T) {
-	svc, fs, keys := newTask4Svc()
+	svc, fs, keys := newUserGroupService()
 	ctx := context.Background()
 
 	u, err := fs.CreateUser(ctx, &domain.User{Email: "f1b@example.com", Role: domain.RoleUser, Status: domain.UserStatusActive})
@@ -149,15 +152,18 @@ func TestDeleteGroupsBatchPreScanConflict(t *testing.T) {
 		SupportedFormats: []domain.RequestFormat{domain.FormatOpenAIChat},
 	})
 	require.NoError(t, err)
-	g1, err := svc.CreateGroup(ctx, "f1b-1", domain.GroupVisibilityPublic, nil, nil)
+	g1, err := svc.CreateGroup(ctx, "f1b-1", "", domain.GroupVisibilityPublic, nil, nil)
 	require.NoError(t, err)
-	g2, err := svc.CreateGroup(ctx, "f1b-2", domain.GroupVisibilityPublic, nil, nil)
+	g2, err := svc.CreateGroup(ctx, "f1b-2", "", domain.GroupVisibilityPublic, nil, nil)
 	require.NoError(t, err)
 	k, err := svc.CreateKey(ctx, u.ID, "k", g1.ID, 0, 0)
 	require.NoError(t, err)
 	gids := []int64{g2.ID}
-	_, err = svc.CreateAccount(ctx, &domain.Account{
-		Name: "f1b-a", TemplateID: tpl.ID, UpstreamKey: "sk-1", GroupIDs: &gids,
+	_, err = svc.CreateAccount(ctx, repository.AccountPatch{
+		Name:        strPtr("f1b-a"),
+		TemplateID:  int64Ptr(tpl.ID),
+		UpstreamKey: strPtr("sk-1"),
+		GroupIDs:    &gids,
 	})
 	require.NoError(t, err)
 
@@ -177,10 +183,10 @@ func TestDeleteGroupsBatchPreScanConflict(t *testing.T) {
 	require.Empty(t, keys.deleted, "整批拒绝：Auth 快照零清理")
 }
 
-// TestUpdateKeyPatchSingleField S3-F1：单字段 PUT 只改该字段（patch 化——其余
+// TestUpdateKeyPatchSingleField：单字段 PUT 只改该字段（patch 化——其余
 // 字段保持原值，不再全列写回）。
 func TestUpdateKeyPatchSingleField(t *testing.T) {
-	svc, fs, _ := newTask4Svc()
+	svc, fs, _ := newUserGroupService()
 	ctx := context.Background()
 
 	u, err := fs.CreateUser(ctx, &domain.User{Email: "patch1@example.com", Role: domain.RoleUser, Status: domain.UserStatusActive})
@@ -191,7 +197,7 @@ func TestUpdateKeyPatchSingleField(t *testing.T) {
 	require.NoError(t, err)
 
 	q := int64(2000)
-	updated, err := svc.UpdateKey(ctx, u.ID, k.ID, nil, nil, nil, &q)
+	updated, err := svc.UpdateKey(ctx, u.ID, k.ID, nil, nil, nil, &q, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(2000), updated.Quota, "quota 被改")
 	require.Equal(t, "k", updated.Name, "name 未被改动")
@@ -199,15 +205,51 @@ func TestUpdateKeyPatchSingleField(t *testing.T) {
 	require.Equal(t, domain.KeyStatusActive, updated.Status, "status 未被改动")
 
 	// 全 nil = 无变更：零写库直接返回当前行
-	noop, err := svc.UpdateKey(ctx, u.ID, k.ID, nil, nil, nil, nil)
+	noop, err := svc.UpdateKey(ctx, u.ID, k.ID, nil, nil, nil, nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(2000), noop.Quota)
 }
 
-// TestUpdateKeyPatchConcurrent S3-F1 -race：并发两个 PUT 改不同字段 → 各自
+// TestUpdateKeyQuotaZeroResetsUsed：额度显式设为 0（= 不限）→ 同步清零累计消耗。
+// 两条理由：① 不限额度下"已用"无意义；② 它是**累计**上限，不清零会把旧消耗
+// 带进下一次设额（刚设好额度就被历史消耗挡住）。设成非 0 不清零（累计语义保持）。
+func TestUpdateKeyQuotaZeroResetsUsed(t *testing.T) {
+	svc, fs, _ := newUserGroupService()
+	ctx := context.Background()
+
+	u, err := fs.CreateUser(ctx, &domain.User{Email: "qz@example.com", Role: domain.RoleUser, Status: domain.UserStatusActive})
+	require.NoError(t, err)
+	g, err := fs.CreateGroup(ctx, &domain.Group{Name: "qz-g", Visibility: domain.GroupVisibilityPublic})
+	require.NoError(t, err)
+	k, err := svc.CreateKey(ctx, u.ID, "qz", g.ID, 3, 1000)
+	require.NoError(t, err)
+	fs.keys[k.ID].QuotaUsed = 400 // 模拟已消耗
+
+	// 设成非 0：累计消耗保持
+	up := int64(2000)
+	kept, err := svc.UpdateKey(ctx, u.ID, k.ID, nil, nil, nil, &up, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(400), kept.QuotaUsed, "设非 0 不清零")
+
+	// 设成 0（不限）：清零
+	zero := int64(0)
+	reset, err := svc.UpdateKey(ctx, u.ID, k.ID, nil, nil, nil, &zero, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), reset.Quota, "quota=0 = 不限")
+	require.Equal(t, int64(0), reset.QuotaUsed, "额度设为 0 → 累计消耗清零")
+
+	// 之后重新设额：从零起算（不被历史消耗挡住）
+	q2 := int64(500)
+	fresh, err := svc.UpdateKey(ctx, u.ID, k.ID, nil, nil, nil, &q2, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(500), fresh.Quota)
+	require.Equal(t, int64(0), fresh.QuotaUsed, "重新设额从零起算")
+}
+
+// TestUpdateKeyPatchConcurrent -race：并发两个 PUT 改不同字段 → 各自
 // 生效（patch 化消除 lost-update——修复前全行快照写回，后写者覆盖先写者）。
 func TestUpdateKeyPatchConcurrent(t *testing.T) {
-	svc, fs, _ := newTask4Svc()
+	svc, fs, _ := newUserGroupService()
 	ctx := context.Background()
 
 	u, err := fs.CreateUser(ctx, &domain.User{Email: "patchc@example.com", Role: domain.RoleUser, Status: domain.UserStatusActive})
@@ -223,12 +265,12 @@ func TestUpdateKeyPatchConcurrent(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, err := svc.UpdateKey(ctx, u.ID, k.ID, &name, nil, nil, nil)
+		_, err := svc.UpdateKey(ctx, u.ID, k.ID, &name, nil, nil, nil, nil)
 		require.NoError(t, err)
 	}()
 	go func() {
 		defer wg.Done()
-		_, err := svc.UpdateKey(ctx, u.ID, k.ID, nil, &st, nil, nil)
+		_, err := svc.UpdateKey(ctx, u.ID, k.ID, nil, &st, nil, nil, nil)
 		require.NoError(t, err)
 	}()
 	wg.Wait()
@@ -241,7 +283,7 @@ func TestUpdateKeyPatchConcurrent(t *testing.T) {
 	require.Equal(t, int64(0), got.Quota, "未改字段保持原值")
 }
 
-// TestSetGroupAssignmentsRollback S3-F2：替换中途注入失败（RevokeGroup）→
+// TestSetGroupAssignmentsRollback：替换中途注入失败（RevokeGroup）→
 // 整体回滚——已完成的 Grant 一并撤销，主视图回到替换前（fake 事务暂存语义）。
 func TestSetGroupAssignmentsRollback(t *testing.T) {
 	fs := newFakeStore()

@@ -8,6 +8,7 @@ import (
 	"math"
 
 	"github.com/is7qin/c3api/internal/domain"
+	"github.com/is7qin/c3api/internal/handler/httpface"
 	"github.com/is7qin/c3api/internal/rule"
 )
 
@@ -33,7 +34,7 @@ func toAPIUser(u *domain.User) User {
 		Role:           &r,
 		Status:         &st,
 		MaxConcurrency: &u.MaxConcurrency,
-		Balance:        ptr(float64(u.Balance) / 1e5),
+		Balance:        httpface.Ptr(float64(u.Balance) / 1e5),
 		CreatedAt:      &u.CreatedAt,
 		UpdatedAt:      &u.UpdatedAt,
 	}
@@ -46,8 +47,9 @@ func toAPIGroup(g *domain.Group) Group {
 	return Group{
 		ID:              &g.ID,
 		Name:            &g.Name,
+		Description:     httpface.Ptr(g.Description),
 		Visibility:      &v,
-		PriceMultiplier: ptr(float64(g.PriceMultiplier) / 10000.0),
+		PriceMultiplier: httpface.Ptr(float64(g.PriceMultiplier) / 10000.0),
 		CreatedAt:       &g.CreatedAt,
 		UpdatedAt:       &g.UpdatedAt,
 		DeletedAt:       g.DeletedAt, // 软删除时间戳（只读字段；已删组不进可选列表）
@@ -61,6 +63,7 @@ func toAPIKey(k *domain.Key) Key {
 		ID:             &k.ID,
 		UserID:         &k.UserID,
 		GroupID:        &k.GroupID,
+		GroupName:      &k.GroupName,
 		Name:           &k.Name,
 		Key:            &k.KeyRaw,
 		Status:         &st,
@@ -168,7 +171,7 @@ func errTypeKind(et domain.ErrorType) (rule.Kind, bool) {
 	return 0, false
 }
 
-// sanitizeErrLog 用户面 err_logs 行级脱敏：行 {kind ← error_type 全函数映射、http_status ← status_code、message ← error_message} 调同一策略（Classify）→ 统一公式 msg=CustomMessage!=nil?*CustomMessage:orig（via rule.UnifiedMessage，与 pipeline 响应同源 I-3）；代理日志保留原文边界另述。Model 口径 = 最终请求模型（映射后 sel.Model，与 failoverLoop 一致）。返回 (替换后文本, 是否替换)。
+// sanitizeErrLog 用户面 err_logs 行级脱敏：行 {kind ← error_type 全函数映射、http_status ← status_code、message ← error_message} 调同一策略（Classify）→ 统一公式 msg=CustomMessage!=nil?*CustomMessage:orig（via rule.UnifiedMessage，与 pipeline 响应同源）；代理日志保留原文边界另述。Model 口径 = 最终请求模型（映射后 sel.Model，与 failoverLoop 一致）。返回 (替换后文本, 是否替换)。
 func (h *UserAPI) sanitizeErrLog(l *domain.UsageLog) (string, bool) {
 	k, ok := errTypeKind(l.ErrorType)
 	if !ok {
@@ -192,12 +195,39 @@ func (h *UserAPI) sanitizeErrLog(l *domain.UsageLog) (string, bool) {
 		ev.ErrorMessage = *l.ErrorMessage
 	}
 	then, _ := h.rules.Classify(ev)
-	// 与 pipeline 同源（I-3 helper 单点）
+	// 与 pipeline 同源（helper 单点）
 	upstream := ""
 	if l.ErrorMessage != nil {
 		upstream = *l.ErrorMessage
 	}
 	return rule.UnifiedMessage(then, upstream)
+}
+
+// toAPIStatsCapabilities 能力投影 → 用户面包内线缆类型（与
+// internal/handler/stat.go 的同名函数是**逐句同构的双份**——两面各自生成
+// schema 类型，跨包不可共用，这是本仓库既有的双面包惯例：toAPIStatTrendPoint /
+// toAPIEntityStatTrendPoint / toAPIStatTTFTSummary 同样各有一份）。
+// 无数值字面量：上限/覆盖天数全部来自同一份 domain KIND 矩阵投影。
+func toAPIStatsCapabilities(c domain.Capabilities) StatsCapabilities {
+	kinds := make(map[string]StatsKindCapability, len(c.Kinds))
+	for id, k := range c.Kinds {
+		storages := make([]StatsKindCapabilityStorages, 0, len(k.Storages))
+		caps := make(map[string]int64, len(k.Storages))
+		days := make(map[string]int, len(k.Storages))
+		for _, s := range k.Storages {
+			name := s.String()
+			storages = append(storages, StatsKindCapabilityStorages(name))
+			caps[name] = k.CostCapSeconds[s]
+			days[name] = k.CoverageDays[s]
+		}
+		kinds[string(id)] = StatsKindCapability{
+			Grouping:       k.Grouping.String(),
+			Storages:       storages,
+			CostCapSeconds: caps,
+			CoverageDays:   days,
+		}
+	}
+	return StatsCapabilities{BucketGridSeconds: int(c.BucketGridSeconds), Kinds: kinds}
 }
 
 func toAPIStatTrendPoint(b *domain.StatBucket) StatTrendPoint {
@@ -215,9 +245,9 @@ func toAPIStatTrendPoint(b *domain.StatBucket) StatTrendPoint {
 		TotalTokens:         &b.TotalTokens,
 		CacheReadTokens:     &b.CacheReadTokens,
 		CacheCreationTokens: &b.CacheCreationTokens,
-		Cost:                ptr(float64(b.Cost) / 1e5),
-		RawCost:             ptr(float64(b.RawCost) / 1e5),
-		TTFTAvgMS:           ptr(avg),
+		Cost:                httpface.Ptr(float64(b.Cost) / 1e5),
+		RawCost:             httpface.Ptr(float64(b.RawCost) / 1e5),
+		TTFTAvgMS:           httpface.Ptr(avg),
 		TTFTMaxMS:           &b.TTFTMaxMS,
 	}
 }
@@ -237,9 +267,9 @@ func toAPIEntityStatTrendPoint(b *domain.EntityStatBucket) StatTrendPoint {
 		TotalTokens:         &b.TotalTokens,
 		CacheReadTokens:     &b.CacheReadTokens,
 		CacheCreationTokens: &b.CacheCreationTokens,
-		Cost:                ptr(float64(b.Cost) / 1e5),
-		RawCost:             ptr(float64(b.RawCost) / 1e5),
-		TTFTAvgMS:           ptr(avg),
+		Cost:                httpface.Ptr(float64(b.Cost) / 1e5),
+		RawCost:             httpface.Ptr(float64(b.RawCost) / 1e5),
+		TTFTAvgMS:           httpface.Ptr(avg),
 		TTFTMaxMS:           &b.TTFTMaxMS,
 	}
 }

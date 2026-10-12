@@ -5,6 +5,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -37,10 +38,36 @@ func (f *fakeKeys) Upsert(hash string, meta domain.KeyMeta) {
 }
 func (f *fakeKeys) Delete(hash string) { f.deleted = append(f.deleted, hash) }
 
+// UpsertManagementKey/DeleteManagementKey 补全 service.AuthRegistrar（管理 key 面 no-op）。
+func (f *fakeKeys) UpsertManagementKey(string, domain.ManagementKeyMeta) {}
+func (f *fakeKeys) DeleteManagementKey(string)                           {}
+
+// testEmailCodes 无行为 service.EmailCodeStore（service.New 必选依赖的测试
+// 占位：被测路径不触验证码面；验证码行为由 newTestUserRouter 经 fake 真实现覆盖）。
+var testEmailCodes service.EmailCodeStore = testEmailCodeStore{}
+
+type testEmailCodeStore struct{}
+
+func (testEmailCodeStore) GetEmailCode(ctx context.Context, email, purpose string) (*domain.EmailCode, error) {
+	return nil, service.ErrNotFound
+}
+
+func (testEmailCodeStore) UpsertEmailCode(ctx context.Context, email, purpose, sha256 string, expiresAt time.Time) (*domain.EmailCode, error) {
+	return &domain.EmailCode{Email: email}, nil
+}
+
+func (testEmailCodeStore) IncrementEmailCodeAttempts(ctx context.Context, email, purpose string) (int, error) {
+	return 0, nil
+}
+
+func (testEmailCodeStore) DeleteEmailCode(ctx context.Context, email, purpose string) error {
+	return nil
+}
+
 func newTestHandler(t *testing.T) *AdminAPI {
 	t.Helper()
 	store := newFakeStore()
-	svc := service.New(store, fakeSched{}, service.NopInvalidator{}, nil, nil, &fakeKeys{}, nil)
+	svc := service.New(service.Deps{Store: store, Scheduler: fakeSched{}, Invalidate: service.NopInvalidator{}, Publisher: nil, RuleReload: nil, Auth: &fakeKeys{}, Log: nil, EmailCodeStore: store})
 	return New(svc)
 }
 
@@ -86,7 +113,7 @@ func TestAdminFlow(t *testing.T) {
 	require.Equal(t, 400, recBad.Code, "非法 credential_type 必须 400: %s", recBad.Body.String())
 
 	rec = do(http.MethodPost, "/api/admin/accounts", `{
-		"name":"acc1","template_id":`+itoa(tpl.ID)+`,"upstream_key":"sk-x","weight":80,"max_concurrency":4}`)
+		"name":"acc1","template_id":`+itoa(tpl.ID)+`,"upstream_key":"sk-x","max_concurrency":4}`)
 	require.Equal(t, 200, rec.Code, "create account: %s", rec.Body.String())
 	var acc domain.Account
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &acc))
@@ -99,7 +126,7 @@ func TestAdminFlow(t *testing.T) {
 	require.Equal(t, domain.GroupVisibilityPublic, groupResp.Visibility, "缺省 visibility = public")
 
 	// 账号侧绑定分组：PUT 账号 body 带 group_ids；回显经 GET /accounts/{id}/groups 核对。
-	rec = do(http.MethodPut, "/api/admin/accounts/"+itoa(acc.ID),
+	rec = do(http.MethodPatch, "/api/admin/accounts/"+itoa(acc.ID),
 		`{"name":"acc1","template_id":`+itoa(tpl.ID)+`,"upstream_key":"sk-x","group_ids":[`+itoa(groupResp.ID)+`]}`)
 	require.Equal(t, 200, rec.Code, "account-side binding: %s", rec.Body.String())
 	rec = do(http.MethodGet, "/api/admin/accounts/"+itoa(acc.ID)+"/groups", "")
@@ -108,7 +135,7 @@ func TestAdminFlow(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &accGroups))
 	require.Equal(t, []int64{groupResp.ID}, accGroups.GroupIds, "账号分组回显")
 
-	// Phase 3a：rotate-key 端点已删除（key 轮换在用户面 /api/user/keys/{id}/rotate）→ 404
+	// rotate-key 端点已删除（key 轮换在用户面 /api/user/keys/{id}/rotate）→ 404
 	rec = do(http.MethodPost, "/api/admin/groups/"+itoa(groupResp.ID)+"/rotate-key", "")
 	require.Equal(t, 404, rec.Code, "rotate-key 端点已删除: %s", rec.Body.String())
 
@@ -279,7 +306,7 @@ func TestGetUsageLogsRequiresFromTo(t *testing.T) {
 }
 
 // TestGetErrLogsRequiresFromTo 无 from/to → 生成层 400（/err_logs 与
-// /usage_logs 同契约；评审 L2：err_logs 侧缺该断言——usage 侧见
+// /usage_logs 同契约；err_logs 侧缺该断言——usage 侧见
 // TestGetUsageLogsRequiresFromTo）。
 func TestGetErrLogsRequiresFromTo(t *testing.T) {
 	h := newTestHandler(t)
@@ -308,7 +335,7 @@ func TestGetErrLogsRequiresFromTo(t *testing.T) {
 // error_type/error_message/billing_tier 全值）。
 func TestGetErrLogs(t *testing.T) {
 	store := newFakeStore()
-	svc := service.New(store, fakeSched{}, service.NopInvalidator{}, nil, nil, &fakeKeys{}, nil)
+	svc := service.New(service.Deps{Store: store, Scheduler: fakeSched{}, Invalidate: service.NopInvalidator{}, Publisher: nil, RuleReload: nil, Auth: &fakeKeys{}, Log: nil, EmailCodeStore: store})
 	h := New(svc)
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
@@ -358,7 +385,7 @@ func TestGetErrLogs(t *testing.T) {
 	require.Equal(t, "auto", *e.BillingTier)
 }
 
-// TestGetLogsFilters（R4-M2/I1 评审项）日志查询过滤面真实断言——防假绿：
+// TestGetLogsFilters（I1 评审项）日志查询过滤面真实断言——防假绿：
 // 此前 fake store 仅按 user_id 过滤，model/error_type/status_code/时间/分页
 // 参数恒不生效（零断言）。本测试逐参数断言 + ID 降序 + keyset 游标分页
 // （cursor = 上页最后一条 id，next_cursor 由 limit+1 探测组装——与真实 repo
@@ -520,7 +547,7 @@ func TestGetLogsFilters(t *testing.T) {
 	require.Equal(t, int64(74), *ebody.Rows[0].KeyID)
 }
 
-// TestGetUsageLogsLimitClip limit>200 裁剪真实断言（评审 L1）：上节 4 行种子
+// TestGetUsageLogsLimitClip limit>200 裁剪真实断言：上节 4 行种子
 // 无法区分"裁剪到 200"与"忽略 limit"——201 行种子断言恰 200 行 + next_cursor
 // 非空（裁剪后仍有下一页）。
 func TestGetUsageLogsLimitClip(t *testing.T) {
@@ -593,31 +620,28 @@ func TestGetTemplatesParams(t *testing.T) {
 	require.Equal(t, "openai-main", body.Rows[0].Name, "row name")
 }
 
-// status 多值（逗号分隔）+ template_id 筛选参数绑定；非法枚举值 → 400
-// （openapi status 是纯 string 不校验枚举，handler 必须显式校验）。
-func TestGetAccountsStatusMulti(t *testing.T) {
+// 账号列表参数绑定（template_id 筛选）+ 未知查询参数忽略（契约无该参数时
+// 生成层不绑定、handler 不感知——请求照常 200）。
+func TestGetAccountsParamsBinding(t *testing.T) {
 	_, _, do := newListTestRouter(t)
 	rec := do(http.MethodPost, "/api/admin/templates", `{
 		"name":"openai-main","base_url":"https://api.openai.com",
 		"supported_formats":["openai-chat"]}`)
 	require.Equal(t, 200, rec.Code, "create template: %s", rec.Body.String())
 	rec = do(http.MethodPost, "/api/admin/accounts", `{
-		"name":"acc1","template_id":1,"upstream_key":"sk-x","status":"active"}`)
+		"name":"acc1","template_id":1,"upstream_key":"sk-x"}`)
 	require.Equal(t, 200, rec.Code, "create account: %s", rec.Body.String())
 
-	rec = do(http.MethodGet, "/api/admin/accounts?status=active,disabled&template_id=1", "")
+	rec = do(http.MethodGet, "/api/admin/accounts?template_id=1", "")
 	require.Equal(t, 200, rec.Code, "list: %s", rec.Body.String())
 	var body AccountListResponse
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
 	require.Equal(t, int64(1), body.Total, "total")
 	require.Len(t, body.Rows, 1, "rows")
 
-	// 非法 status 枚举 → 400（handoff 硬性要求：不校验会落 repo 裸 error → 500）
-	rec = do(http.MethodGet, "/api/admin/accounts?status=bogus", "")
-	require.Equal(t, 400, rec.Code, "invalid status: %s", rec.Body.String())
-	var errBody map[string]any
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errBody))
-	require.Contains(t, errBody, "error", "must be ErrorResponse JSON")
+	// 契约外查询参数 → 忽略不报错（200），不是 400/500
+	rec = do(http.MethodGet, "/api/admin/accounts?bogus_param=1", "")
+	require.Equal(t, 200, rec.Code, "unknown query param ignored: %s", rec.Body.String())
 }
 
 // 非法 sort 值 → 400（service validateListQuery 白名单校验）。
@@ -663,7 +687,7 @@ func errMsg(t *testing.T, rec *httptest.ResponseRecorder) string {
 }
 
 // TestSingleResourceMissingID 单资源 GET/DELETE 缺 id → 404，且响应体消息
-// 含缺失 id（与批量 404 同语义；Minor T5-2 清账：handler fake 的 Get/Delete
+// 含缺失 id（与批量 404 同语义；Minor 清账：handler fake 的 Get/Delete
 // 需返回带 id 错误，此前仅状态码断言/缺失）。
 func TestSingleResourceMissingID(t *testing.T) {
 	_, _, do := newListTestRouter(t)

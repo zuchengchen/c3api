@@ -10,12 +10,28 @@ package usage
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/worker"
 	"github.com/is7qin/c3api/pkg/logx"
 )
+
+// DiskProbe 数据盘可用空间探针（spec §3.11）：返回可用字节数（best-effort）。
+// ok=false = 无法探测（保留旧值 / ETA unknown）。
+type DiskProbe func() (freeBytes int64, ok bool)
+
+// defaultDiskMinFreeBytes 容量处置默认下限（可用空间低于此值 ⇒ 停供应商新流量）。
+// 未配置时生效；spec 未给固定值，取保守 5 GiB。
+const defaultDiskMinFreeBytes = 5 << 30
+
+// NewDiskProbe 构造基于文件系统 statfs 的可用空间探针（path 所在卷）。非 unix
+// 平台恒 ok=false（ETA unknown）。path 由组合根按数据卷选择（best-effort）。
+func NewDiskProbe(path string) DiskProbe {
+	return func() (int64, bool) { return probeDiskFree(path) }
+}
 
 // PartitionManager 分区管理面（repository.Repository 实现）：保留策略只需
 // DROP 过期分区 + 预建未来分区，不感知分区表内部 DDL。now/until 由调用方
@@ -23,30 +39,59 @@ import (
 // 独立：LogRetentionDays / ErrLogRetentionDays / StatsRetentionDays——后者由
 // usage_stats 与 usage_entity_stats 共用，同一循环 DROP+预建）。
 // DeleteRedemptionUsesBefore 是普通表（redemption_uses 无分区可 DROP）的
-// 有界批删路径——同为保留策略的周期清理手段，归口本接口（F3-2）。
+// 有界批删路径——同为保留策略的周期清理手段，归口本接口。
 type PartitionManager interface {
 	EnsureUsageLogPartitions(ctx context.Context, now, until time.Time) error
-	DropUsageLogPartitionsBefore(ctx context.Context, cutoff time.Time) (int, error)
+	// RetireUsageLogPartitions usage_logs 分区退休屏障（spec 2026-10-09 §3.11）：
+	// 只在无未确认资金事件（未记账正收益行 / 未扣费事件）时分区分区 DROP；被挡
+	// 分区经 Blocked 返回（独立持久告警）。替代裸 DropUsageLogPartitionsBefore。
+	RetireUsageLogPartitions(ctx context.Context, cutoff time.Time) (domain.UsageLogRetireResult, error)
 	EnsureErrLogPartitions(ctx context.Context, now, until time.Time) error
 	DropErrLogPartitionsBefore(ctx context.Context, cutoff time.Time) (int, error)
 	EnsureUsageStatsPartitions(ctx context.Context, now, until time.Time) error
 	DropUsageStatsPartitionsBefore(ctx context.Context, cutoff time.Time) (int, error)
 	EnsureUsageEntityStatsPartitions(ctx context.Context, now, until time.Time) error
 	DropUsageEntityStatsPartitionsBefore(ctx context.Context, cutoff time.Time) (int, error)
+	EnsureRoutingFactPartitions(ctx context.Context, now, until time.Time) error
+	DropRoutingQualityFactBefore(ctx context.Context, cutoff time.Time) (int, error)
+	DropRoutingFlowFactBefore(ctx context.Context, cutoff time.Time) (int, error)
+	DeleteRoutingFlowSnapshotStateBefore(ctx context.Context, cutoff time.Time) (int, error)
+	// RoutingFactPartitionStats 路由观测面的兜底统计（聚合告警 + 分表诊断 +
+	// 快照行数 + 无名分区数，无分区时 Count=0、Oldest 为零值）。保留期兜底观测
+	// 的读面（A17）。形状复用 domain.RoutingPartitionStats——该接缝**不得**引用
+	// repository 的类型，否则 usage 会为它引入对整个 repository 的依赖（此前零依赖）。
+	RoutingFactPartitionStats(ctx context.Context) (domain.RoutingPartitionStats, error)
 	DeleteRedemptionUsesBefore(ctx context.Context, cutoff time.Time) (int, error)
 }
 
-// redemptionUseRetentionDays redemption_uses 保留窗口（TTL 定死 90 天，F3-2）。
+// redemptionUseRetentionDays redemption_uses 保留窗口（TTL 定死 90 天）。
 // 90 天窗口内的兑换记录即审计证据，超窗删除不破坏审计语义——兑换审计只需
 // 近期窗口（新近兑换可追溯），留存超出窗口的行无审计价值。
 const redemptionUseRetentionDays = 90
 
 // RetentionConfig retention worker 配置。
 type RetentionConfig struct {
-	LogRetentionDays    int           // usage_logs 分区保留天数（config usage.log_retention_days；<= 0 = 不删除）
-	ErrLogRetentionDays int           // err_logs 分区保留天数（config usage.errlog_retention_days，默认 7 天短保留——错误审计；<= 0 = 不删除）
-	StatsRetentionDays  int           // usage_stats 分区保留天数（config usage.stats_retention_days，默认 180 天——聚合统计长保留；<= 0 = 不删除）
-	TickerInterval      time.Duration // 巡检周期（生产 1h；测试注入短周期；<= 0 兜底 1h）
+	LogRetentionDays    int // usage_logs 分区保留天数（config usage.log_retention_days；<= 0 = 不删除）
+	ErrLogRetentionDays int // err_logs 分区保留天数（config usage.errlog_retention_days，默认 7 天短保留——错误审计；<= 0 = 不删除）
+	StatsRetentionDays  int // usage_stats 分区保留天数（config usage.stats_retention_days，默认 180 天——聚合统计长保留；<= 0 = 不删除）
+	// RoutingObservationRetentionDays 路由观测面（routing_quality_fact /
+	// routing_flow_fact 两张事实分区表 + snapshot_state 交接状态）
+	// 保留天数（config routing.observation_retention_days，默认 7；config 地板 2）。
+	// 与 usage_stats **解耦**：观测深度是运维参数，不再搭 180 天长保留的车
+	// （判据 A4/B1/B2/B3）；读面窗口守卫用同一份天数 + 同一换算
+	// （domain.RoutingObservationCutoff）。<= 0 = 不删除。
+	RoutingObservationRetentionDays int
+	TickerInterval                  time.Duration // 巡检周期（生产 1h；测试注入短周期；<= 0 兜底 1h）
+	// DiskProbe 数据盘可用空间探针（spec §3.11）：周期采样算容量 ETA 与处置；
+	// nil = 不观测（disk_eta_seconds = -1 / capacity_blocked = false）。
+	DiskProbe DiskProbe
+	// DiskMinFreeBytes 可用空间下限：低于此值 ⇒ 容量不足，触发 OnCapacityBlocked
+	// （边沿）。<=0 ⇒ defaultDiskMinFreeBytes。
+	DiskMinFreeBytes int64
+	// OnCapacityBlocked 容量不足处置回调（spec §3.11）：blocked=true ⇒ 组合根据此
+	// 停供应商新流量 / 拒绝入库；恢复（可用空间回到下限之上）回调 false。
+	// nil = 仅观测不处置。
+	OnCapacityBlocked func(blocked bool)
 }
 
 // RetentionWorker 按日分区保留 worker（worker.Worker 契约，Name="retention"）：
@@ -57,11 +102,11 @@ type RetentionConfig struct {
 //     快 5~6 个量级；按分区名日期判定，无需查元数据——usage_stats 保留清理
 //     用户裁决 2026-08-11：PG DELETE 不释放空间，必须分区 DROP）
 //   - 预建 当日 + 未来 1 天 分区（PG 无自动建分区，防日界跨区插入失败）
-//   - redemption_uses 有界批删（F3-2）：普通表无分区可 DROP，同一循环内每轮
+//   - redemption_uses 有界批删：普通表无分区可 DROP，同一循环内每轮
 //     DELETE 至多 5000 行超窗行（TTL 定死 90 天，见 redemptionUseRetentionDays）
 //     ——低频表单轮即清，超大批多轮收敛（每轮上限防长事务持锁）
 //
-// DROP × 在途插入竞态（评审 I-3）：DROP TABLE 需 ACCESS EXCLUSIVE 锁，与
+// DROP × 在途插入竞态：DROP TABLE 需 ACCESS EXCLUSIVE 锁，与
 // 在途插入事务串行；能落进被 DROP 分区（保留期前）的行只有回放/陈旧
 // created_at 的延迟日志——该分区数据本就在保留语义内（要清理）。万一插入
 // 恰好失败 → 走落库失败路径（Warn + 丢弃，与普通批量落库失败同语义，不自愈
@@ -79,15 +124,88 @@ type RetentionWorker struct {
 	// DROP 分区数（失败轮保留上轮值——缓存 runOnce 现有返回值，DROP 的 n 即
 	// 真实 DB 答案）；usage_entity_stats 与 usage_stats 共用 StatsRetentionDays，
 	// 独立计数 lastDropEntityStats。
-	lastPatrol          atomic.Int64
-	lastDropLogs        atomic.Int64
+	lastPatrol   atomic.Int64
+	lastDropLogs atomic.Int64
+	// lastBlockedLogs 最近一轮 usage_logs 分区退休屏障挡下的分区数（§3.11 应用
+	// 告警；>0 = 存在未确认资金事件，容量耗尽前须处置）。
+	lastBlockedLogs     atomic.Int64
 	lastDropErrLogs     atomic.Int64
 	lastDropStats       atomic.Int64
 	lastDropEntityStats atomic.Int64
+	// 路由观测面 DROP 计数（与 lastDrop* 同纪律：失败轮保留上轮值）。0 且分区
+	// 未减 ≠ 失败——无过期分区时 DROP 本就返回 0；是否失败看 Warn 日志。
+	lastDropRoutingQuality atomic.Int64
+	lastDropRoutingFlow    atomic.Int64
+	// 保留期兜底观测（spec §6/A17）：聚合告警口径（partitionCount/oldestPartition）
+	// + 分表诊断口径（quality/flow 各自计数与最老）+ 快照行数 + 无名分区数。
+	// 事实表的有界性完全依赖本 worker 在跑，故这些项让「worker 停摆」可观测。
+	partitionCount        atomic.Int64
+	oldestPartition       atomic.Int64
+	qualityPartitionCount atomic.Int64
+	qualityOldest         atomic.Int64
+	flowPartitionCount    atomic.Int64
+	flowOldest            atomic.Int64
+	snapshotRows          atomic.Int64
+	undatedPartitions     atomic.Int64
+	// statsStale 查询失败的可见标记：失败轮保留上轮值（与 lastDrop* 同纪律），
+	// 但 lastPatrol 仍推进——无此标记，/ops 会把旧数当新鲜数呈现。true = 当前
+	// 呈现的是过期值，下轮成功查询后归 false。
+	statsStale atomic.Bool
+
+	// 容量处置面（spec §3.11）——探针/下限/回调由装配侧注入。
+	diskProbe   DiskProbe
+	diskMinFree int64
+	onCapacity  func(bool)
+	// 磁盘观测：diskFreeBytes 最近采样可用空间；diskEtaSeconds 预计耗尽秒数
+	// （-1 = unknown）；capacityBlocked 低于下限的边沿状态；lastDisk* 上一样本
+	// （算增长速率）。
+	diskFreeBytes        atomic.Int64
+	diskObservedUnixMs   atomic.Int64
+	diskEtaSeconds       atomic.Int64
+	capacityBlocked      atomic.Bool
+	lastDiskFreeBytes    atomic.Int64
+	lastDiskSampleUnixMs atomic.Int64
+
+	// alert 持久 blocked 告警状态（§3.11）：跨巡检轮保留（阻断未解除即持续呈现），
+	// 解除轮清空。alertMu 保护（runOnce 写 / Stats 读）。
+	alertMu sync.Mutex
+	alert   *RetentionBlockedAlert
+}
+
+// RetentionBlockedAlert 持久 blocked 告警状态（spec §3.11）：被 §3.11 屏障挡下、
+// 拒绝 DROP 的 usage_logs 分区清单 + 首次被挡时刻 + 最老未确认债权时刻。跨巡检
+// 轮保留（未解除即持续出现），运维须扩容/恢复 credit·thaw 后重试；绝不默默清债。
+type RetentionBlockedAlert struct {
+	Partitions             []RetentionBlockedPartition `json:"partitions"`
+	FirstBlockedUnixMs     int64                       `json:"first_blocked_unix_ms"`
+	OldestUncreditedUnixMs int64                       `json:"oldest_uncredited_unix_ms"`
+}
+
+// RetentionBlockedPartition 单个被挡分区的告警证据（json 小写键，供前端/运维）。
+type RetentionBlockedPartition struct {
+	Name                   string `json:"name"`
+	UncreditedEarnRows     int64  `json:"uncredited_earn_rows"`
+	UnbilledRows           int64  `json:"unbilled_rows"`
+	OldestUncreditedUnixMs int64  `json:"oldest_uncredited_unix_ms"`
+	ReconSourceKeys        int64  `json:"recon_source_keys"`
+	ReconMismatch          int64  `json:"recon_mismatch"`
+	ReconOpenKeys          int64  `json:"recon_open_keys"`
 }
 
 func NewRetention(cfg RetentionConfig, parts PartitionManager, log *logx.Logger) *RetentionWorker {
-	return &RetentionWorker{cfg: cfg, parts: parts, log: log}
+	w := &RetentionWorker{
+		cfg:         cfg,
+		parts:       parts,
+		log:         log,
+		diskProbe:   cfg.DiskProbe,
+		diskMinFree: cfg.DiskMinFreeBytes,
+		onCapacity:  cfg.OnCapacityBlocked,
+	}
+	if w.diskMinFree <= 0 {
+		w.diskMinFree = defaultDiskMinFreeBytes
+	}
+	w.diskEtaSeconds.Store(-1)
+	return w
 }
 
 // Name worker.Worker 契约（注册顺序无依赖——DROP/预建均幂等）。
@@ -120,9 +238,9 @@ func (w *RetentionWorker) loop(ctx context.Context) {
 }
 
 // runOnce 单轮巡检：三表各自 DROP 过期分区（独立 cutoff）+ 预建未来分区 +
-// redemption_uses 有界批删（F3-2，TTL 定死 90 天）；失败 Warn 不中断循环（下一
-// 轮重试）。now 现取一次，cutoff/ensure 边界共用同一时钟（评审 I-2：边界由调用
-// 方 now 推导，不各取各的）。逐表错误隔离（一表失败不影响他表——C32 纪律：
+// redemption_uses 有界批删（TTL 定死 90 天）；失败 Warn 不中断循环（下一
+// 轮重试）。now 现取一次，cutoff/ensure 边界共用同一时钟（边界由调用
+// 方 now 推导，不各取各的）。逐表错误隔离（一表失败不影响他表：
 // usage_stats 180 天 DROP 失败不连带明细表清理；redemption_uses 批删失败不
 // 影响分区三表，反之亦然）。
 func (w *RetentionWorker) runOnce() {
@@ -132,15 +250,32 @@ func (w *RetentionWorker) runOnce() {
 	// 保留上一轮值，LastPatrol 仍推进标记"巡检发生过"）。
 	if w.cfg.LogRetentionDays > 0 {
 		cutoff := now.AddDate(0, 0, -w.cfg.LogRetentionDays)
-		n, err := w.parts.DropUsageLogPartitionsBefore(ctx, cutoff)
+		res, err := w.parts.RetireUsageLogPartitions(ctx, cutoff)
 		if err != nil {
 			if w.log != nil {
-				w.log.Warn("retention drop usage_logs partitions failed", logx.Error(err))
+				w.log.Warn("retention retire usage_logs partitions failed", logx.Error(err))
 			}
 		} else {
-			w.lastDropLogs.Store(int64(n))
-			if n > 0 && w.log != nil {
-				w.log.Info("retention dropped usage_logs partitions", logx.Int("count", n))
+			w.lastDropLogs.Store(int64(res.Dropped))
+			w.lastBlockedLogs.Store(int64(len(res.Blocked)))
+			// 持久 blocked 告警状态（§3.11）：被挡分区跨巡检轮保留，解除轮清空。
+			w.updateBlockedAlert(now, res.Blocked)
+			if res.Dropped > 0 && w.log != nil {
+				w.log.Info("retention retired usage_logs partitions", logx.Int("count", res.Dropped))
+			}
+			// 未确认资金事件不得随 retention 删除（§3.11）：被挡分区进入持久
+			// 告警（分项规模 + 最老债权时刻），运维须扩容磁盘/恢复 credit/thaw
+			// 后重试；绝不能默默清掉债务。
+			for _, b := range res.Blocked {
+				if w.log != nil {
+					w.log.Warn("retention blocked usage_logs partition (unconfirmed liability)",
+						logx.String("partition", b.Name),
+						logx.Int64("uncredited_earn_rows", b.UncreditedEarnRows),
+						logx.Int64("unbilled_rows", b.UnbilledRows),
+						logx.Int64("recon_source_keys", b.ReconSourceKeys),
+						logx.Int64("recon_mismatch", b.ReconMismatch),
+						logx.Int64("recon_open_keys", b.ReconOpenKeys))
+				}
 			}
 		}
 	}
@@ -183,7 +318,43 @@ func (w *RetentionWorker) runOnce() {
 			}
 		}
 	}
-	// redemption_uses 有界批删（F3-2）：TTL 定死 90 天（非配置项）——90 天窗口
+	// 路由观测面保留：**独立 cutoff**（routing.observation_retention_days，默认
+	// 7 天），不再搭 usage_stats 的 180 天车——观测深度是可配运维参数，而
+	// 180 天分区保留与 7 天默认观测期错配会让超界窗口静默返回部分聚合
+	// （§3 R4，判据 A4）。三张分区表各自 DROP；snapshot_state 是普通表，
+	// 走有界 DELETE（与分区 DROP 同一 cutoff，防"删后重建"由写面守卫兜底）。
+	if w.cfg.RoutingObservationRetentionDays > 0 {
+		cutoff := domain.RoutingObservationCutoff(now, w.cfg.RoutingObservationRetentionDays)
+		if n, err := w.parts.DropRoutingQualityFactBefore(ctx, cutoff); err != nil {
+			if w.log != nil {
+				w.log.Warn("retention drop routing_quality_fact partitions failed", logx.Error(err))
+			}
+		} else {
+			w.lastDropRoutingQuality.Store(int64(n))
+			if n > 0 && w.log != nil {
+				w.log.Info("retention dropped routing_quality_fact partitions", logx.Int("count", n))
+			}
+		}
+		if n, err := w.parts.DropRoutingFlowFactBefore(ctx, cutoff); err != nil {
+			if w.log != nil {
+				w.log.Warn("retention drop routing_flow_fact partitions failed", logx.Error(err))
+			}
+		} else {
+			w.lastDropRoutingFlow.Store(int64(n))
+			if n > 0 && w.log != nil {
+				w.log.Info("retention dropped routing_flow_fact partitions", logx.Int("count", n))
+			}
+		}
+		n, err := w.parts.DeleteRoutingFlowSnapshotStateBefore(ctx, cutoff)
+		if err != nil {
+			if w.log != nil {
+				w.log.Warn("retention delete routing snapshot state failed", logx.Error(err))
+			}
+		} else if n > 0 && w.log != nil {
+			w.log.Info("retention deleted routing snapshot state", logx.Int("count", n))
+		}
+	}
+	// redemption_uses 有界批删：TTL 定死 90 天（非配置项）——90 天窗口
 	// 内的兑换记录即审计证据，超窗删除不破坏审计语义。每轮至多删 5000 行
 	// （分区三表 O(1) DROP 之外的普通表清理路径），失败 Warn 下轮重试。
 	n, err := w.parts.DeleteRedemptionUsesBefore(ctx, now.AddDate(0, 0, -redemptionUseRetentionDays))
@@ -214,7 +385,137 @@ func (w *RetentionWorker) runOnce() {
 			w.log.Warn("retention pre-create usage_entity_stats partitions failed", logx.Error(err))
 		}
 	}
+	if err := w.parts.EnsureRoutingFactPartitions(ctx, now, now.AddDate(0, 0, 1)); err != nil {
+		if w.log != nil {
+			w.log.Warn("retention pre-create routing fact partitions failed", logx.Error(err))
+		}
+	}
+	// 兜底观测（A17）：预建后取分区概况。失败保留上轮值（与 lastDrop* 同约定：
+	// 失败不覆盖，lastPatrol 仍推进），但置 statsStale 让过期值可见。最老分区
+	// 早于 cutoff ⇒ Warn——正常巡检下不可能发生，一旦出现即分区 DROP 未生效
+	// （worker 停摆或 DROP 持续失败），而分区静默无界增长。
+	if st, err := w.parts.RoutingFactPartitionStats(ctx); err != nil {
+		if w.log != nil {
+			w.log.Warn("retention routing partition stats failed", logx.Error(err))
+		}
+		w.statsStale.Store(true)
+	} else {
+		w.partitionCount.Store(int64(st.Count))
+		w.qualityPartitionCount.Store(int64(st.QualityCount))
+		w.flowPartitionCount.Store(int64(st.FlowCount))
+		w.snapshotRows.Store(int64(st.SnapshotRows))
+		w.undatedPartitions.Store(int64(st.UndatedCount))
+		w.oldestPartition.Store(unixMilliOrZero(st.Oldest))
+		w.qualityOldest.Store(unixMilliOrZero(st.QualityOldest))
+		w.flowOldest.Store(unixMilliOrZero(st.FlowOldest))
+		w.statsStale.Store(false)
+		if !st.Oldest.IsZero() && w.cfg.RoutingObservationRetentionDays > 0 {
+			cutoff := domain.RoutingObservationCutoff(now, w.cfg.RoutingObservationRetentionDays)
+			if st.Oldest.Before(cutoff) && w.log != nil {
+				w.log.Warn("retention routing partitions older than the observation cutoff",
+					logx.Int("partition_count", st.Count),
+					logx.String("oldest_partition", st.Oldest.UTC().Format(time.RFC3339)),
+					logx.String("cutoff", cutoff.UTC().Format(time.RFC3339)))
+			}
+		}
+	}
+	// 容量采样（spec §3.11）：可用空间 + 增长 ⇒ ETA；低于下限 ⇒ 处置。
+	w.sampleDisk(now)
 	w.lastPatrol.Store(now.UnixMilli())
+}
+
+// updateBlockedAlert 更新持久 blocked 告警状态：blocked 非空 ⇒ 保留（首次被挡
+// 时刻跨轮保留）；空 ⇒ 清空（阻断解除）。now 现取一次与巡检同钟。
+func (w *RetentionWorker) updateBlockedAlert(now time.Time, blocked []domain.BlockedPartition) {
+	if len(blocked) == 0 {
+		w.alertMu.Lock()
+		w.alert = nil
+		w.alertMu.Unlock()
+		return
+	}
+	view := &RetentionBlockedAlert{Partitions: make([]RetentionBlockedPartition, 0, len(blocked))}
+	var oldest int64
+	for _, b := range blocked {
+		p := RetentionBlockedPartition{
+			Name:               b.Name,
+			UncreditedEarnRows: b.UncreditedEarnRows,
+			UnbilledRows:       b.UnbilledRows,
+			ReconSourceKeys:    b.ReconSourceKeys,
+			ReconMismatch:      b.ReconMismatch,
+			ReconOpenKeys:      b.ReconOpenKeys,
+		}
+		if b.OldestUncredited != nil {
+			p.OldestUncreditedUnixMs = *b.OldestUncredited
+			if oldest == 0 || *b.OldestUncredited < oldest {
+				oldest = *b.OldestUncredited
+			}
+		}
+		view.Partitions = append(view.Partitions, p)
+	}
+	view.OldestUncreditedUnixMs = oldest
+	w.alertMu.Lock()
+	if w.alert != nil && w.alert.FirstBlockedUnixMs != 0 {
+		view.FirstBlockedUnixMs = w.alert.FirstBlockedUnixMs // 首次被挡时刻跨轮保留
+	} else {
+		view.FirstBlockedUnixMs = now.UnixMilli()
+	}
+	w.alert = view
+	w.alertMu.Unlock()
+}
+
+// sampleDisk 采样数据盘可用空间（spec §3.11）：算增长速率 ⇒ 容量 ETA；低于下限
+// ⇒ 处置（边沿回调 OnCapacityBlocked）。探针 nil / 探测失败 ⇒ 保留旧值（不处置）。
+func (w *RetentionWorker) sampleDisk(now time.Time) {
+	if w.diskProbe == nil {
+		return
+	}
+	free, ok := w.diskProbe()
+	if !ok {
+		return
+	}
+	nowMs := now.UnixMilli()
+	prevFree := w.lastDiskFreeBytes.Load()
+	prevMs := w.lastDiskSampleUnixMs.Load()
+	w.diskFreeBytes.Store(free)
+	w.diskObservedUnixMs.Store(nowMs)
+	if prevMs != 0 && nowMs > prevMs {
+		consumed := prevFree - free
+		if consumed > 0 {
+			elapsed := float64(nowMs-prevMs) / 1000.0
+			if bps := float64(consumed) / elapsed; bps > 0 {
+				w.diskEtaSeconds.Store(int64(float64(free) / bps))
+			}
+		} else {
+			w.diskEtaSeconds.Store(-1) // 未观测到消耗 ⇒ ETA unknown
+		}
+	}
+	w.lastDiskFreeBytes.Store(free)
+	w.lastDiskSampleUnixMs.Store(nowMs)
+	// 处置边沿：低于下限 ⇒ blocked；恢复 ⇒ 复位。回调只在状态翻转时触发一次。
+	blocked := free < w.diskMinFree
+	if blocked != w.capacityBlocked.Swap(blocked) {
+		if w.log != nil {
+			if blocked {
+				w.log.Warn("retention capacity below floor; stopping new supplier ingress",
+					logx.Int64("free_bytes", free), logx.Int64("floor_bytes", w.diskMinFree))
+			} else {
+				w.log.Info("retention capacity recovered; resuming supplier ingress",
+					logx.Int64("free_bytes", free))
+			}
+		}
+		if w.onCapacity != nil {
+			w.onCapacity(blocked)
+		}
+	}
+}
+
+// unixMilliOrZero 零值 time 归 0：零值 time 的 UnixMilli 是巨大负数（公元 1 年），
+// 直接呈现会让运维看到荒谬的「最老分区」。
+func unixMilliOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixMilli()
 }
 
 // Close 幂等（worker.Worker 契约）：DROP/预建均幂等，无排空需求。

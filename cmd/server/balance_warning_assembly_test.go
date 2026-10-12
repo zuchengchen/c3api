@@ -16,16 +16,14 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 
-	"github.com/is7qin/c3api/internal/billing"
-	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/handler"
+	"github.com/is7qin/c3api/internal/notification"
 	"github.com/is7qin/c3api/internal/worker"
 )
 
 type fakeBalanceWarningService struct {
 	enabled         bool
 	mailConfigCalls int
-	clearCooldown   func(context.Context, int64, int64) error
 }
 
 func (s *fakeBalanceWarningService) BalanceWarningEnabled() bool { return s.enabled }
@@ -35,20 +33,21 @@ func (s *fakeBalanceWarningService) MailConfig() (string, int, string, string, s
 	return "smtp.example.com", 465, "user", "secret", "from@example.com", "implicit", true
 }
 
-func (*fakeBalanceWarningService) RenderTemplate(context.Context, domain.EmailTemplatePurpose, map[string]string) (string, string, error) {
-	return "subject", "body", nil
-}
+// wireBalanceWarning 恒返回非 nil worker（构造序反转：worker 先建、
+// flusher 后建，sink 经 NewFlusher 构造参数注入）。"billing disabled → 无
+// worker/无 flusher" 改由 main 的 cfg.Billing.Enabled 分支持有（分支内才调
+// wire + NewFlusher，分支外两者均为 nil），wire 层不再表达该语义——旧
+// TestWireBalanceWarningReturnsNilWhenBillingSinkAbsent 随 setter 删除而失效；
+// disabled 形状仍由 TestOrderedWorkersKeepsEmailAndOmitsWarningWhenBillingDisabled
+// 与 TestStatsProvidersOmitsWarningWhenBillingDisabled 在 orderedWorkers(nil, nil)
+// 层断言（与 main 禁用分支的 nil warningWorker/billingWorker 同形）。
+func TestWireBalanceWarningConstructsWorker(t *testing.T) {
+	svc := &fakeBalanceWarningService{enabled: true}
 
-func (s *fakeBalanceWarningService) SetBalanceWarningCooldownCleaner(clear func(context.Context, int64, int64) error) {
-	s.clearCooldown = clear
-}
+	warningWorker := wireBalanceWarning(notification.NewCooldown(newAssemblyRedis(t)), svc, nil, nil)
 
-type capturingWarningSinkSetter struct {
-	sink billing.BalanceWarningSink
-}
-
-func (s *capturingWarningSinkSetter) SetBalanceWarningSink(sink billing.BalanceWarningSink) {
-	s.sink = sink
+	require.NotNil(t, warningWorker)
+	require.Equal(t, "notification", warningWorker.Name())
 }
 
 type lifecycleWorker struct {
@@ -81,25 +80,6 @@ func newAssemblyRedis(t *testing.T) *redis.Client {
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	return client
-}
-
-func TestWireBalanceWarningReturnsNilWhenBillingSinkAbsent(t *testing.T) {
-	svc := &fakeBalanceWarningService{}
-	worker := wireBalanceWarning(nil, newAssemblyRedis(t), svc, nil, nil)
-
-	require.Nil(t, worker)
-	require.NotNil(t, svc.clearCooldown)
-}
-
-func TestWireBalanceWarningConstructsWorkerAndSetsBillingSink(t *testing.T) {
-	setter := &capturingWarningSinkSetter{}
-	svc := &fakeBalanceWarningService{enabled: true}
-
-	warningWorker := wireBalanceWarning(setter, newAssemblyRedis(t), svc, nil, nil)
-
-	require.NotNil(t, warningWorker)
-	require.Same(t, warningWorker, setter.sink)
-	require.Equal(t, "notification", warningWorker.Name())
 }
 
 func TestBalanceWarningEnabledSuppressesWhenGlobalSwitchDisabled(t *testing.T) {
@@ -149,8 +129,7 @@ func TestOrderedWorkersKeepsEmailAndOmitsWarningWhenBillingDisabled(t *testing.T
 }
 
 func TestStatsProvidersMakesConditionalWarningVisibleToOps(t *testing.T) {
-	setter := &capturingWarningSinkSetter{}
-	warningWorker := wireBalanceWarning(setter, newAssemblyRedis(t), &fakeBalanceWarningService{enabled: true}, nil, nil)
+	warningWorker := wireBalanceWarning(notification.NewCooldown(newAssemblyRedis(t)), &fakeBalanceWarningService{enabled: true}, nil, nil)
 	email := &lifecycleWorker{name: "email", events: &[]string{}, mu: &sync.Mutex{}}
 	workers := orderedWorkers(email, warningWorker, nil)
 	api := handler.New(nil, handler.OpsOptions{Workers: statsProviders(workers, nil)})

@@ -33,7 +33,7 @@ export default function UserRegister() {
   const doRegister = async (withCode: string | undefined) => {
     const res = await userApi.register({ email: email.trim(), password, ...(withCode ? { code: withCode } : {}) })
     userAuth.setToken(res.token)
-    userAuth.setRole(res.user.Role)
+    userAuth.setRole(res.user.Role ?? 'user')
     nav('/user')
   }
   const submit = async () => {
@@ -48,6 +48,7 @@ export default function UserRegister() {
       if (e instanceof ApiError && e.message.includes('email verification required')) {
         try { await userApi.registerCode({ email: email.trim() }); setStep('code'); setCountdown(60); setErr('') } catch (ee) { setErr(ee instanceof ApiError ? ee.message : t('user.auth.errorGeneric')) }
       } else if (e instanceof ApiError && e.status === 403) setErr(t('user.register.signupDisabled'))
+      else if (e instanceof ApiError && e.status === 409) setErr(t('user.register.emailExists'))
       else setErr(e instanceof ApiError ? e.message : t('user.auth.errorGeneric'))
     } finally { setLoading(false) }
   }

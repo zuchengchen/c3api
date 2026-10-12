@@ -3,7 +3,6 @@
 package account
 
 import (
-	"fmt"
 	"time"
 
 	"entgo.io/ent/dialect/sql"
@@ -23,12 +22,6 @@ const (
 	FieldBaseURL = "base_url"
 	// FieldUpstreamKey holds the string denoting the upstream_key field in the database.
 	FieldUpstreamKey = "upstream_key"
-	// FieldStatus holds the string denoting the status field in the database.
-	FieldStatus = "status"
-	// FieldCooldownUntil holds the string denoting the cooldown_until field in the database.
-	FieldCooldownUntil = "cooldown_until"
-	// FieldWeight holds the string denoting the weight field in the database.
-	FieldWeight = "weight"
 	// FieldMaxConcurrency holds the string denoting the max_concurrency field in the database.
 	FieldMaxConcurrency = "max_concurrency"
 	// FieldLastError holds the string denoting the last_error field in the database.
@@ -37,6 +30,20 @@ const (
 	FieldLastUsedAt = "last_used_at"
 	// FieldFailedAt holds the string denoting the failed_at field in the database.
 	FieldFailedAt = "failed_at"
+	// FieldFailureSource holds the string denoting the failure_source field in the database.
+	FieldFailureSource = "failure_source"
+	// FieldEnabled holds the string denoting the enabled field in the database.
+	FieldEnabled = "enabled"
+	// FieldLifecycleRevision holds the string denoting the lifecycle_revision field in the database.
+	FieldLifecycleRevision = "lifecycle_revision"
+	// FieldIdentityRevision holds the string denoting the identity_revision field in the database.
+	FieldIdentityRevision = "identity_revision"
+	// FieldUpstreamCostMultiplierBp holds the string denoting the upstream_cost_multiplier_bp field in the database.
+	FieldUpstreamCostMultiplierBp = "upstream_cost_multiplier_bp"
+	// FieldCacheDomain holds the string denoting the cache_domain field in the database.
+	FieldCacheDomain = "cache_domain"
+	// FieldSupplierUserID holds the string denoting the supplier_user_id field in the database.
+	FieldSupplierUserID = "supplier_user_id"
 	// FieldUpdatedAt holds the string denoting the updated_at field in the database.
 	FieldUpdatedAt = "updated_at"
 	// FieldDeletedAt holds the string denoting the deleted_at field in the database.
@@ -79,13 +86,17 @@ var Columns = []string{
 	FieldTemplateID,
 	FieldBaseURL,
 	FieldUpstreamKey,
-	FieldStatus,
-	FieldCooldownUntil,
-	FieldWeight,
 	FieldMaxConcurrency,
 	FieldLastError,
 	FieldLastUsedAt,
 	FieldFailedAt,
+	FieldFailureSource,
+	FieldEnabled,
+	FieldLifecycleRevision,
+	FieldIdentityRevision,
+	FieldUpstreamCostMultiplierBp,
+	FieldCacheDomain,
+	FieldSupplierUserID,
 	FieldUpdatedAt,
 	FieldDeletedAt,
 	FieldCreatedAt,
@@ -108,10 +119,16 @@ func ValidColumn(column string) bool {
 }
 
 var (
-	// DefaultWeight holds the default value on creation for the "weight" field.
-	DefaultWeight int
 	// DefaultMaxConcurrency holds the default value on creation for the "max_concurrency" field.
 	DefaultMaxConcurrency int
+	// DefaultEnabled holds the default value on creation for the "enabled" field.
+	DefaultEnabled bool
+	// DefaultLifecycleRevision holds the default value on creation for the "lifecycle_revision" field.
+	DefaultLifecycleRevision int64
+	// DefaultIdentityRevision holds the default value on creation for the "identity_revision" field.
+	DefaultIdentityRevision int64
+	// DefaultUpstreamCostMultiplierBp holds the default value on creation for the "upstream_cost_multiplier_bp" field.
+	DefaultUpstreamCostMultiplierBp int
 	// DefaultUpdatedAt holds the default value on creation for the "updated_at" field.
 	DefaultUpdatedAt func() time.Time
 	// UpdateDefaultUpdatedAt holds the default value on update for the "updated_at" field.
@@ -119,34 +136,6 @@ var (
 	// DefaultCreatedAt holds the default value on creation for the "created_at" field.
 	DefaultCreatedAt func() time.Time
 )
-
-// Status defines the type for the "status" enum field.
-type Status string
-
-// StatusActive is the default value of the Status enum.
-const DefaultStatus = StatusActive
-
-// Status values.
-const (
-	StatusActive    Status = "active"
-	StatusUnhealthy Status = "unhealthy"
-	Status429       Status = "429"
-	StatusDisabled  Status = "disabled"
-)
-
-func (s Status) String() string {
-	return string(s)
-}
-
-// StatusValidator is a validator for the "status" field enum values. It is called by the builders before save.
-func StatusValidator(s Status) error {
-	switch s {
-	case StatusActive, StatusUnhealthy, Status429, StatusDisabled:
-		return nil
-	default:
-		return fmt.Errorf("account: invalid enum value for status field: %q", s)
-	}
-}
 
 // OrderOption defines the ordering options for the Account queries.
 type OrderOption func(*sql.Selector)
@@ -176,21 +165,6 @@ func ByUpstreamKey(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldUpstreamKey, opts...).ToFunc()
 }
 
-// ByStatus orders the results by the status field.
-func ByStatus(opts ...sql.OrderTermOption) OrderOption {
-	return sql.OrderByField(FieldStatus, opts...).ToFunc()
-}
-
-// ByCooldownUntil orders the results by the cooldown_until field.
-func ByCooldownUntil(opts ...sql.OrderTermOption) OrderOption {
-	return sql.OrderByField(FieldCooldownUntil, opts...).ToFunc()
-}
-
-// ByWeight orders the results by the weight field.
-func ByWeight(opts ...sql.OrderTermOption) OrderOption {
-	return sql.OrderByField(FieldWeight, opts...).ToFunc()
-}
-
 // ByMaxConcurrency orders the results by the max_concurrency field.
 func ByMaxConcurrency(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldMaxConcurrency, opts...).ToFunc()
@@ -209,6 +183,41 @@ func ByLastUsedAt(opts ...sql.OrderTermOption) OrderOption {
 // ByFailedAt orders the results by the failed_at field.
 func ByFailedAt(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldFailedAt, opts...).ToFunc()
+}
+
+// ByFailureSource orders the results by the failure_source field.
+func ByFailureSource(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldFailureSource, opts...).ToFunc()
+}
+
+// ByEnabled orders the results by the enabled field.
+func ByEnabled(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldEnabled, opts...).ToFunc()
+}
+
+// ByLifecycleRevision orders the results by the lifecycle_revision field.
+func ByLifecycleRevision(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldLifecycleRevision, opts...).ToFunc()
+}
+
+// ByIdentityRevision orders the results by the identity_revision field.
+func ByIdentityRevision(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldIdentityRevision, opts...).ToFunc()
+}
+
+// ByUpstreamCostMultiplierBp orders the results by the upstream_cost_multiplier_bp field.
+func ByUpstreamCostMultiplierBp(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldUpstreamCostMultiplierBp, opts...).ToFunc()
+}
+
+// ByCacheDomain orders the results by the cache_domain field.
+func ByCacheDomain(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldCacheDomain, opts...).ToFunc()
+}
+
+// BySupplierUserID orders the results by the supplier_user_id field.
+func BySupplierUserID(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldSupplierUserID, opts...).ToFunc()
 }
 
 // ByUpdatedAt orders the results by the updated_at field.

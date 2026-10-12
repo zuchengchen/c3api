@@ -12,6 +12,7 @@ import (
 
 	"github.com/is7qin/c3api/internal/ent"
 	"github.com/is7qin/c3api/internal/ent/account"
+	"github.com/is7qin/c3api/internal/ent/balancelog"
 	"github.com/is7qin/c3api/internal/ent/group"
 	"github.com/is7qin/c3api/internal/ent/key"
 	"github.com/is7qin/c3api/internal/ent/priceentry"
@@ -25,16 +26,20 @@ import (
 // ListQuery 列表查询：分页/筛选/排序。Sort 为白名单内字段名（如 "name"），
 // 非法值返回 ErrInvalidSort；Order 仅 "asc"/"desc"（空 = desc）。
 type ListQuery struct {
-	Limit      int      // <=0 → 20
-	Offset     int      // <0 → 0
-	Name       string   // 模糊匹配（不区分大小写）
-	Email      string   // 用户专属：邮箱模糊匹配
-	Sort       string   // 空 → id
-	Order      string   // asc/desc；空 → desc
-	StatusList []string // 账号专属：多值 status
-	TemplateID int64    // 账号专属：0 = 不过滤
-	UserID     int64    // keys 管理端专属：0 = 不过滤（对齐 TemplateID 先例）
-	GroupID    int64    // keys 管理端专属：0 = 不过滤（对齐 TemplateID 先例）
+	Limit           int    // <=0 → 20
+	Offset          int    // <0 → 0
+	Name            string // 模糊匹配（不区分大小写）
+	Email           string // 用户专属：邮箱模糊匹配
+	Role            string // 用户专属：角色精确过滤（空 = 不过滤）；未知非空值 → 空列表
+	SupplierSurface bool   // 用户专属：true = 仅供应商面可达角色（domain.SupplierSurfaceRoles），覆盖 Role
+	Sort            string // 空 → id
+	Order           string // asc/desc；空 → desc
+	TemplateID      int64  // 账号专属：0 = 不过滤
+	// Enabled 账号专属三态过滤：nil = 不过滤；&true = 仅启用；&false = 仅禁用。
+	// 与运行时失效（failed_at）无关——管理面启停是独立维度。
+	Enabled *bool
+	UserID  int64 // keys 管理端专属：0 = 不过滤（对齐 TemplateID 先例）
+	GroupID int64 // keys 管理端专属：0 = 不过滤（对齐 TemplateID 先例）
 }
 
 var ErrInvalidSort = errors.New("invalid sort field")
@@ -42,7 +47,7 @@ var ErrInvalidSort = errors.New("invalid sort field")
 // sortOrder 把 ListQuery 翻译为 ent 排序项。返回 ent.Asc/ent.Desc 的原生无名类型
 // func(*sql.Selector)：各实体 Query.Order 接受同底层类型的 OrderOption（named type），
 // 计划初稿的 ent.OrderFunc 返回类型与 OrderOption 互为不同 named type 不可直接赋值，
-// 故返回无名类型（编译验证通过，见 Task 1 报告）。
+// 故返回无名类型（编译验证通过）。
 // 白名单外 sort → ErrInvalidSort；order 非 ""/asc/desc → "invalid order"；order 空 = desc。
 func (q ListQuery) sortOrder(sortFields map[string]string) (func(*sql.Selector), error) {
 	if q.Sort == "" {
@@ -69,9 +74,8 @@ var (
 	}
 	accountSortFields = map[string]string{
 		"id": account.FieldID, "name": account.FieldName, "template_id": account.FieldTemplateID,
-		"status": account.FieldStatus, "cooldown_until": account.FieldCooldownUntil,
-		"weight": account.FieldWeight, "max_concurrency": account.FieldMaxConcurrency,
-		"last_used_at": account.FieldLastUsedAt, "created_at": account.FieldCreatedAt,
+		"max_concurrency": account.FieldMaxConcurrency,
+		"last_used_at":    account.FieldLastUsedAt, "created_at": account.FieldCreatedAt,
 		"updated_at": account.FieldUpdatedAt,
 	}
 	groupSortFields = map[string]string{
@@ -111,5 +115,11 @@ var (
 	priceEntrySortFields = map[string]string{
 		"id": priceentry.FieldID, "model": priceentry.FieldModel,
 		"updated_at": priceentry.FieldUpdatedAt,
+	}
+	// balanceLogSortFields /api/admin/users/{id}/balance-logs sort 白名单
+	// （默认 id——按用户分页走 (user_id, id) 索引）。
+	balanceLogSortFields = map[string]string{
+		"id": balancelog.FieldID, "amount": balancelog.FieldAmount,
+		"balance_after": balancelog.FieldBalanceAfter, "created_at": balancelog.FieldCreatedAt,
 	}
 )

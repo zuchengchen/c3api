@@ -18,6 +18,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 
+	"github.com/is7qin/c3api/internal/continuation"
 	"github.com/is7qin/c3api/internal/domain"
 )
 
@@ -43,7 +44,7 @@ type fakeTransport struct {
 	readQueue []fakeRead
 	readBlock chan struct{}
 	pingErr   error
-	// panicWritesFrom 第 N 次 Write 起 panic（F2 注入：relayWS 首帧转发 = 第 1
+	// panicWritesFrom 第 N 次 Write 起 panic（注入：relayWS 首帧转发 = 第 1
 	// 次写——必须在 goroutine 内才被 relayRecover 接住，故从第 2 次起注入）。
 	// pingPanic = Ping 恒 panic（心跳 goroutine 注入）。
 	panicWritesFrom int
@@ -147,18 +148,22 @@ type relayOutcome struct {
 
 func newRelayWSTest(t *testing.T, ft *fakeTransport, frameHook func([]byte), first []byte) (*relayWSTestEnv, *websocket.Conn, *httptest.Server) {
 	t.Helper()
-	return newRelayWSTestHBI(t, ft, frameHook, first, 0)
+	return newRelayWSTestHBI(t, ft, frameHook, first, 0, nil)
 }
 
 // newRelayWSTestHBI 同 newRelayWSTest，但允许缩短心跳间隔（hbi > 0 生效；
-// F2 心跳 panic 注入用例：relay 启动前改写 Proxy.wsHeartbeatInterval seam——
-// 先例 TestCodexWSHeartbeatCadence）。
-func newRelayWSTestHBI(t *testing.T, ft *fakeTransport, frameHook func([]byte), first []byte, hbi time.Duration) (*relayWSTestEnv, *websocket.Conn, *httptest.Server) {
+// 心跳 panic 注入用例：relay 启动前改写 Proxy.wsHeartbeatInterval seam——
+// 先例 TestCodexWSHeartbeatCadence）与硬续接 store 装配（store 非 nil =
+// contTag 生效——必须在 dial 前接线，relayWS 启动即读 p.cont）。
+func newRelayWSTestHBI(t *testing.T, ft *fakeTransport, frameHook func([]byte), first []byte, hbi time.Duration, store *continuation.Store) (*relayWSTestEnv, *websocket.Conn, *httptest.Server) {
 	t.Helper()
-	store := &captureLogStore{}
-	p := newTestProxyFormatLogs(t, "http://127.0.0.1:1", domain.FormatOpenAIResponsesWS, store)
+	logs := &captureLogStore{}
+	p := newTestProxyFormatLogs(t, "http://127.0.0.1:1", domain.FormatOpenAIResponsesWS, logs)
 	if hbi > 0 {
 		p.wsHeartbeatInterval = hbi
+	}
+	if store != nil {
+		p.cont = store
 	}
 	sel, err := p.sched.Select(10, domain.FormatOpenAIResponsesWS, "gpt-4o")
 	require.NoError(t, err, "Select 必须成功（真实抢槽——finish 的 Release 与之平衡）")
@@ -180,7 +185,7 @@ func newRelayWSTestHBI(t *testing.T, ft *fakeTransport, frameHook func([]byte), 
 	t.Cleanup(srv.Close)
 	c := dialResponsesWS(t, srv)
 	t.Cleanup(func() { c.CloseNow() })
-	return &relayWSTestEnv{p: p, store: store, ft: ft, out: out}, c, srv
+	return &relayWSTestEnv{p: p, store: logs, ft: ft, out: out}, c, srv
 }
 
 // TestRelayWSFirstFrameWriteFail 首帧转发失败 → (false, fwMsg) + CloseNow 直拆
@@ -222,9 +227,9 @@ func TestRelayWSUpstreamNormalClose(t *testing.T) {
 	env.store.mu.Unlock()
 	require.Equal(t, domain.ErrNone, lg.ErrorType)
 	require.Equal(t, http.StatusOK, lg.StatusCode)
-	require.Equal(t, int64(2), lg.InputTokens, "可计费输入 = 线上 input 3 − cached 1（spec 2026-08-25 归一）")
+	require.Equal(t, int64(2), lg.InputTokens, "可计费输入 = 线上 input 6 − cached 1 − cache_write 3（P0-2 归一）")
 	require.Equal(t, int64(5), lg.OutputTokens)
-	require.Equal(t, int64(8), lg.TotalTokens)
+	require.Equal(t, int64(11), lg.TotalTokens)
 	require.Equal(t, int64(1), lg.CacheReadTokens)
 	require.Equal(t, int64(3), lg.CacheCreationTokens)
 	env.p.sched.FlushRules() // MarkResult 异步投递：断言前排空
@@ -269,7 +274,7 @@ func TestRelayWSClientAbort(t *testing.T) {
 	env.store.mu.Unlock()
 	require.NotNil(t, lg, "abort 记录必须存在")
 	require.Equal(t, http.StatusOK, lg.StatusCode)
-	require.Equal(t, int64(2), lg.InputTokens, "断开前已嗅探的 usage 不丢（可计费输入 = 3 − cached 1）")
+	require.Equal(t, int64(2), lg.InputTokens, "断开前已嗅探的 usage 不丢（可计费输入 = 6 − cached 1 − cache_write 3）")
 	require.Equal(t, int64(5), lg.OutputTokens)
 	env.p.sched.FlushRules()
 	ri, ok := env.p.sched.Runtime(1)
@@ -279,9 +284,11 @@ func TestRelayWSClientAbort(t *testing.T) {
 }
 
 // TestRelayWSUpstreamError 分类路径③：上游网络错误（无关闭帧）→ 错误——记录
-// 先行（ErrAbort + 断前 usage）+ 连接级/5xx 分流 冷却（StatusUnhealthy）+ 客户端
+// 先行（ErrAbort + 断前 usage）+ 连接级/5xx 分流投递 typed throttle（运行时
+// 状态机已随 cutover 删除，RuntimeInfo.Status 恒 active/disabled 投影）+ 客户端
 // 1011 关闭 + 传输 CloseNow 直拆（上游已死免握手）。
 func TestRelayWSUpstreamError(t *testing.T) {
+	testHealthSink.reset()
 	ft := &fakeTransport{readQueue: []fakeRead{
 		{typ: websocket.MessageText, frame: []byte(responsesWSCompletedFrame)},
 		{typ: 0, err: errors.New("upstream network error")},
@@ -306,12 +313,13 @@ func TestRelayWSUpstreamError(t *testing.T) {
 	}
 	env.store.mu.Unlock()
 	require.NotNil(t, lg, "recordStreamAbort 记录必须存在（ErrAbort——现状语义）")
-	require.Equal(t, int64(2), lg.InputTokens, "断前已嗅探 usage 照常计费（可计费输入 = 3 − cached 1）")
+	require.Equal(t, int64(2), lg.InputTokens, "断前已嗅探 usage 照常计费（可计费输入 = 6 − cached 1 − cache_write 3）")
 	require.Equal(t, int64(5), lg.OutputTokens)
 	env.p.sched.FlushRules()
 	ri, ok := env.p.sched.Runtime(1)
 	require.True(t, ok)
-	require.Equal(t, domain.StatusUnhealthy, ri.Status, "上游错误 → 连接级/5xx 分流 冷却")
+	require.Equal(t, domain.StatusActive, ri.Status, "运行时状态机已删：临时健康走 typed throttle，Status 恒 active 投影")
+	require.Len(t, testHealthSink.throttlesFor(1), 1, "上游错误 → 连接级/5xx 分流惩罚恰一次投递")
 	require.Zero(t, ri.Concurrency, "并发槽必须释放")
 }
 
@@ -394,7 +402,7 @@ func TestRelayWSFrameHookBeforeClientWrite(t *testing.T) {
 	require.NoError(t, env.p.rec.Close(context.Background()))
 }
 
-// --- F2 崩溃面：三 goroutine panic 注入 → recover 收尾不崩进程 ---
+// --- 崩溃面：三 goroutine panic 注入 → recover 收尾不崩进程 ---
 // 注入点在帧循环内（panicWritesFrom=2 的 Write / frameHook / Ping）——任何
 // 路径 panic 都被 relayRecover 接住：连接按对应分类收尾、进程存活（测试能
 // 走到断言即进程未崩）、defer close(upLoopDone)/wg.Done 照常执行。
@@ -403,6 +411,7 @@ func TestRelayWSFrameHookBeforeClientWrite(t *testing.T) {
 // 在 goroutine 外不可注入）→ 按身份进 upErr 槽 → 上游错误收尾：客户端 1011
 // + 传输 CloseNow + 连接级/5xx 分流 冷却（与上游网络错误同分类，不误伤）。
 func TestRelayWSClientLoopPanic(t *testing.T) {
+	testHealthSink.reset()
 	ft := &fakeTransport{panicWritesFrom: 2, readBlock: make(chan struct{})}
 	env, c, _ := newRelayWSTest(t, ft, nil,
 		[]byte(`{"type":"response.create","model":"gpt-4o","input":"hi"}`))
@@ -420,7 +429,8 @@ func TestRelayWSClientLoopPanic(t *testing.T) {
 	env.p.sched.FlushRules()
 	ri, ok := env.p.sched.Runtime(1)
 	require.True(t, ok)
-	require.Equal(t, domain.StatusUnhealthy, ri.Status, "panic 视为上游错误 → 连接级/5xx 分流 冷却")
+	require.Equal(t, domain.StatusActive, ri.Status, "运行时状态机已删：panic 按上游错误走 typed throttle")
+	require.Len(t, testHealthSink.throttlesFor(1), 1, "panic 视为上游错误 → 连接级/5xx 分流惩罚恰一次投递")
 	require.Zero(t, ri.Concurrency, "并发槽必须释放")
 }
 
@@ -463,9 +473,10 @@ func TestRelayWSUpLoopPanic(t *testing.T) {
 // 心跳 goroutine panic（Ping 注入）→ 按身份进 pingErr 槽 → 上游错误收尾：
 // 客户端 1011 + 传输 CloseNow（与心跳失联同分类）。
 func TestRelayWSHeartbeatPanic(t *testing.T) {
+	testHealthSink.reset()
 	ft := &fakeTransport{pingPanic: true, readBlock: make(chan struct{})}
 	env, c, _ := newRelayWSTestHBI(t, ft, nil,
-		[]byte(`{"type":"response.create","model":"gpt-4o","input":"hi"}`), 50*time.Millisecond)
+		[]byte(`{"type":"response.create","model":"gpt-4o","input":"hi"}`), 50*time.Millisecond, nil)
 	defer c.CloseNow()
 
 	readResponsesWSClose(t, c, websocket.StatusInternalError) // 心跳 panic → 上游错误 → 1011
@@ -477,5 +488,63 @@ func TestRelayWSHeartbeatPanic(t *testing.T) {
 	env.p.sched.FlushRules()
 	ri, ok := env.p.sched.Runtime(1)
 	require.True(t, ok)
-	require.Equal(t, domain.StatusUnhealthy, ri.Status, "心跳 panic → 连接级/5xx 分流 冷却")
+	require.Equal(t, domain.StatusActive, ri.Status, "运行时状态机已删：心跳 panic 走 typed throttle")
+	require.Len(t, testHealthSink.throttlesFor(1), 1, "心跳 panic → 连接级/5xx 分流惩罚恰一次投递")
+}
+
+// --- 同步面回归：fail-closed 收尾不得挂在空闲客户端的 Read 上 ---
+
+// TestRelayWSContFailIdleClientNoHang 硬续接 fail-closed（绑定权威缺失 →
+// errContUnavailable）+ 空闲客户端（不读帧、不回关闭握手）：relay 必须主动
+// 拆客户端连接解除 client-loop 的阻塞 Read 并 join 全部 goroutine——收尾
+// 不得等优雅 Close 握手的库内超时（5s）放行。回归：修复前 relayWS 挂在
+// wsWriteError 的握手等待上，看门狗（2s）先到。
+// 屏障：contBind 在裸请求（无 dispatch 上下文）上即时失败，无 sleep、无
+// 概率窗口；out 通道 = relayWS 真实返回（含 wg.Wait 全 join）。
+func TestRelayWSContFailIdleClientNoHang(t *testing.T) {
+	testHealthSink.reset()
+	_, s, _ := contFixture(t)
+	ft := &fakeTransport{readQueue: []fakeRead{
+		{typ: websocket.MessageText, frame: []byte(`{"type":"response.created","response":{"id":"rsp_gate","status":"created"}}`)},
+	}}
+	env, c, _ := newRelayWSTestHBI(t, ft, nil,
+		[]byte(`{"type":"response.create","model":"gpt-4o","input":"hi"}`), 0, s)
+	defer c.CloseNow()
+
+	select {
+	case r := <-env.out:
+		require.True(t, r.handled, "fail-closed 已记录 = 已处理")
+	case <-time.After(2 * time.Second):
+		c.CloseNow() // 解除 srv.Close 清理挂死，让失败可读
+		t.Fatal("contFail 收尾挂在空闲客户端 Read：relay 必须主动拆连接解除 client-loop")
+	}
+
+	require.True(t, ft.closeNow.Load(), "fail-closed 必须 CloseNow 直拆上游")
+	// 错误帧先于拆连接送达（TCP 缓冲数据在 FIN 后仍可读）；未绑定 id 永不泄漏。
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	typ, f, err := c.Read(ctx)
+	require.NoError(t, err, "错误帧必须在主动拆连接前已写出（客户端仍可读）")
+	require.Equal(t, websocket.MessageText, typ)
+	require.Contains(t, string(f), `"type":"error"`, "fail-closed 终态错误帧")
+	require.NotContains(t, string(f), "rsp_gate", "未绑定 id 不得泄漏")
+
+	require.NoError(t, env.p.rec.Close(context.Background()))
+	require.NoError(t, env.p.errlog.Close(context.Background()))
+	env.store.mu.Lock()
+	var lg *domain.UsageLog
+	for _, l := range env.store.logs {
+		if l.ErrorType == domain.Err5xx {
+			lg = l
+		}
+	}
+	env.store.mu.Unlock()
+	require.NotNil(t, lg, "fail-closed 记录必须存在（Err5xx）")
+	require.Equal(t, http.StatusServiceUnavailable, lg.StatusCode, "绑定权威缺失 → 503")
+	env.p.sched.FlushRules()
+	ri, ok := env.p.sched.Runtime(1)
+	require.True(t, ok)
+	require.Equal(t, domain.StatusActive, ri.Status, "网关侧 fail-closed 不冷却账号")
+	require.Empty(t, testHealthSink.throttlesFor(1), "网关侧 fail-closed 不投递惩罚")
+	require.Zero(t, ri.Concurrency, "并发槽必须释放")
 }

@@ -38,34 +38,29 @@ func CanRetry(cat CallerCategory, o AttemptOutcome) bool {
 	if o.HTTPStatus >= 500 && o.HTTPStatus <= 599 {
 		return false
 	}
-	// network not_sent may retry
-	if o.HTTPStatus == 0 && o.Commit == CommitNotSent && !o.BusinessFrameSent && o.Result == ResultFailed && !o.IsMalformed {
+	// network not_sent may retry — never for a hard continuation: the bound
+	// account is the only valid target, another account cannot resolve the
+	// referenced response.
+	if o.HTTPStatus == 0 && o.Commit == CommitNotSent && !o.BusinessFrameSent && o.Result == ResultFailed && !o.IsMalformed && !o.HardContinuation {
 		return true
 	}
 	return false
-}
-
-func RetryMatrixGolden() map[CallerCategory]map[string]bool {
-	cats := AllCallerCategories()
-	kinds := []string{"not_sent", "429", "5xx", "sent_ambiguous", "response_started", "client_committed", "client_cancel", "malformed"}
-	out := make(map[CallerCategory]map[string]bool)
-	for _, cat := range cats {
-		m := make(map[string]bool)
-		for _, k := range kinds {
-			o := outcomeForKind(k, cat, false)
-			m[k] = CanRetry(cat, o)
-		}
-		out[cat] = m
-	}
-	return out
 }
 
 func outcomeForKind(kind string, cat CallerCategory, hard bool) AttemptOutcome {
 	base := AttemptOutcome{
 		ID:                "attempt-1",
 		RouteClassID:      "rc1",
+		QualityClassID:    "qc1",
 		Fingerprint:       "fp1",
-		LifecycleRevision: 1,
+		TemplateID:        1,
+		AccountID:         1,
+		RequestedModel:    "gpt-4o",
+		MappedModel:       "gpt-4o",
+		CallerCategory:    cat,
+		OperationTag:      "chat_completions",
+		Ordinal:           1,
+		IdentityRevision:  1, // synthetic placeholder K; not part of the continuation (I,K) comparison (see AttemptOutcome.IdentityRevision)
 		Lane:              LanePrimary,
 		Generation:        1,
 		HardContinuation:  hard,
@@ -125,6 +120,5 @@ func outcomeForKind(kind string, cat CallerCategory, hard bool) AttemptOutcome {
 		base.IsMalformed = true
 		base.Terminal = true
 	}
-	_ = cat
 	return base
 }

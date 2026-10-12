@@ -15,16 +15,18 @@ import (
 // + Src + V）。
 func TestChangeRoundtrip(t *testing.T) {
 	c := Change{
-		V:           1,
-		Users:       true,
-		Templates:   true,
-		Clients:     true,
-		Multipliers: true,
-		Keys:        true,
-		Settings:    true,
-		Rules:       true,
-		Groups:      []int64{12, 34, 56},
-		Src:         "i-1",
+		V:              1,
+		Users:          true,
+		Templates:      true,
+		Clients:        true,
+		Multipliers:    true,
+		Keys:           true,
+		Settings:       true,
+		Rules:          true,
+		Pricing:        true,
+		ManagementKeys: true,
+		Groups:         []int64{12, 34, 56},
+		Src:            "i-1",
 	}
 	got, err := Unmarshal(Marshal(c))
 	require.NoError(t, err)
@@ -101,6 +103,21 @@ func TestMarshalPayloadGuard(t *testing.T) {
 	})
 }
 
+// TestNotifyRoutingDirtySurvivesPayloadGuard intelligent routing 契约：账号/
+// 静态变更是 routing dirty 的载体（Groups → sched 组级定向重载 → RequestCompile
+// 重编译决策视图）。载荷守卫 >6KB 降级丢 Groups 时，Templates=true 必须置位
+// ——sched 全量重载包含组级（去抖器 merge 语义），routing dirty 不随载荷丢失。
+func TestNotifyRoutingDirtySurvivesPayloadGuard(t *testing.T) {
+	groups := make([]int64, 2000) // ~20KB > 6KB 守卫阈值
+	for i := range groups {
+		groups[i] = int64(10000000 + i)
+	}
+	got, err := Unmarshal(Marshal(Change{V: 1, Groups: groups}))
+	require.NoError(t, err)
+	require.Nil(t, got.Groups, "超限 → 定向组列表丢弃")
+	require.True(t, got.Templates, "routing dirty 必须经全量重载触发器保留（重编译入口）")
+}
+
 // marshalRaw 不经守卫的原始序列化（守卫边界构造/断言用——守卫内部测量的就是
 // 这个长度）。
 func marshalRaw(c Change) []byte {
@@ -139,4 +156,20 @@ func groupsForTarget(t *testing.T, target int) []int64 {
 func TestUnmarshalInvalid(t *testing.T) {
 	_, err := Unmarshal([]byte(`{not json`))
 	require.Error(t, err)
+}
+
+// TestChangePricingIsEmpty 定价跨实例失效：Pricing 置位 → 非空载荷
+// （publish 前置放行）；零值 → 仍空。
+func TestChangePricingIsEmpty(t *testing.T) {
+	require.False(t, Change{Pricing: true}.IsEmpty(), "Pricing:true 必须非空")
+	require.True(t, Change{}.IsEmpty(), "零值仍空")
+	require.False(t, Change{V: 1, Pricing: true}.IsEmpty(), "V 不参与判定")
+}
+
+// TestChangeManagementKeysIsEmpty 管理 key（mk-）跨实例失效：ManagementKeys
+// 置位 → 非空载荷（publish 前置放行；否则 service.publish 会直接丢弃）。
+func TestChangeManagementKeysIsEmpty(t *testing.T) {
+	require.False(t, Change{ManagementKeys: true}.IsEmpty(), "ManagementKeys:true 必须非空")
+	require.False(t, Change{V: 1, ManagementKeys: true}.IsEmpty(), "V 不参与判定")
+	require.True(t, Change{}.IsEmpty(), "零值仍空")
 }

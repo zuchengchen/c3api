@@ -103,8 +103,8 @@ func TestPostTemplatesBatchUpdate(t *testing.T) {
 	require.Equal(t, 400, rec.Code, "empty fields: %s", rec.Body.String())
 }
 
-// TestPostAccountsBatchUpdate 批量更新账号：成功（status=disabled 生效）/
-// group_ids 提供（替换）/ 空数组（清空）/ null（不变）/ 非法 status 400 /
+// TestPostAccountsBatchUpdate 批量更新账号：成功（max_concurrency 生效）/
+// group_ids 提供（替换）/ 空数组（清空）/ null（不变）/ 未知字段 400 /
 // 空 fields 400 / 缺 id 404。
 func TestPostAccountsBatchUpdate(t *testing.T) {
 	_, _, do := newListTestRouter(t)
@@ -125,20 +125,20 @@ func TestPostAccountsBatchUpdate(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &groupResp))
 	gID := groupResp.ID
 
-	// 成功：{"ids":[...],"fields":{"status":"disabled"}} → 200 {"updated":2}
+	// 成功：{"ids":[...],"fields":{"max_concurrency":3}} → 200 {"updated":2}
 	rec = do(http.MethodPost, "/api/admin/accounts/batch-update",
-		`{"ids":[`+itoa(ids[0])+`,`+itoa(ids[1])+`],"fields":{"status":"disabled"}}`)
+		`{"ids":[`+itoa(ids[0])+`,`+itoa(ids[1])+`],"fields":{"max_concurrency":3}}`)
 	require.Equal(t, 200, rec.Code, "batch update: %s", rec.Body.String())
 	var up BatchUpdateResponse
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &up))
 	require.Equal(t, 2, up.Updated)
 
-	// GET 确认 status 已生效
+	// GET 确认 max_concurrency 已生效
 	rec = do(http.MethodGet, "/api/admin/accounts/"+itoa(ids[0]), "")
 	require.Equal(t, 200, rec.Code, "get: %s", rec.Body.String())
 	var acc domain.Account
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &acc))
-	require.Equal(t, domain.StatusDisabled, acc.Status)
+	require.Equal(t, 3, acc.MaxConcurrency)
 
 	// group_ids 提供 → 替换生效（回显核对）
 	rec = do(http.MethodPost, "/api/admin/accounts/batch-update",
@@ -172,10 +172,10 @@ func TestPostAccountsBatchUpdate(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &ag))
 	require.Equal(t, []int64{gID}, ag.GroupIds, "null = 不变")
 
-	// 非法 status 枚举 → 400（handler 显式校验）
+	// 未知字段 → 400（严格边界：DisallowUnknownFields）
 	rec = do(http.MethodPost, "/api/admin/accounts/batch-update",
-		`{"ids":[`+itoa(ids[0])+`],"fields":{"status":"bogus"}}`)
-	require.Equal(t, 400, rec.Code, "invalid status: %s", rec.Body.String())
+		`{"ids":[`+itoa(ids[0])+`],"fields":{"not_an_account_field":1}}`)
+	require.Equal(t, 400, rec.Code, "unknown field: %s", rec.Body.String())
 
 	// 空 fields → 400
 	rec = do(http.MethodPost, "/api/admin/accounts/batch-update",
@@ -232,7 +232,7 @@ func TestAccountGroupsCreateUpdate(t *testing.T) {
 	require.Empty(t, ag.GroupIds, "创建不带 group_ids = 无分组")
 
 	// PUT 替换：只留 g1（g2 被移除）
-	rec = do(http.MethodPut, "/api/admin/accounts/"+itoa(acc.ID),
+	rec = do(http.MethodPatch, "/api/admin/accounts/"+itoa(acc.ID),
 		`{"name":"a1","template_id":1,"upstream_key":"sk-x","group_ids":[`+itoa(g.ID)+`]}`)
 	require.Equal(t, 200, rec.Code, "put replace: %s", rec.Body.String())
 	rec = do(http.MethodGet, "/api/admin/accounts/"+itoa(acc.ID)+"/groups", "")
@@ -241,7 +241,7 @@ func TestAccountGroupsCreateUpdate(t *testing.T) {
 	require.Equal(t, []int64{g.ID}, ag.GroupIds, "PUT 替换 = 只留所选")
 
 	// PUT 清空（[]）
-	rec = do(http.MethodPut, "/api/admin/accounts/"+itoa(acc.ID), `{"name":"a1","template_id":1,"upstream_key":"sk-x","group_ids":[]}`)
+	rec = do(http.MethodPatch, "/api/admin/accounts/"+itoa(acc.ID), `{"name":"a1","template_id":1,"upstream_key":"sk-x","group_ids":[]}`)
 	require.Equal(t, 200, rec.Code, "put clear: %s", rec.Body.String())
 	rec = do(http.MethodGet, "/api/admin/accounts/"+itoa(acc.ID)+"/groups", "")
 	require.Equal(t, 200, rec.Code)
@@ -249,7 +249,7 @@ func TestAccountGroupsCreateUpdate(t *testing.T) {
 	require.Empty(t, ag.GroupIds, "PUT [] = 清空")
 
 	// PUT 缺省 group_ids = 不变（仍为空）
-	rec = do(http.MethodPut, "/api/admin/accounts/"+itoa(acc.ID), `{"name":"a1","template_id":1,"upstream_key":"sk-x"}`)
+	rec = do(http.MethodPatch, "/api/admin/accounts/"+itoa(acc.ID), `{"name":"a1","template_id":1,"upstream_key":"sk-x"}`)
 	require.Equal(t, 200, rec.Code, "put without group_ids: %s", rec.Body.String())
 	rec = do(http.MethodGet, "/api/admin/accounts/"+itoa(acc.ID)+"/groups", "")
 	require.Equal(t, 200, rec.Code)
@@ -320,7 +320,7 @@ func TestPostGroupsBatchDelete(t *testing.T) {
 	for i := 1; i <= 2; i++ {
 		rec := do(http.MethodPost, "/api/admin/groups", `{"name":"g`+itoa(int64(i))+`"}`)
 		require.Equal(t, 200, rec.Code, "create group: %s", rec.Body.String())
-		// Phase 3a：创建响应为 Group 本体（无 key 字段）
+		// 创建响应为 Group 本体（无 key 字段）
 		var created domain.Group
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &created))
 		ids = append(ids, created.ID)

@@ -22,11 +22,9 @@ import (
 	"github.com/is7qin/c3api/internal/ent/groupassignment"
 )
 
-// GroupRepo 同时承担调度器 Loader 的账号状态回写（UpdateAccountStatus 委托 AccountRepo，
-// 由 repository.New 注入；调度器按单个 loader 对象获取数据源）。
+// GroupRepo 承担调度器 Loader 的快照数据源（LoadGroupsAccounts/LoadGroupAccounts）。
 type GroupRepo struct {
-	client   *ent.Client
-	accounts *AccountRepo
+	client *ent.Client
 	// driver 为成员关系全表扫描用（LoadGroupsAccounts；与 user_repo 同构——
 	// 普通 client 与 tx client 均可用）。
 	driver dialect.Driver
@@ -37,11 +35,12 @@ type GroupRepo struct {
 const accountGroupsMembershipSQL = `SELECT account_id, group_id FROM account_groups`
 
 func (r *GroupRepo) CreateGroup(ctx context.Context, g *domain.Group) (*domain.Group, error) {
-	// price_multiplier 恒写入（service 层把缺省归一为 10000 = ×1——T3.5 修正：
+	// price_multiplier 恒写入（service 层把缺省归一为 10000 = ×1：
 	// API 边界 nullable float64 可表达显式 0 = 免费组，repo 不再把 0 当"未指定"
 	// 跳过落列）。DB 默认 10000 为兜底。
 	q := r.client.Group.Create().
 		SetName(g.Name).
+		SetDescription(g.Description).
 		SetVisibility(group.Visibility(g.Visibility)).
 		SetPriceMultiplier(g.PriceMultiplier).
 		// protocol_convert 恒写入（service 层把缺省归一为空数组；JSON 列自动
@@ -101,6 +100,7 @@ func (r *GroupRepo) UpdateGroup(ctx context.Context, g *domain.Group) (*domain.G
 	// 改 name/visibility → 写回，未触及倍率时携带原值自然保留；显式 0 = 免费组）。
 	row, err := r.client.Group.UpdateOneID(g.ID).
 		SetName(g.Name).
+		SetDescription(g.Description).
 		SetVisibility(group.Visibility(g.Visibility)).
 		SetPriceMultiplier(g.PriceMultiplier).
 		SetProtocolConvert(protocolConvertStrings(g.ProtocolConverts)).
@@ -130,7 +130,7 @@ func (r *GroupRepo) DeleteGroup(ctx context.Context, id int64) error {
 
 // LoadGroupsAccounts 全量组→账号快照（调度器启动/定时/全量失效的数据源）。
 //
-// 崩溃修复（O3 实证：847k 组 → 启动 fatal / 运行中静默空结果）：ent
+// 崩溃修复（实证：847k 组 → 启动 fatal / 运行中静默空结果）：ent
 // WithAccounts eager-load 对 m2m 边生成两跳参数化 IN——
 //  1. `SELECT account_id, group_id FROM account_groups WHERE group_id IN (全部组 id)`
 //  2. `SELECT * FROM accounts WHERE id IN (跳1的账号 id)`
@@ -139,14 +139,14 @@ func (r *GroupRepo) DeleteGroup(ctx context.Context, id int64) error {
 // 即崩溃；且 ent 邻接跳恒为参数化 IN（无法经分片控制），故本方法弃用 eager-load，
 // 改为**全表扫描 + 内存 join**（任务决策：语义允许时改 JOIN）：
 //  1. `Account.Query().WithTemplate().All`——账号全表扫描；模板 IN 参数数受
-//     模板表实体数约束（管理面小表，O3 压测仅 6 个），非账号规模驱动。
-//     模板侧嵌套 WithExt（template_ext 1:1 边缘表）——W4 快照合并
+//     模板表实体数约束（管理面小表 压测仅 6 个），非账号规模驱动。
+//     模板侧嵌套 WithExt（template_ext 1:1 边缘表）——快照合并
 //     StripImageTools 用；ext 的 IN 参数数同为模板实体数约束（同一小表界）。
 //  2. `Group.Query().IDs`——组 id 全表扫描（零参数；为无账号组保留空条目——
 //     与旧 eager-load 语义一致，调度器 Select 区分"组不存在"与"组无账号"）。
 //  3. `SELECT account_id, group_id FROM account_groups`——成员关系全表扫描，
 //     零参数。
-//  4. `SELECT * FROM account_exts`——账号 ext 全表扫描 + 内存 join（T2 起
+//  4. `SELECT * FROM account_exts`——账号 ext 全表扫描 + 内存 join（此后
 //     codex 路由按 Account.Ext 派生 AccountCredential）。不 eager-load 的原因
 //     同成员关系：ext 的 FK 是 account_id，eager-load 生成 `WHERE account_id
 //     IN (全部账号 id)`——参数数 = 账号实体数，>65,535 触顶；全表扫描零参数，
@@ -158,7 +158,7 @@ func (r *GroupRepo) DeleteGroup(ctx context.Context, id int64) error {
 // 组不会出现在结果中——见下方白名单守卫；旧 eager-load 同窗口行为。）
 func (r *GroupRepo) LoadGroupsAccounts(ctx context.Context) (map[int64][]*domain.Account, error) {
 	// 软删除：已删 account/group 不进调度器快照（成员关系白名单守卫同语义）。
-	// 模板侧嵌套 WithExt：快照合并 StripImageTools（W4；ext IN 参数数受模板
+	// 模板侧嵌套 WithExt：快照合并 StripImageTools（；ext IN 参数数受模板
 	// 表实体数约束——同一小表界，见上方注释）；账号侧 ext 不 eager-load
 	// （FK=account_id 的 IN 参数数受账号规模驱动——触顶约束，见步骤 4）。
 	accs, err := r.client.Account.Query().Where(account.DeletedAtIsNil()).
@@ -218,6 +218,69 @@ func (r *GroupRepo) LoadGroupsAccounts(ctx context.Context) (map[int64][]*domain
 	return out, nil
 }
 
+// compileStalenessSQL is the single §9-A1 read-only aggregate pass: one
+// statement, nine scalar subqueries, no new columns/tables/keys/indexes
+// (schema frozen). Soft deletes mirror the snapshot inclusion (deleted_at IS
+// NULL); membership/ext rows are count-only. Known limit: an exact membership
+// swap (remove one, add one — same COUNT) is probe-invisible; membership moves
+// always ride NOTIFY → InvalidateGroup in-app, and disconnect gaps ride
+// reconnect FullRefresh, so the probe stays a backstop, never the primary
+// carrier. Freshness maxima ride
+// MAX(updated_at) on exactly the three tables whose ent schemas maintain it
+// (account.go:36, group.go:29, template.go:26 — UpdateDefault(time.Now), so
+// every ent write path bumps it, including the writes that change account
+// content WITHOUT bumping lifecycle_revision (the runtime failure verb, and
+// out-of-band direct-DB edits). The other
+// two tables have no maintained timestamp — verified, not assumed: account_groups
+// is an ent m2m edge table (no schema file, no time columns; edge rows are
+// immutable (account_id, group_id) pairs — insert/delete only, so COUNT is
+// complete and every move additionally rides NOTIFY → InvalidateGroup in-app);
+// account_exts carries no time columns at all (account_ext.go:23-44) and every
+// service ext write co-bumps the parent account's lifecycle_revision in the
+// same transaction (ext_codex_repo.go), so ext content edits are rev-covered
+// and COUNT covers ext insert/delete. COALESCE pins empty tables to epoch
+// (never NULL — the tuple must compare exact).
+const compileStalenessSQL = `SELECT` +
+	` (SELECT COUNT(*) FROM accounts WHERE deleted_at IS NULL),` +
+	` (SELECT COALESCE(MAX(lifecycle_revision), 0) FROM accounts WHERE deleted_at IS NULL),` +
+	` (SELECT COALESCE(MAX(updated_at), 'epoch'::timestamptz) FROM accounts WHERE deleted_at IS NULL),` +
+	` (SELECT COUNT(*) FROM groups WHERE deleted_at IS NULL),` +
+	` (SELECT COALESCE(MAX(updated_at), 'epoch'::timestamptz) FROM groups WHERE deleted_at IS NULL),` +
+	` (SELECT COUNT(*) FROM templates WHERE deleted_at IS NULL),` +
+	` (SELECT COALESCE(MAX(updated_at), 'epoch'::timestamptz) FROM templates WHERE deleted_at IS NULL),` +
+	` (SELECT COUNT(*) FROM account_groups),` +
+	` (SELECT COUNT(*) FROM account_exts)`
+
+// CompileStalenessSnapshot runs the §9-A1 probe tuple (counts + freshness
+// maxima) for the scheduler backstop. Colocated with LoadGroupsAccounts: same
+// tables, same driver-seam convention (zero IN parameters — the 65,535
+// discipline), same soft-delete predicates. The scheduler consumes the tuple
+// only — no SQL, no pool ever enters the lane.
+func (r *GroupRepo) CompileStalenessSnapshot(ctx context.Context) (domain.CompileStaleness, error) {
+	rows := &entsql.Rows{}
+	if err := r.driver.Query(ctx, compileStalenessSQL, []any{}, rows); err != nil {
+		return domain.CompileStaleness{}, fmt.Errorf("compile staleness snapshot: %w", err)
+	}
+	defer rows.Close()
+	var out domain.CompileStaleness
+	var accountsUpdated, groupsUpdated, templatesUpdated time.Time
+	if !rows.Next() {
+		return domain.CompileStaleness{}, fmt.Errorf("compile staleness snapshot: no rows")
+	}
+	if err := rows.Scan(&out.Accounts, &out.MaxLifecycleRevision, &accountsUpdated,
+		&out.Groups, &groupsUpdated, &out.Templates, &templatesUpdated,
+		&out.Memberships, &out.Exts); err != nil {
+		return domain.CompileStaleness{}, fmt.Errorf("compile staleness snapshot (scan): %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return domain.CompileStaleness{}, fmt.Errorf("compile staleness snapshot: %w", err)
+	}
+	out.AccountsUpdatedAtNano = accountsUpdated.UnixNano()
+	out.GroupsUpdatedAtNano = groupsUpdated.UnixNano()
+	out.TemplatesUpdatedAtNano = templatesUpdated.UnixNano()
+	return out, nil
+}
+
 // LoadGroupMultipliers 全量组倍率快照（id → 万分数；groups.price_multiplier
 // NOT NULL 默认 10000——每行都有值；billing.Balances.Reload 调用）。独立方法
 // 不并入 LoadGroupsAccounts（后者是账号路由快照，语义/带宽不同）。
@@ -235,7 +298,7 @@ func (r *GroupRepo) LoadGroupMultipliers(ctx context.Context) (map[int64]int, er
 
 // LoadAssignmentMultipliers 全量用户-组专属倍率快照（(user_id, group_id) →
 // 万分数；仅 group_assignments.price_multiplier 非 NULL 行——缺失 = 未设置 →
-// 用组倍率；billing.Balances.Reload/ReloadMultipliers 调用，T3.5 修正：用户
+// 用组倍率；billing.Balances.Reload/ReloadMultipliers 调用 修正：用户
 // 专属倍率按组挂载）。
 func (r *GroupRepo) LoadAssignmentMultipliers(ctx context.Context) (map[billing.AssignmentKey]int, error) {
 	rows, err := r.client.GroupAssignment.Query().
@@ -271,7 +334,7 @@ func (r *GroupRepo) LoadGroupAccounts(ctx context.Context, groupID int64) ([]*do
 	// 同界）；account_ext 表按组定向取，不做全表扫描（组级定向重载语义）。
 	accs, err := r.client.Account.Query().
 		Where(account.DeletedAtIsNil(), account.HasGroupsWith(group.IDEQ(groupID))).
-		WithTemplate(func(q *ent.TemplateQuery) { q.WithExt() }). // W4：ext 边快照合并 StripImageTools
+		WithTemplate(func(q *ent.TemplateQuery) { q.WithExt() }). // ext 边快照合并 StripImageTools
 		All(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("load group accounts (group %d): %w", groupID, err)
@@ -294,9 +357,4 @@ func (r *GroupRepo) LoadGroupAccounts(ctx context.Context, groupID int64) ([]*do
 		out = append(out, toDomainAccount(a))
 	}
 	return out, nil
-}
-
-// UpdateAccountStatus 满足 scheduler.Loader：账号状态回写委托 AccountRepo。
-func (r *GroupRepo) UpdateAccountStatus(ctx context.Context, id int64, status domain.AccountStatus, cooldownUntil *time.Time, lastError *string, weight *int) error {
-	return r.accounts.UpdateAccountStatus(ctx, id, status, cooldownUntil, lastError, weight)
 }

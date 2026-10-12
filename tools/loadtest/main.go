@@ -5,15 +5,15 @@
 // loadtest 对网关打压测：固定并发 goroutine 持续请求，支持流式首字节和非流式完整响应延迟。
 // 用法: go run ./tools/loadtest -mode stream -addr http://127.0.0.1:8080 -key ck-xxx -concurrency 10000 -duration 5m -healthz http://127.0.0.1:8080/healthz
 //
-//	go run ./tools/loadtest -mode fill -fill-type users -admin-token <C3API_ADMIN_TOKEN> -concurrency 2000 -duration 5m
+//	go run ./tools/loadtest -mode fill -fill-type users -admin-jwt <platform_admin JWT> -concurrency 2000 -duration 5m
 //
 // 混合压测（模型请求 + 填充 API 并发）：开两个 loadtest 进程同时跑——一个
 // -mode stream -keys keys.txt、一个 -mode fill，各自 -out 落盘。同机交错跑 +
 // 每请求 CPU 对比（压测机 loadavg 50+，单进程内混流会让 fill 请求被流式
 // 长连接饿死，双进程是简单可靠的分流）。
-// 相对 brief 原代码的修正（均标注在行内）：
+// 相对原设想的修正（均标注在行内）：
 //   - os import 用 -out 兜底：把 RESULT 摘要同时写入文件（验收记录留档）。
-//   - 采样 goroutine 的 elapsed 直接取真实经过时间（brief 里 time.Since 套
+//   - 采样 goroutine 的 elapsed 直接取真实经过时间（原设计里 time.Since 套
 //     time.Since 的表达式恒为 ~0s，属"简化输出"占位）。
 //   - 首字节采样从 sync.Map 改为 mutex map（并发 CAS 实测在 Go 1.26
 //     HashTrieMap 上高争用会活锁，压测卡死，见压测记录）。
@@ -33,7 +33,9 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	_ "net/http/pprof"
 	"net/url"
 	"os"
@@ -56,7 +58,8 @@ var (
 	pprof       = flag.String("pprof", "", "listen addr for /debug/pprof (goroutine dump on hang)")
 	mode        = flag.String("mode", "stream", "request mode: stream, chat, fill, models, api-admin or api-user")
 	// fill 模式（管理面填充 API 压测）：并发创建用户/key/账号/组/模板/定价。
-	adminToken   = flag.String("admin-token", "", "C3API_ADMIN_TOKEN (fill/api-admin mode admin APIs; keys fill 走用户面不需要)")
+	// -admin-jwt 取**裸 JWT 串**（platform_admin），工具内部补 `Bearer ` 前缀。
+	adminJWT     = flag.String("admin-jwt", "", "raw platform_admin JWT (fill/api-admin mode admin APIs; keys fill 走用户面不需要)")
 	fillType     = flag.String("fill-type", "users", "fill mode entity: users, keys, accounts, groups, templates, pricing or mixed")
 	fillUser     = flag.String("fill-user", "user0@loadtest.test:loadtest-pass-1", "keys fill: 登录账号 email:password（-fill-user-file 为空时兜底）")
 	fillUserFile = flag.String("fill-user-file", "", "keys fill: 每行 email:password 的账号文件，随机挑（分散登录压力，对齐 setup 用户命名）")
@@ -68,6 +71,9 @@ var (
 	codesOut  = flag.String("codes-out", "", "api-admin: 生成的兑换码逐行追加此文件（供 api-user -codes-in 消费）")
 	codesIn   = flag.String("codes-in", "", "api-user: 可核销兑换码文件（追加式，进程内周期重读；多进程并跑会有重复核销 4xx 噪声）")
 	readsOnly = flag.Bool("api-reads-only", false, "api 模式只跑读场景（增长后纯读延迟对比用）")
+	// intelligent-routing 场景：prompt_cache_key 软亲和轮转（配合 setup
+	// -cache-domains 的共享域分布）。
+	affinityKeys = flag.Int("affinity-keys", 0, "stream/chat mode: rotate N prompt_cache_key affinity domains (affinity-<i>) across requests — exercises compiled cache-domain soft affinity and spill (0 = no affinity key; formats chat/responses)")
 )
 
 // keyPool 多 key 模式：每请求随机取一个（-keys 文件行）；空 = 用 -key 单 key。
@@ -85,8 +91,15 @@ type metrics struct {
 	// 30k 并发下每请求抢同一把锁（最大热点）；p99 遍历数组同样无锁。
 	samples        [sampleBuckets]atomic.Int64 // stream 首字节延迟采样：10ms/桶
 	latencySamples [sampleBuckets]atomic.Int64 // chat 完整响应延迟采样：10ms/桶
-	mu             sync.Mutex                  // 仅保护 errDetail（错误路径低频，0 错误零锁）
-	errDetail      map[string]int64
+	// dial/建连观测（自持 DialContext 计 dial，httptrace 只供 GotConn）：建连拥塞（SYN 丢/accept 排队）是压测夹具
+	// 与网关之间最容易失明的一段——goroutine dump 与首字节直方图都看不到它。
+	dialN      atomic.Int64 // 真实新建连接数（Keep-Alive 复用不计）
+	dialUS     atomic.Int64 // dial 累计微秒
+	dialSlow   atomic.Int64 // dial >1s 计数（建连拥塞信号）
+	connWaitN  atomic.Int64 // GotConn 样本数（新建+复用）
+	connWaitMS atomic.Int64 // reqStart → GotConn 累计毫秒
+	mu         sync.Mutex   // 仅保护 errDetail（错误路径低频，0 错误零锁）
+	errDetail  map[string]int64
 }
 
 func (m *metrics) addErr(detail string) {
@@ -107,8 +120,8 @@ func main() {
 		validateFillFlags()
 	}
 	if *mode == "api-admin" {
-		if *adminToken == "" {
-			fmt.Fprintln(os.Stderr, "-mode api-admin requires -admin-token (C3API_ADMIN_TOKEN)")
+		if *adminJWT == "" {
+			fmt.Fprintln(os.Stderr, "-mode api-admin requires -admin-jwt (raw platform_admin JWT)")
 			os.Exit(2)
 		}
 		if *codesIn != "" {
@@ -160,7 +173,7 @@ func main() {
 
 	// 每 worker 自建局部随机源：math/rand/v2 全局源带锁，30k 并发下
 	// pickKey/退避抢同一把锁；按 worker 索引分种子，退避不会同频共振。
-	// transport 同样 per-worker（#19）：全局共享 transport 的连接池锁
+	// transport 同样 per-worker：全局共享 transport 的连接池锁
 	// （connsMu）在 50k 并发下是跨 worker 争抢点；每 worker 独立 transport
 	// 后池锁归零竞争，连接数不变（稳态每 worker 恰好一条 keep-alive）。
 	randSeed := uint64(time.Now().UnixNano())
@@ -171,12 +184,8 @@ func main() {
 		go func(idx int, rng *rand.Rand) {
 			defer wg.Done()
 			// 每 worker 独立 transport（池容量 1 即够——稳态恒 1 条连接）：
-			// 避免共享 transport 的连接池锁竞争（#19）；参数同全局版。
-			transport := &http.Transport{
-				MaxIdleConns:        1,
-				MaxIdleConnsPerHost: 1,
-				IdleConnTimeout:     90 * time.Second,
-			}
+			// 避免共享 transport 的连接池锁竞争；参数同全局版。
+			transport := newLoadTransport(m)
 			client := &http.Client{Timeout: 10 * time.Minute, Transport: transport}
 			if isAPI {
 				// api 模式：worker 自含循环（登录/预热/计时段都在内）。
@@ -225,6 +234,17 @@ func main() {
 
 	wg.Wait()
 	result := fmt.Sprintf("\n=== RESULT ===\nmode=%s\n", *mode)
+	if *mode == "stream" || *mode == "chat" {
+		// 模型请求模式带 format（images 的 JSON/SSE 两形态结果必须可区分归档）。
+		result += fmt.Sprintf("format=%s\n", *format)
+		if n := m.dialN.Load(); n > 0 {
+			result += fmt.Sprintf("dial_n=%d dial_avg_ms=%.2f dial_gt1s=%d\n",
+				n, float64(m.dialUS.Load())/float64(n)/1000, m.dialSlow.Load())
+		}
+		if n := m.connWaitN.Load(); n > 0 {
+			result += fmt.Sprintf("conn_wait_n=%d conn_wait_avg_ms=%d\n", n, m.connWaitMS.Load()/n)
+		}
+	}
 	if *mode == "fill" {
 		result += fmt.Sprintf("fill_type=%s\n", *fillType)
 	}
@@ -274,7 +294,9 @@ func pickKey(rng *rand.Rand) string {
 // newLoadtestRequest builds the minimal request for the selected mode + format.
 // 三格式（多模板多格式压测）：chat → /v1/chat/completions（Bearer），
 // responses → /v1/responses（Bearer），anthropic → /v1/messages（x-api-key）。
-func newLoadtestRequest(base, groupKey, requestMode string) *http.Request {
+// affinity 非空且格式为 chat/responses 时注入 prompt_cache_key（软亲和一致性
+// 哈希的显式键；anthropic/images 不吃该字段，忽略）。
+func newLoadtestRequest(base, groupKey, requestMode, affinity string) *http.Request {
 	if requestMode == "models" {
 		// GET /v1/models：网关内存快照直出（零上游、零 DB），延迟口径同 chat。
 		req, _ := http.NewRequest(http.MethodGet, base+"/v1/models", nil)
@@ -289,6 +311,7 @@ func newLoadtestRequest(base, groupKey, requestMode string) *http.Request {
 		if requestMode == "stream" {
 			body = `{"model":"gpt-4o","stream":true,"input":"hi"}`
 		}
+		body = injectAffinity(body, affinity)
 	case "anthropic":
 		path = "/v1/messages"
 		body = `{"model":"claude-3-5-sonnet-20241022","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
@@ -296,16 +319,21 @@ func newLoadtestRequest(base, groupKey, requestMode string) *http.Request {
 			body = `{"model":"claude-3-5-sonnet-20241022","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}`
 		}
 	case "images":
-		// images generations：非流式 JSON（data 数组计图计费）；流式变体需
-		// 上游 SSE 帧规格支持，fakeupstream 未实现——压测覆盖非流式。
+		// images generations：-mode chat = 非流式 JSON（data 数组计图计费）；
+		// -mode stream = stream:true → 网关 SSE 透传（image_generation.completed
+		// 帧 + [DONE] 终帧，fakeupstream 已支持同口径 wire 形态）。
 		path = "/v1/images/generations"
 		body = `{"model":"gpt-image-1","prompt":"a cat","n":1,"size":"1024x1024"}`
+		if requestMode == "stream" {
+			body = `{"model":"gpt-image-1","prompt":"a cat","n":1,"size":"1024x1024","stream":true}`
+		}
 	default: // chat
 		path = "/v1/chat/completions"
 		body = `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
 		if requestMode == "stream" {
 			body = `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 		}
+		body = injectAffinity(body, affinity)
 	}
 	req, _ := http.NewRequest(http.MethodPost, base+path, bytes.NewReader([]byte(body)))
 	if *format == "anthropic" {
@@ -317,27 +345,70 @@ func newLoadtestRequest(base, groupKey, requestMode string) *http.Request {
 	return req
 }
 
+// injectAffinity 在 JSON body 顶层注入 prompt_cache_key（affinity 空 = 原样）。
+// 压测工具侧最小字符串手术：body 恒以 `{"model":...` 开头，插到首个字段后。
+func injectAffinity(body, affinity string) string {
+	if affinity == "" {
+		return body
+	}
+	return `{"prompt_cache_key":"` + affinity + `",` + body[1:]
+}
+
 // 请求模板：format×mode 在进程内固定，URL/body/固定头只构建一次；每请求
 // Clone + 换 key，避免 http.NewRequest 的 URL 解析 + body 字符串复制 +
 // 头表构建（4 万+ req/s 下是 GC 的主要来源之一，见上机 profile）。
+// affinity 模式（-affinity-keys N>0）预构建 N 个模板（每域一个 prompt_cache_key），
+// 每请求轮转取一，稳定命中编译缓存域软亲和。
 var (
-	reqTmpl  *http.Request
-	tmplBody []byte
+	reqTmpl        *http.Request
+	tmplBody       []byte
+	affinityTmpls  []*http.Request
+	affinityBodies [][]byte
 )
 
 // buildReqTemplate 按当前 flags 预构建请求模板（main 启动时调用一次）。
 func buildReqTemplate() {
-	reqTmpl = newLoadtestRequest(*addr, *key, *mode)
+	reqTmpl = newLoadtestRequest(*addr, *key, *mode, "")
 	if reqTmpl.Body != nil { // GET（models）无体
 		tmplBody, _ = io.ReadAll(reqTmpl.Body)
 	}
 	reqTmpl.GetBody = func() (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(tmplBody)), nil
 	}
+	affinityTmpls = affinityTmpls[:0]
+	affinityBodies = affinityBodies[:0]
+	if *affinityKeys > 0 {
+		for i := 0; i < *affinityKeys; i++ {
+			at := newLoadtestRequest(*addr, *key, *mode, fmt.Sprintf("affinity-%d", i))
+			var ab []byte
+			if at.Body != nil {
+				ab, _ = io.ReadAll(at.Body)
+			}
+			at.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(ab)), nil
+			}
+			affinityTmpls = append(affinityTmpls, at)
+			affinityBodies = append(affinityBodies, ab)
+		}
+	}
 }
 
 // newRequestFromTemplate 克隆模板并按 key 设置认证头（其余静态）。
-func newRequestFromTemplate(groupKey string) *http.Request {
+// affinity 模式按 idx 轮转取对应模板；idx<0 = 无亲和（单模板快路径不变）。
+func newRequestFromTemplate(groupKey string, idx int) *http.Request {
+	if idx >= 0 && len(affinityTmpls) > 0 {
+		tmpl := affinityTmpls[idx%len(affinityTmpls)]
+		ab := affinityBodies[idx%len(affinityBodies)]
+		req := tmpl.Clone(context.Background())
+		if *format == "anthropic" {
+			req.Header.Set("x-api-key", groupKey)
+		} else {
+			req.Header.Set("Authorization", "Bearer "+groupKey)
+		}
+		req.Body = io.NopCloser(bytes.NewReader(ab))
+		req.ContentLength = int64(len(ab))
+		return req
+	}
 	req := reqTmpl.Clone(context.Background())
 	if *format == "anthropic" {
 		req.Header.Set("x-api-key", groupKey)
@@ -349,11 +420,56 @@ func newRequestFromTemplate(groupKey string) *http.Request {
 	return req
 }
 
+// affinityIdx 返回本请求的亲和模板下标（-affinity-keys 0 → -1 走单模板）。
+func affinityIdx(rng *rand.Rand) int {
+	if *affinityKeys <= 0 {
+		return -1
+	}
+	return rng.IntN(*affinityKeys)
+}
+
+// newLoadTransport 每 worker 独立 transport（连接池锁零竞争）+ 建连观测。
+// dial 统计由自持 DialContext 完成（语义与 http 默认 dialer 一致：30s 超时、
+// 30s keepalive）——httptrace 的 Connect* 回调由 transport 拨号 goroutine
+// 调用，实测高并发回环下偶发不触发（tcpConns=1 而回调零记录），统计不可信；
+// 自持 dialer 记录在发起拨号的同一调用栈内，确定性成立。GotConn（conn_wait）
+// 仍走 httptrace：与请求同 goroutine，确定性成立。
+func newLoadTransport(m *metrics) *http.Transport {
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	return &http.Transport{
+		MaxIdleConns:        1,
+		MaxIdleConnsPerHost: 1,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			t0 := time.Now()
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err == nil {
+				d := time.Since(t0)
+				m.dialN.Add(1)
+				m.dialUS.Add(d.Microseconds())
+				if d > time.Second {
+					m.dialSlow.Add(1)
+				}
+			}
+			return conn, err
+		},
+	}
+}
+
 // doRequest executes one request; count=true includes it in the result metrics.
 // Connection failures retain the jittered backoff used by the stream benchmark.
 func doRequest(client *http.Client, m *metrics, rng *rand.Rand, count bool) {
-	req := newRequestFromTemplate(pickKey(rng))
+	req := newRequestFromTemplate(pickKey(rng), affinityIdx(rng))
 	reqStart := time.Now()
+	// 建连等待观测：GotConn 每次取连接都触发（与请求同 goroutine，确定性），
+	// reqStart→GotConn 含 dial 等待与连接池排队；dial 本身由 transport 的
+	// DialContext 记录（见 newLoadTransport）。
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) {
+			m.connWaitN.Add(1)
+			m.connWaitMS.Add(time.Since(reqStart).Milliseconds())
+		},
+	}))
 	resp, err := client.Do(req)
 	if err != nil {
 		if count {
@@ -363,7 +479,7 @@ func doRequest(client *http.Client, m *metrics, rng *rand.Rand, count bool) {
 		}
 		// 连接级失败退避（100-300ms 抖动）：Windows 监听 backlog（SOMAXCONN≈200）
 		// 下突发拨号会被 RST，无退避的立即重试会形成自持拒绝风暴
-		// （Task 9 实测：500 并发无退避 99.4% refused，150 并发无失败）。
+		// （压测实测：500 并发无退避 99.4% refused，150 并发无失败）。
 		time.Sleep(time.Duration(100+rng.IntN(200)) * time.Millisecond)
 		return
 	}
@@ -475,13 +591,13 @@ func loadFillUserFile() {
 	fmt.Printf("loaded %d fill users from %s\n", len(fillUserPool), *fillUserFile)
 }
 
-// validateFillFlags fill 模式启动校验：fill-type 枚举 + admin token 依赖 +
+// validateFillFlags fill 模式启动校验：fill-type 枚举 + admin JWT 依赖 +
 // 登录账号文件加载。
 func validateFillFlags() {
 	switch *fillType {
 	case "users", "accounts", "groups", "templates", "pricing", "mixed":
-		if *adminToken == "" {
-			fmt.Fprintf(os.Stderr, "-mode fill with -fill-type %s requires -admin-token (C3API_ADMIN_TOKEN)\n", *fillType)
+		if *adminJWT == "" {
+			fmt.Fprintf(os.Stderr, "-mode fill with -fill-type %s requires -admin-jwt (raw platform_admin JWT)\n", *fillType)
 			os.Exit(2)
 		}
 	case "keys":
@@ -516,7 +632,7 @@ func newFillRequest(client *http.Client, rng *rand.Rand) (req *http.Request, pre
 	mk := func(method, path string, body any) *http.Request {
 		b, _ := json.Marshal(body)
 		req, _ := http.NewRequest(method, *addr+path, bytes.NewReader(b))
-		req.Header.Set("Authorization", "Bearer "+*adminToken)
+		req.Header.Set("Authorization", "Bearer "+*adminJWT)
 		req.Header.Set("Content-Type", "application/json")
 		return req
 	}
@@ -556,9 +672,10 @@ func newFillRequest(client *http.Client, rng *rand.Rand) (req *http.Request, pre
 		req.Header.Set("Authorization", "Bearer "+lr.Token)
 		return req, ""
 	case "accounts":
+		// intelligent-routing 新契约：无 weight/status 旧字段（选号由编译器计划决定）。
 		return mk(http.MethodPost, "/api/admin/accounts", map[string]any{
 			"name": tag, "template_id": *fillTplID, "upstream_key": "sk-fill",
-			"group_ids": []int64{*fillGroupID}, "weight": 100, "max_concurrency": 100000,
+			"group_ids": []int64{*fillGroupID}, "max_concurrency": 100000,
 		}), ""
 	case "groups":
 		return mk(http.MethodPost, "/api/admin/groups", map[string]any{
@@ -616,7 +733,7 @@ func doFillRequest(client *http.Client, m *metrics, rng *rand.Rand, count bool) 
 	if *fillKeysOut != "" && *fillType == "keys" {
 		fillKeyB, _ = io.ReadAll(resp.Body)
 	} else {
-		_, _ = io.Copy(io.Discard, resp.Body) // 响应体排空，连接回池复用（O3 复核：此路径与 keys 登录子请求均已排空，唯一缺口在 doRequest 非 200 分支，已修）
+		_, _ = io.Copy(io.Discard, resp.Body) // 响应体排空，连接回池复用（复核：此路径与 keys 登录子请求均已排空，唯一缺口在 doRequest 非 200 分支，已修）
 	}
 	resp.Body.Close()
 	if resp.StatusCode != 200 {

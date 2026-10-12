@@ -6,8 +6,8 @@ package proxy
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"time"
 
@@ -17,61 +17,53 @@ import (
 	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/rule"
 	"github.com/is7qin/c3api/internal/scheduler"
+	"github.com/is7qin/c3api/pkg/logx"
 	"github.com/is7qin/c3api/pkg/sserelay"
 )
 
-// anthropicCaller 是 anthropic 格式的 UpstreamCaller 实现（从 tryAnthropic
-// 迁移，行为逐行等价）。
 type anthropicCaller struct{ p *Proxy }
+
+// anthropicCaller 负责 Messages 的原始 SSE 中继，缓存用量在 message_start、输出用量在 message_delta 分别提取。
 
 func (c *anthropicCaller) Call(ctx context.Context, w http.ResponseWriter, r *http.Request, reqID string, groupID int64, start time.Time, sel *scheduler.Selection, cred string, body []byte, stream bool) (int, []byte, bool, error) {
 	p := c.p
-
 	if stream {
-		// 客户端请求模型：流式无完整 params 解析（评审 I-2），gjson 顶层
-		// 提取（1 次分配，远低于旧的完整参数解析）。Model 即 string 别名。
+		// 客户端请求模型：流式不解析完整参数，仅 gjson 提取顶层 model；原始字节中继，上游通过 AnthMessageStreamRaw 直透
 		reqModel := gjson.GetBytes(body, "model").String()
 		ctx, cancel := context.WithTimeout(ctx, p.cfg.UpstreamStreamTimeout)
 		defer cancel()
-		// 模型改写：与 SDK 路径 params.Model = sel.Model 等价（ModelMapping 语义）。
-		// 客户端请求体已带 stream:true（fake 上游按 body["stream"] 分支），无需注入。
-		// GC 削减 P1：model 已匹配 → 短路返回原切片零分配。
+		// 模型映射：等价 SDK 路径对 params.Model 的覆盖，客户端已带 stream:true 无需注入，命中则零分配复用原切片
 		streamBody, err := setModel(body, sel.Model)
 		if err != nil {
 			return 0, nil, false, err
 		}
-		resp, err := p.clients.AnthMessageStreamRaw(ctx, sel.TemplateID, sel.BaseURL, cred, streamBody)
+		resp, err := p.clients.AnthMessageStreamRaw(ctx, sel.TemplateID, sel.BaseURL, cred, streamBody, r.Header)
 		if err != nil {
 			return statusOf(err), upstreamBody(err), false, err
 		}
 		if resp.StatusCode != http.StatusOK {
 			rb := readUpstreamBody(resp)
 			resp.Body.Close()
-			return resp.StatusCode, rb, false, nil
+			// 2xx-非-200 归一 502 再交 pipeline（attempt_outcome 拒绝 ResultFailed+2xx）。
+			return streamUpstreamStatus(resp.StatusCode), rb, false, nil
 		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("X-Accel-Buffering", "no")
+		writeSSEHeaders(w)
+		out := sserelay.NewOutput(w, p.cfg.StreamKeepaliveInterval, sserelay.OutputOptions{Ctx: ctx, Cancel: cancel})
+		defer out.Release()
 		var it, ot, tt, cr, cc int64
-		// TTFT 采集（首 token 时间毫秒）：首个 SSE 帧（任意事件）到达时间——
-		// Observer 在帧原样写出后回调；单帧旁路零成本（time.Now 一次 + 毫秒
-		// 换算）。首帧后写入 ctx（logWithCtx 读取）；无首 token 路径不写入 → nil。
+		// TTFT 首帧语义：首个 SSE 事件（写出前 seam）记录毫秒，已提交流无帧则 nil
 		var ttft *int64
 		err = sserelay.Relay(ctx, w, resp.Body, sserelay.Config{
+			Output: out,
 			Mapper: newResponseModelSSEMapper(sel.ClientResponseModel(reqModel)),
-			Observer: func(ev sserelay.Event) {
+			OnEvent: func(ev sserelay.Event) {
 				if ttft == nil {
 					ms := time.Since(start).Milliseconds()
 					ttft = &ms
 				}
-				// 真实 API 的流式用量分两处携带：input/cache 在 message_start 事件的
-				// message.usage 里（评审 M1：前缀 message.usage.*，非顶层），
-				// output_tokens 在 message_delta 事件的 usage 里
-				// （message_delta.usage 不含 input_tokens）。EventName：缺 event:
-				// 名帧按 data.type 推断（非规范上游，P3）。
+				// 协议用量：input/cache 在 message_start，output 在 message_delta；缺 event 名按 data.type 推断
 				switch string(ev.EventName()) {
 				case "message_start":
-					// ot/tt 恒 0（anthropicStartUsage 无对应字段；tt 下游自算）
 					if t, ok := anthropicStartUsage(ev.Data); ok {
 						it, cr, cc = t.it, t.cr, t.cc
 					}
@@ -84,40 +76,73 @@ func (c *anthropicCaller) Call(ctx context.Context, w http.ResponseWriter, r *ht
 		if ttft != nil {
 			ctx = context.WithValue(ctx, ctxKeyTTFT{}, ttft)
 		}
+		// 观测器恰好一次归属：后续分支仅走 Cancel / 失败 / 成功之一
+		base := mergeDispatchBase(ctx, anthropicBaseOutcome(reqID, groupID, sel, reqModel, start, ttft, it, ot, cr, cc))
 		if err != nil {
-			// 客户端断开：释放槽位，无法转移。errors.Is(err, context.Canceled) 即
-			// 客户端断开——sserelay.normalize 已区分三类（C-P2-2）：父 ctx 取消 →
-			// Canceled；上游停滞超时（UpstreamStreamTimeout）→ DeadlineExceeded，
-			// 走上游错误分支（recordStreamAbort + 连接级/5xx 分流），不得当作客户端断开。
-			if errors.Is(err, context.Canceled) {
-				// 客户端断开：上游已消费请求（成功），仍须记录用量，否则
-				// 成功请求丢日志。与上游流中止同语义：200 + ErrAbort。
-				p.finish(sel.AccountID, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), domain.FormatAnthropic, http.StatusOK, domain.ErrAbort, usageTuple{it: it, ot: ot, tt: it + ot, cr: cr, cc: cc}, start)))
+			// 统一出口判定（§3.7）：取消/写失败不补写；未提交交 pipeline；已提交写 SSE error。
+			switch classifyStreamExit(ctx, out, err, AttemptUsage{InputTokens: it, OutputTokens: ot, CacheReadTokens: cr, CacheCreationTokens: cc}, ttft) {
+			case streamExitClientCancel:
+				// 已提交流用量保留：沿用断前已收到的用量，无则 0，记 200+ErrAbort 防丢日志
+				oc := base
+				oc.Result = ResultClientCancel
+				oc.Commit = CommitResponseStarted
+				oc.HTTPStatus = 0
+				oc.Terminal = true
+				oc.BusinessFrameSent = true
+				p.observeDispatchOutcome(ctx, oc, nil)
+				p.finish(sel, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), domain.FormatAnthropic, http.StatusOK, domain.ErrAbort, usageTuple{it: it, ot: ot, tt: it + ot, cr: cr, cc: cc}, start)))
+				return 0, nil, true, nil
+			case streamExitUncommitted:
+				// 未提交读取失败 → pipeline（handled=false，可 failover/写 JSON）
+				return statusOf(err), nil, false, err
+			default: // 写失败 / 已提交
+				if out.Committed() {
+					writeClientStreamError(out, domain.FormatAnthropic, err)
+				}
+				oc := base
+				oc.Result = ResultFailed
+				oc.HTTPStatus = 0
+				oc.Commit = CommitSentAmbiguous
+				oc.Terminal = true
+				oc.BusinessFrameSent = true
+				health := &AttemptHealthEvent{Kind: scheduler.RuleKindOf(statusOf(err)), ErrorMessage: err.Error()}
+				p.observeDispatchOutcome(ctx, oc, health)
+				if p.log != nil {
+					p.log.Warn("upstream stream aborted", logx.String("request_id", reqID))
+				}
+				p.finish(sel, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), domain.FormatAnthropic, http.StatusOK, domain.ErrAbort, usageTuple{it: it, ot: ot, tt: it + ot, cr: cr, cc: cc}, start)))
 				return 0, nil, true, nil
 			}
-			p.recordStreamAbort(ctx, reqID, groupID, start, sel, reqModel, usageTuple{it: it, ot: ot, tt: it + ot, cr: cr, cc: cc}, err)
-			p.sched.MarkResult(sel.AccountID, scheduler.RuleKindOf(statusOf(err)), nil, statusOf(err), err.Error(), sel.Model)
-			return 0, nil, true, nil
 		}
 		tt = it + ot
-		p.sched.MarkResult(sel.AccountID, rule.KindOK, nil, http.StatusOK, "", sel.Model)
-		p.finish(sel.AccountID, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), domain.FormatAnthropic, 200, domain.ErrNone, usageTuple{it: it, ot: ot, tt: tt, cr: cr, cc: cc}, start)))
+		base.Usage.OutputTokens = ot
+		base.Usage.InputTokens = it
+		base.Timing.TTFTMS = ttft
+		base.Timing.LatencyMS = time.Since(start).Milliseconds()
+		oc := base
+		oc.Result = ResultSuccess
+		oc.HTTPStatus = 200
+		oc.Commit = CommitClientCommitted
+		oc.Terminal = true
+		oc.BusinessFrameSent = true
+		oc.Usage = AttemptUsage{InputTokens: it, OutputTokens: ot, CacheReadTokens: cr, CacheCreationTokens: cc}
+		health := &AttemptHealthEvent{Kind: rule.KindOK}
+		p.observeDispatchOutcome(ctx, oc, health)
+		p.finish(sel, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), domain.FormatAnthropic, 200, domain.ErrNone, usageTuple{it: it, ot: ot, tt: tt, cr: cr, cc: cc}, start)))
 		return 200, nil, true, nil
 	}
-
 	var params anthropic.MessageNewParams
 	if err := json.Unmarshal(body, &params); err != nil {
-		// 本地拒绝（handled=true，无记录）：同 chat 语义。Select 已占并发槽，
-		// 必须释放（Release-only）。
+		// 本地拒绝：参数校验失败，已占并发槽仅释放不计健康与用量
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "invalid request body: " + err.Error()}})
-		p.sched.Release(sel.AccountID)
+		sel.Release()
 		return 400, nil, true, nil
 	}
-	// 客户端请求模型快照：下一行覆盖前取值（零额外分配，与 gjson 值等价）。
+	// 客户端请求模型快照：覆盖前取值用于日志与观测，零额外分配
 	reqModel := params.Model
-	params.Model = sel.Model // Model = string 别名
-	tpl := tplOf(sel)        // 非流式 SDK 路径（GC 削减 P6：流式原始请求路径已免模板对象分配）
-	resp, err := p.clients.AnthMessage(ctx, tpl, cred, params)
+	params.Model = sel.Model
+	tpl := tplOf(sel) // 非流式走 SDK 模板路径
+	resp, err := p.clients.AnthMessage(ctx, tpl, cred, params, r.Header)
 	if err != nil {
 		return statusOf(err), upstreamBody(err), false, err
 	}
@@ -133,10 +158,40 @@ func (c *anthropicCaller) Call(ctx context.Context, w http.ResponseWriter, r *ht
 	_, _ = w.Write(data)
 	var it, ot, tt, cr, cc int64
 	if resp.JSON.Usage.Valid() {
-		// 非流式：SDK v1.56.0 Usage 结构体直读。
+		// 非流式用量：直接读取响应 usage，输入/缓存与输出同库
 		it, ot, tt, cr, cc = anthropicUsageFromResponse(resp.Usage)
 	}
-	p.sched.MarkResult(sel.AccountID, rule.KindOK, nil, http.StatusOK, "", sel.Model)
-	p.finish(sel.AccountID, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), domain.FormatAnthropic, 200, domain.ErrNone, usageTuple{it: it, ot: ot, tt: tt, cr: cr, cc: cc}, start)))
+	base := mergeDispatchBase(ctx, anthropicBaseOutcome(reqID, groupID, sel, reqModel, start, nil, it, ot, cr, cc))
+	out := base
+	out.Result = ResultSuccess
+	out.HTTPStatus = 200
+	out.Commit = CommitClientCommitted
+	out.Terminal = true
+	out.BusinessFrameSent = true
+	out.Usage = AttemptUsage{InputTokens: it, OutputTokens: ot, CacheReadTokens: cr, CacheCreationTokens: cc}
+	health := &AttemptHealthEvent{Kind: rule.KindOK}
+	p.observeDispatchOutcome(ctx, out, health)
+	p.finish(sel, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), domain.FormatAnthropic, 200, domain.ErrNone, usageTuple{it: it, ot: ot, tt: tt, cr: cr, cc: cc}, start)))
 	return 200, nil, true, nil
+}
+
+func anthropicBaseOutcome(reqID string, groupID int64, sel *scheduler.Selection, reqModel string, start time.Time, ttft *int64, it, ot, cr, cc int64) AttemptOutcome {
+	routeID, _ := domain.RouteClassID(groupID, domain.FormatAnthropic, reqModel, domain.OpAnthropicMessages)
+	qualityID, _ := domain.QualityClassID(domain.CallerAnthropic, domain.FormatAnthropic, sel.Model, domain.OpAnthropicMessages)
+	fp := sel.CandidateFingerprint
+	if fp == "" {
+		fp = hex.EncodeToString(routeID[:8])
+	}
+	return buildOutcome(CallerAnthropic, OperationTag(domain.OpAnthropicMessages), outcomeParams{
+		reqID:          AttemptID(reqID),
+		routeClassID:   RouteClassID(hex.EncodeToString(routeID[:])),
+		qualityClassID: QualityClassID(hex.EncodeToString(qualityID[:])),
+		fingerprint:    CandidateFingerprint(fp),
+		templateID:     sel.TemplateID,
+		accountID:      sel.AccountID,
+		requestedModel: reqModel,
+		mappedModel:    sel.Model,
+		timing:         AttemptTiming{LatencyMS: max(time.Since(start).Milliseconds(), 0), TTFTMS: ttft},
+		usage:          AttemptUsage{InputTokens: it, OutputTokens: ot, CacheReadTokens: cr, CacheCreationTokens: cc},
+	})
 }

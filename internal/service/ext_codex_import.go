@@ -19,17 +19,17 @@ import (
 	"github.com/is7qin/c3api/pkg/logx"
 )
 
-// —— codex 凭据批量导入（Task B：batch-import-codex-oauth / batch-import-codex-pat
+// —— codex 凭据批量导入（batch-import-codex-oauth / batch-import-codex-pat
 // 共享 upsert 核心） ——
 //
 // 解耦的是 API/校验面（oauth/pat 各端点类型特定校验），底层单实现
 // importCodexAccounts：逐行 键查重（组合键 codex_email + codex_account_id）→
 //   - 不存在 → imported：**单行事务**（txRepo.CreateAccount + txRepo.
-//     UpsertAccountExt（NewCodexIdentity 身份）+ txRepo.SetAccountGroups 可选——
-//     任一步失败整体回滚，无孤儿）；
-//   - 存在且类型匹配 → updated：**只更新凭据列**（oauth → WriteOAuthRotation
-//     三列 / pat → WritePATKey——identity/并发/权重/归属零触碰；全量
-//     UpsertAccountExt 的 ClearX 清 NULL 面禁用）；
+//     UpsertAccountExt（NewCodexIdentity 生成 installation_id）+ txRepo.
+//     SetAccountGroups 可选——任一步失败整体回滚，无孤儿）；
+//   - 存在且类型匹配 → updated：**只更新凭据列**（oauth 三列 / pat 单列——
+//     identity/并发/权重/归属零触碰；全量 UpsertAccountExt 的 ClearX 清 NULL
+//     面禁用）；
 //   - 存在但类型不匹配 → 行级 failed（不跨类型混写）。
 //
 // 不调 service.CreateAccount（带 invalidate/publish 副作用面——事务回滚时副作用
@@ -48,7 +48,6 @@ type codexImportRow struct {
 	oauthExpires *time.Time
 	patKey       string
 	maxConc      int // 显式归一（缺省 25——导入面裁决覆盖账号表默认 8）
-	weight       int // 显式归一（缺省 100）
 }
 
 // ImportCodexOAuthAccounts 批量导入 codex-oauth 凭据（ServerInterface 依赖面）：
@@ -56,41 +55,43 @@ type codexImportRow struct {
 // 错配 → 400 整批拒绝**，防违反 ext 类型 == 模板类型的硬不变量 ext_codex.go:238）；
 // 逐行类型特定校验（必填/成对/expires RFC3339/email 格式——失败 → 行级 failed
 // 收集继续）；共享核心落库。
-func (s *Service) ImportCodexOAuthAccounts(ctx context.Context, items []domain.CodexOAuthImportItem, tplID, groupID *int64) (*domain.ImportResult, error) {
-	if err := s.checkCodexImportTemplate(ctx, tplID, credential.TypeCodexOAuth); err != nil {
-		return nil, err
-	}
-	res := &domain.ImportResult{}
-	rows := make([]codexImportRow, 0, len(items))
-	for i, it := range items {
-		row, err := codexOAuthRow(i, it)
-		if err != nil {
-			res.Failed = append(res.Failed, domain.ImportFailedItem{Index: i, Error: err.Error()})
-			continue
-		}
-		rows = append(rows, row)
-	}
-	s.importCodexAccounts(ctx, rows, *tplID, groupID, credential.TypeCodexOAuth, res)
-	return res, nil
+func (s *Service) ImportCodexOAuthAccounts(ctx context.Context, items []domain.CodexOAuthImportItem, tplID, groupID *int64, cfg domain.CodexImportConfig) (*domain.ImportResult, error) {
+	return importCodexBatch(s, ctx, items, codexOAuthRow, tplID, groupID, credential.TypeCodexOAuth, cfg)
 }
 
 // ImportCodexPATAccounts 批量导入 codex-pat 凭据（结构同 oauth 端点；模板
 // credential_type 必须 == codex-pat）。
-func (s *Service) ImportCodexPATAccounts(ctx context.Context, items []domain.CodexPATImportItem, tplID, groupID *int64) (*domain.ImportResult, error) {
-	if err := s.checkCodexImportTemplate(ctx, tplID, credential.TypeCodexPAT); err != nil {
+func (s *Service) ImportCodexPATAccounts(ctx context.Context, items []domain.CodexPATImportItem, tplID, groupID *int64, cfg domain.CodexImportConfig) (*domain.ImportResult, error) {
+	return importCodexBatch(s, ctx, items, codexPATRow, tplID, groupID, credential.TypeCodexPAT, cfg)
+}
+
+// importCodexBatch oauth/pat 两导入端点的共享核心——唯一差异即入参 credType
+// （模板类型校验用）与 rowFn（行解析器：类型特定校验 → 共享行形态）。模板顶层
+// 校验 → 配置校验 → 逐行解析（行级失败收集继续）→ 共享落库核心
+// importCodexAccounts。泛型 T = 端点 item 类型（CodexOAuthImportItem /
+// CodexPATImportItem）；Go 不允许方法带类型参数，故为包级函数（首参 *Service）。
+func importCodexBatch[T any](s *Service, ctx context.Context, items []T, rowFn func(int, T) (codexImportRow, error), tplID, groupID *int64, credType credential.Type, cfg domain.CodexImportConfig) (*domain.ImportResult, error) {
+	if err := s.checkCodexImportTemplate(ctx, tplID, credType); err != nil {
+		return nil, err
+	}
+	if err := validateCodexImportConfig(cfg); err != nil {
 		return nil, err
 	}
 	res := &domain.ImportResult{}
 	rows := make([]codexImportRow, 0, len(items))
 	for i, it := range items {
-		row, err := codexPATRow(i, it)
+		row, err := rowFn(i, it)
 		if err != nil {
 			res.Failed = append(res.Failed, domain.ImportFailedItem{Index: i, Error: err.Error()})
 			continue
 		}
 		rows = append(rows, row)
 	}
-	s.importCodexAccounts(ctx, rows, *tplID, groupID, credential.TypeCodexPAT, res)
+	s.importCodexAccounts(ctx, rows, *tplID, groupID, credType, cfg, res)
+	// 供应商面导入新建归属本人账号 ⇒ 财务视图换代（§4.6.3 发布屏障）。
+	if sc := domain.AccountScopeFrom(ctx); sc.Set {
+		s.reloadSupplierView(ctx)
+	}
 	return res, nil
 }
 
@@ -114,6 +115,8 @@ func (s *Service) checkCodexImportTemplate(ctx context.Context, tplID *int64, en
 }
 
 // codexOAuthRow oauth 行类型特定校验 → 共享行形态（失败返回行级错误文案）。
+// codex_account_id 必填（缺省补全由 handler 导入映射层先行；补全后仍空 → 行级
+// failed——放宽 = 允许缺省提供，不等于允许空入库，幂等键 email+account_id 不变）。
 func codexOAuthRow(index int, it domain.CodexOAuthImportItem) (codexImportRow, error) {
 	if !validEmail(it.CodexEmail) {
 		return codexImportRow{}, errors.New("codex_email 必填且须为合法邮箱")
@@ -135,15 +138,14 @@ func codexOAuthRow(index int, it domain.CodexOAuthImportItem) (codexImportRow, e
 	row := codexImportRow{
 		index: index, email: it.CodexEmail, accountID: it.CodexAccountID,
 		oauthToken: it.CodexOAuthToken, oauthRT: it.CodexOAuthRefreshToken, oauthExpires: expires,
-		maxConc: 25, weight: 100,
+		maxConc: 25,
 	}
-	if err := applyCodexImportConfig(&row, it.MaxConcurrency, it.Weight); err != nil {
-		return codexImportRow{}, err
-	}
+	applyCodexImportConfig(&row, it.MaxConcurrency)
 	return row, nil
 }
 
 // codexPATRow pat 行类型特定校验 → 共享行形态（失败返回行级错误文案）。
+// codex_account_id 必填（缺省补全由 handler 导入映射层先行；语义同 oauth 行）。
 func codexPATRow(index int, it domain.CodexPATImportItem) (codexImportRow, error) {
 	if !validEmail(it.CodexEmail) {
 		return codexImportRow{}, errors.New("codex_email 必填且须为合法邮箱")
@@ -156,26 +158,58 @@ func codexPATRow(index int, it domain.CodexPATImportItem) (codexImportRow, error
 	}
 	row := codexImportRow{
 		index: index, email: it.CodexEmail, accountID: it.CodexAccountID, patKey: it.CodexPATKey,
-		maxConc: 25, weight: 100,
+		maxConc: 25,
 	}
-	if err := applyCodexImportConfig(&row, it.MaxConcurrency, it.Weight); err != nil {
-		return codexImportRow{}, err
-	}
+	applyCodexImportConfig(&row, it.MaxConcurrency)
 	return row, nil
 }
 
-// applyCodexImportConfig 配置面缺省/范围归一（对齐 validateAccount 既有边界：
-// weight < 0 → 行级失败；max_concurrency < 1 → 归一缺省——导入面 25 覆盖账号
-// 表默认 8；weight 0 合法保留）。nil = 未提供 → 缺省。
-func applyCodexImportConfig(row *codexImportRow, maxConc, weight *int) error {
+// applyCodexImportConfig 配置面缺省/范围归一（对齐 validateAccountPatch 既有边界：
+// max_concurrency < 1 → 归一缺省——导入面 25 覆盖账号表默认 8）。nil = 未提供 → 缺省。
+func applyCodexImportConfig(row *codexImportRow, maxConc *int) {
 	if maxConc != nil && *maxConc >= 1 {
 		row.maxConc = *maxConc
 	}
-	if weight != nil {
-		if *weight < 0 {
-			return errors.New("weight 不能为负")
+}
+
+// validateCodexImportConfig 导入面 body 级配置校验（**整批**语义：非法 → 400
+// 整批拒绝，与模板类型错配同级——配置对全批生效、无行级归属）。边界与
+// validateAccountPatch 一致（倍率 0–100000 bp；缓存域复用 validateCacheDomain）。
+func validateCodexImportConfig(cfg domain.CodexImportConfig) error {
+	if cfg.UpstreamCostMultiplierBp != nil && (*cfg.UpstreamCostMultiplierBp < 0 || *cfg.UpstreamCostMultiplierBp > 100000) {
+		return ErrInvalidInput
+	}
+	if cfg.CacheDomain != nil && *cfg.CacheDomain != "" {
+		if err := validateCacheDomain(*cfg.CacheDomain); err != nil {
+			return ErrInvalidInput
 		}
-		row.weight = *weight
+	}
+	return nil
+}
+
+// codexImportEnabled 新建账号启停：缺省 true（与创建面默认一致）。
+func codexImportEnabled(cfg domain.CodexImportConfig) bool {
+	if cfg.Enabled != nil {
+		return *cfg.Enabled
+	}
+	return true
+}
+
+// codexImportMultiplierBp 新建账号采购成本倍率（万分数）：缺省 ×1（10000）；
+// 提供则精确落值——含 0（免费，与"未提供"可区分）。
+func codexImportMultiplierBp(cfg domain.CodexImportConfig) *int {
+	if cfg.UpstreamCostMultiplierBp != nil {
+		return cfg.UpstreamCostMultiplierBp
+	}
+	v := 10000
+	return &v
+}
+
+// codexImportCacheDomain 新建账号共享缓存域：缺省/空串 = 账号私有域（nil）。
+func codexImportCacheDomain(cfg domain.CodexImportConfig) *string {
+	if cfg.CacheDomain != nil && *cfg.CacheDomain != "" {
+		v := *cfg.CacheDomain
+		return &v
 	}
 	return nil
 }
@@ -185,10 +219,10 @@ func applyCodexImportConfig(row *codexImportRow, maxConc, weight *int) error {
 // 整批——整批不原子，响应恒 200 语义由 handler 组装）。批末一次 invalidate +
 // publish（gids = imported 行归组 ∪ updated 行既有分组——凭据变更须重载调度器
 // 组快照，新凭据经 AccountExt 快照生效）。
-func (s *Service) importCodexAccounts(ctx context.Context, rows []codexImportRow, tplID int64, groupID *int64, credType credential.Type, res *domain.ImportResult) {
+func (s *Service) importCodexAccounts(ctx context.Context, rows []codexImportRow, tplID int64, groupID *int64, credType credential.Type, cfg domain.CodexImportConfig, res *domain.ImportResult) {
 	var gids []int64
 	for _, row := range rows {
-		imported, accountID, err := s.importCodexRow(ctx, row, tplID, groupID, credType)
+		imported, accountID, err := s.importCodexRow(ctx, row, tplID, groupID, credType, cfg)
 		if err != nil {
 			res.Failed = append(res.Failed, domain.ImportFailedItem{Index: row.index, Error: err.Error()})
 			continue
@@ -219,7 +253,7 @@ func (s *Service) importCodexAccounts(ctx context.Context, rows []codexImportRow
 // importCodexRow 单行导入（组合键查重 → imported/updated/跨类型行级 failed）。
 // 返回 imported=true 新建 / false 凭据更新（accountID 仅 updated 路径有效——
 // invalidate 组并集用）；错误 = 行级失败原因。
-func (s *Service) importCodexRow(ctx context.Context, row codexImportRow, tplID int64, groupID *int64, credType credential.Type) (imported bool, accountID int64, err error) {
+func (s *Service) importCodexRow(ctx context.Context, row codexImportRow, tplID int64, groupID *int64, credType credential.Type, cfg domain.CodexImportConfig) (imported bool, accountID int64, err error) {
 	cur, err := s.store.FindAccountExtByCodexKey(ctx, row.email, row.accountID)
 	if err != nil && !errors.Is(err, repository.ErrNotFound) {
 		return false, 0, err
@@ -248,11 +282,20 @@ func (s *Service) importCodexRow(ctx context.Context, row codexImportRow, tplID 
 	// 不存在 → imported：单行事务。直调 tx 版 repo 原始方法——不调
 	// service.CreateAccount（invalidate/publish 副作用面在事务回滚时已发）；
 	// 副作用批末一次（importCodexAccounts）。
+	// 归属（§2.5）：供应商面导入恒写 JWT 本人（作用域注入）；管理面 = 平台自有。
+	var supplierUID int64
+	if sc := domain.AccountScopeFrom(ctx); sc.Set {
+		supplierUID = sc.OwnerUID
+	}
 	identity := NewCodexIdentity()
 	err = s.store.WithTx(ctx, func(tx repository.TxStore) error {
 		acc, err := tx.CreateAccount(ctx, &domain.Account{
-			Name: row.email, TemplateID: tplID,
-			Weight: row.weight, MaxConcurrency: row.maxConc, // 显式写缺省（25/100）——不依赖表默认 8
+			Name: row.email, TemplateID: tplID, Enabled: codexImportEnabled(cfg),
+			MaxConcurrency: row.maxConc, // 显式写缺省（25）——不依赖表默认 8
+			// 配置面（body 级）只作用于新建行——updated 路径只更新凭据列。
+			UpstreamCostMultiplierBp: codexImportMultiplierBp(cfg),
+			CacheDomain:              codexImportCacheDomain(cfg),
+			SupplierUserID:           supplierUID,
 		})
 		if err != nil {
 			return err
@@ -288,20 +331,29 @@ func (s *Service) importCodexRow(ctx context.Context, row codexImportRow, tplID 
 }
 
 // updateCodexCredentials updated 路径凭据列部分更新（oauth 三列 / pat 单列——
-// identity/email/并发/权重/归属零触碰）。
+// identity/email/并发/权重/归属零触碰），管理员 fenced：CAS expectedRevision +1。
+// SDK 内部刷新继续使用 WriteOAuthRotation（unfenced）。
 func (s *Service) updateCodexCredentials(ctx context.Context, accountID int64, row codexImportRow, credType credential.Type) error {
-	if credType == credential.TypeCodexOAuth {
-		return s.store.WriteOAuthRotation(ctx, accountID, row.oauthToken, row.oauthRT, row.oauthExpires)
+	acc, err := s.store.GetAccount(ctx, accountID)
+	if err != nil {
+		return mapRepoErr(err)
 	}
-	return s.store.WritePATKey(ctx, accountID, row.patKey)
+	expected := acc.LifecycleRevision
+	if credType == credential.TypeCodexOAuth {
+		return mapRepoErr(s.store.AdminWriteOAuthRotationCAS(ctx, accountID, expected, row.oauthToken, row.oauthRT, row.oauthExpires))
+	}
+	return mapRepoErr(s.store.AdminWritePATKeyCAS(ctx, accountID, expected, row.patKey))
 }
 
-// importKeyConflictErr 唯一索引冲突 → 行级 failed 文案（并发同键兜底面：
-// ent 透传 *pgconn.PgError Code=23505）。
+// importKeyConflictErr 唯一索引冲突 → 行级 failed 文案（并发同键兜底面；
+// 也覆盖**跨归属同组合键**：供应商面查重带作用域 ⇒ 他人归属的同键行查不到，
+// 落到 INSERT 撞全局唯一索引 (codex_email, codex_account_id) ⇒ 23505）。
+// 文案**不得回显他人 id**：判据里只出现本次请求自带的 email/account_id（那是
+// 调用方自己的输入），归属与行 id 一律不出现——越域探针拿不到任何他人信息。
 func importKeyConflictErr(err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-		return errors.New("键冲突：同 (codex_email, codex_account_id) 账号并发导入，本行未写入")
+		return errors.New("键冲突：同 (codex_email, codex_account_id) 账号已存在或并发导入，本行未写入")
 	}
 	return err
 }

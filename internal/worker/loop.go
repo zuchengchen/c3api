@@ -52,9 +52,14 @@ func Loop(ctx context.Context, name string, log *logx.Logger, fn func(context.Co
 	}
 }
 
-// GoLoop spawns Loop in a new goroutine.
-func GoLoop(ctx context.Context, name string, log *logx.Logger, fn func(context.Context)) {
-	go Loop(ctx, name, log, fn)
+// GoLoop spawns Loop in a new goroutine and returns a done channel closed when Loop exits.
+func GoLoop(ctx context.Context, name string, log *logx.Logger, fn func(context.Context)) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		Loop(ctx, name, log, fn)
+	}()
+	return done
 }
 
 // Recover runs fn with one-shot panic recovery and error log (no restart).

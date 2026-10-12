@@ -4,7 +4,7 @@
 
 package billing
 
-// 分表设计并行隔离（用户裁决 2026-08-11）：计费游标消费者（F2 后无内存队列——
+// 分表设计并行隔离（用户裁决 2026-08-11）：计费游标消费者（后无内存队列——
 // 消费 DB 游标扣费）与 errlog worker（错误审计明细 → err_logs）在代理内并行
 // 运行，两路无共享可变状态（Flusher 游标周期 vs ErrLogWorker 队列）。并发喂入
 // 两路 → 各自排空计数精确，互不串路、互不阻塞。
@@ -52,7 +52,7 @@ func TestFlusherErrlogWorkerParallelIsolated(t *testing.T) {
 		store.seedRow(int64(i), int64(i%4+1), 100, time.Now())
 		store.setBalance(int64(i%4+1), 1_000_000)
 	}
-	f := newFlusherWith(store, map[int64]int64{1: 1e9, 2: 1e9, 3: 1e9, 4: 1e9})
+	f := newFlusherWith(store, map[int64]int64{1: 1e9, 2: 1e9, 3: 1e9, 4: 1e9}, nil)
 
 	errs := &captureErrInserter{}
 	ew := usage.NewErrLogWorker(usage.ErrLogConfig{QueueSize: 4096, FlushInterval: time.Hour}, errs, nil)

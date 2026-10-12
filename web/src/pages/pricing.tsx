@@ -210,7 +210,7 @@ function VariantsDialog({
     }
     if (r.dow_mask != null) {
       const bools = dowMaskToBools(r.dow_mask)
-      const labels = bools.map((v, i) => (v ? t(`pricing.variants.${DOW_KEYS[i]}`) : null)).filter((v): v is string => v !== null)
+      const labels = bools.flatMap((v, i) => (v ? [t(`pricing.variants.${DOW_KEYS[i]}`)] : []))
       if (labels.length) parts.push(labels.join(','))
     }
     return parts.length ? parts.join(' · ') : '—'
@@ -480,7 +480,7 @@ function VariantsDialog({
                   <Input id="var-call" type="number" min={0} step="any" value={setPricePerCallStr} onChange={e => { setSetPricePerCallStr(e.target.value); setRowErr(null) }} placeholder="0.01" />
                 </div>
               ) : mode === 'image' ? (
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div className="space-y-1.5">
                     <Label htmlFor="var-img-in">{t('pricing.variants.setImgInTokLabel')}</Label>
                     <Input id="var-img-in" type="number" min={0} step="any" value={setImgInStr} onChange={e => { setSetImgInStr(e.target.value); setRowErr(null) }} placeholder="0.001" />
@@ -495,7 +495,7 @@ function VariantsDialog({
                   </div>
                 </div>
               ) : (
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div className="space-y-1.5">
                     <Label htmlFor="var-in">{t('pricing.variants.setInputLabel')}</Label>
                     <Input id="var-in" type="number" min={0} step="any" value={setInputStr} onChange={e => { setSetInputStr(e.target.value); setRowErr(null) }} placeholder="0.001" />
@@ -547,7 +547,7 @@ function VariantsDialog({
                 </div>
                 <div className="space-y-1.5">
                   <p className="text-xs font-medium text-muted-foreground">{t('pricing.variants.groupTokenRange')}</p>
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                     <div className="space-y-1.5">
                       <Label htmlFor="var-ctx-min">{t('pricing.variants.ctxMinLabel')}</Label>
                       <Input id="var-ctx-min" type="number" min={0} step={1} value={ctxMinStr} onChange={e => { setCtxMinStr(e.target.value); setRowErr(null) }} placeholder="0" />
@@ -560,7 +560,7 @@ function VariantsDialog({
                 </div>
                 <div className="space-y-1.5">
                   <p className="text-xs font-medium text-muted-foreground">{t('pricing.variants.groupWindow')}</p>
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                     <div className="space-y-1.5">
                       <Label htmlFor="var-time-start">{t('pricing.variants.timeStartLabel')}</Label>
                       <Input id="var-time-start" value={timeStart} onChange={e => { setTimeStart(e.target.value); setRowErr(null) }} placeholder="09:00" />
@@ -842,7 +842,7 @@ function PricingListShell({ list, header, children, empty }: PricingListShellPro
         <>
           {/* 玻璃与滚动分离（同 logs.tsx:502 规范帧）：ScrollArea 承载外框与横向滚动，
               Table 容器中性化；纵向滚动仍归 AppShell 主滚动区，故无本地 max-h */}
-          <ScrollArea data-od-id={`table-scroll-pricing-${list.mode}`} className="rounded-[14px] border border-transparent bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] after:pointer-events-none after:absolute after:inset-0 after:z-20 after:rounded-[14px] after:border after:border-[rgba(19,45,83,0.26)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:after:border-[rgba(148,180,220,0.32)]" showHorizontal>
+          <ScrollArea data-od-id={`table-scroll-pricing-${list.mode}`} className="rounded-[14px] border border-[rgba(19,45,83,0.26)] bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:border-[rgba(148,180,220,0.32)]" showHorizontal>
             <Table className="min-w-[1400px]" containerClassName="overflow-x-visible border-0 shadow-none rounded-none bg-transparent backdrop-blur-none">
               <TableHeader>
                 <TableRow>{header}</TableRow>
@@ -1176,7 +1176,7 @@ export default function PricingPage() {
                 <p className="text-xs text-muted-foreground">{t('pricing.takeoverHint')}</p>
               )}
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="space-y-1.5">
                 <Label htmlFor="pf-input">{t('pricing.promptLabel')}</Label>
                 <Input id="pf-input" type="number" min={0} step="any" value={form.inputPerM} onChange={e => { setForm(f => ({ ...f, inputPerM: e.target.value })); setFormErr(null) }} />
@@ -1301,7 +1301,7 @@ export default function PricingPage() {
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
             <DialogTitle>{t('pricing.deleteTitle')}</DialogTitle>
-            <DialogDescription>{t('pricing.deleteDesc', { model: deleting?.Model })}</DialogDescription>
+            <DialogDescription>{t('pricing.deleteDesc', { model: deleting?.Model ?? '' })}</DialogDescription>
           </DialogHeader>
           {del.isError && errMsg(del.error) && (
             <p className="text-sm text-destructive">{errMsg(del.error)}</p>
@@ -1319,7 +1319,7 @@ export default function PricingPage() {
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
             <DialogTitle>{t('pricing.deleteTitle')}</DialogTitle>
-            <DialogDescription>{t('pricing.deleteDesc', { model: imgDeleting?.Model })}</DialogDescription>
+            <DialogDescription>{t('pricing.deleteDesc', { model: imgDeleting?.Model ?? '' })}</DialogDescription>
           </DialogHeader>
           {imgDel.isError && errMsg(imgDel.error) && (
             <p className="text-sm text-destructive">{errMsg(imgDel.error)}</p>
@@ -1337,7 +1337,7 @@ export default function PricingPage() {
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
             <DialogTitle>{t('pricing.deleteTitle')}</DialogTitle>
-            <DialogDescription>{t('pricing.deleteDesc', { model: fnDeleting?.Model })}</DialogDescription>
+            <DialogDescription>{t('pricing.deleteDesc', { model: fnDeleting?.Model ?? '' })}</DialogDescription>
           </DialogHeader>
           {fnDel.isError && errMsg(fnDel.error) && (
             <p className="text-sm text-destructive">{errMsg(fnDel.error)}</p>

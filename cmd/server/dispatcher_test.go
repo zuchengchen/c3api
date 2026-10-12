@@ -33,6 +33,11 @@ func (r *recSched2) InvalidateGroup(g int64) {
 	r.groups = append(r.groups, g)
 	r.mu.Unlock()
 }
+func (r *recSched2) InvalidateGroups(ids []int64) {
+	r.mu.Lock()
+	r.groups = append(r.groups, ids...)
+	r.mu.Unlock()
+}
 func (r *recSched2) InvalidateAllSyncCtx(ctx context.Context) error {
 	r.mu.Lock()
 	r.full++
@@ -78,8 +83,9 @@ func (r *recBal2) relCalls() int  { r.mu.Lock(); defer r.mu.Unlock(); return r.r
 func (r *recBal2) multCalls() int { r.mu.Lock(); defer r.mu.Unlock(); return r.mult }
 
 type recSettings2 struct {
-	mu sync.Mutex
-	n  int
+	mu       sync.Mutex
+	n        int
+	pricingN int
 }
 
 func (r *recSettings2) ReloadSettings(ctx context.Context) error {
@@ -89,6 +95,16 @@ func (r *recSettings2) ReloadSettings(ctx context.Context) error {
 	return nil
 }
 func (r *recSettings2) calls() int { r.mu.Lock(); defer r.mu.Unlock(); return r.n }
+
+// ReloadPricingCtx 定价变更走 dispatcher 直连（settings 同款同步路径，
+// 不入去抖器），复用同一 fake 目标记录调用。
+func (r *recSettings2) ReloadPricingCtx(ctx context.Context) error {
+	r.mu.Lock()
+	r.pricingN++
+	r.mu.Unlock()
+	return nil
+}
+func (r *recSettings2) pricingCalls() int { r.mu.Lock(); defer r.mu.Unlock(); return r.pricingN }
 
 type recRules2 struct {
 	mu sync.Mutex
@@ -249,7 +265,7 @@ func TestDispatcherApplyMapping(t *testing.T) {
 	t.Run("Settings", func(t *testing.T) {
 		rg := newTestDispatcher(t)
 		rg.d.Apply(context.Background(), notify.Change{Settings: true})
-		// #36 时序（R2 M-1）：settings 快照同步刷新（Apply 内，非去抖 flush——
+		// 时序：settings 快照同步刷新（Apply 内，非去抖 flush——
 		// scope 重载必须读到新 N）。
 		require.Equal(t, 1, rg.settings.calls(), "settings → settings 快照同步重载")
 		// 注册表按 ScopeSettings 精确重载（auth 即时生效，不等待去抖窗口）。
@@ -265,6 +281,14 @@ func TestDispatcherApplyMapping(t *testing.T) {
 		rg.d.Apply(context.Background(), notify.Change{Rules: true})
 		waitFlush(t, func() bool { return rg.rules.calls() > 0 })
 		require.Equal(t, 1, rg.rules.calls(), "rules → 规则表全量重载")
+	})
+
+	t.Run("Pricing", func(t *testing.T) {
+		rg := newTestDispatcher(t)
+		rg.d.Apply(context.Background(), notify.Change{Pricing: true})
+		// 与 settings 同款：同步直连 svc.ReloadPricingCtx，不入去抖器。
+		require.Equal(t, 1, rg.settings.pricingCalls(), "pricing → 定价快照全量重载（同步直连）")
+		require.Equal(t, 0, rg.settings.calls(), "pricing 不触发 settings 重载")
 	})
 
 	t.Run("DegradedFullWithGroups", func(t *testing.T) {
@@ -291,6 +315,7 @@ func TestDispatcherApplyMapping(t *testing.T) {
 		require.Equal(t, 0, rg.bal.multCalls())
 		require.Equal(t, 0, rg.settings.calls())
 		require.Equal(t, 0, rg.rules.calls())
+		require.Equal(t, 0, rg.settings.pricingCalls())
 		require.Equal(t, 0, rg.snapAuth.calls(), "空变更不触发注册表 scope 重载")
 	})
 }
@@ -324,14 +349,14 @@ func TestDispatcherApplyMergesSingleFlush(t *testing.T) {
 	require.Equal(t, 1, rg.auth.calls(), "远端 + 本地同窗口合并为一次 reload")
 }
 
-// errSettings2 ReloadSettings 恒失败（G1-1 Apply 失败注入）。
+// errSettings2 ReloadSettings 恒失败（Apply 失败注入）。
 type errSettings2 struct{ recSettings2 }
 
 func (e *errSettings2) ReloadSettings(ctx context.Context) error {
 	return errors.New("settings boom")
 }
 
-// errSnap2 快照 Reload 恒失败但记录调用（G1-1 Apply 失败注入）。
+// errSnap2 快照 Reload 恒失败但记录调用（Apply 失败注入）。
 type errSnap2 struct {
 	recSnap
 }
@@ -341,7 +366,7 @@ func (e *errSnap2) Reload(ctx context.Context) error {
 	return errors.New("snapshot boom")
 }
 
-// TestDispatcherApplyFailureTolerated G1-1（p2-02/G-P2-1）：Apply 无返回值——
+// TestDispatcherApplyFailureTolerated：Apply 无返回值——
 // 内部失败（settings 同步重载失败 + 注册表 scope 快照重载失败）独立 Warn 消
 // 化，不透传：无 panic，同批其他变更位仍被吞入去抖（事件提示语义不破坏）。
 func TestDispatcherApplyFailureTolerated(t *testing.T) {
@@ -387,6 +412,9 @@ func (s *settingsNStub) ReloadSettings(ctx context.Context) error {
 }
 func (s *settingsNStub) N() int { return int(s.snapN.Load()) }
 
+// ReloadPricingCtx pricing 直连面（settings 同款）；本桩不关心定价，no-op。
+func (s *settingsNStub) ReloadPricingCtx(ctx context.Context) error { return nil }
+
 // recSnapN auth 快照桩：Reload 时刻记录 settings 桩快照 N——模拟 gate.reload 在
 // auth.Reload 内（LoadKeys/LoadUsers 之后）现读 provider 的时序，期间快照不被
 // 改动，观测等价。
@@ -406,7 +434,7 @@ func (r *recSnapN) Reload(ctx context.Context) error {
 }
 func (r *recSnapN) observedN() int { r.mu.Lock(); defer r.mu.Unlock(); return r.lastN }
 
-// TestDispatcherSettingsTiming settings 变更时序（R2 M-1 #36 即时重算）：
+// TestDispatcherSettingsTiming settings 变更时序（即时重算）：
 // settings 旧 N → 远端变更落库（dbN 新 N）→ Apply(Change{Settings:true}) →
 // auth.Reload 必须读到新 N。顺序保证：settings 快照先同步刷新、scope 精确重载
 // 后执行——修复前仅 Mark（去抖 200ms 后才 flush
@@ -484,7 +512,7 @@ func TestDispatcherFullRefresh(t *testing.T) {
 	})
 }
 
-// TestDispatcherFullRefreshFirstConnectSkip E2 启动双刷（E-P2-4）：main 启动
+// TestDispatcherFullRefreshFirstConnectSkip 启动双刷：main 启动
 // 首刷全成功（ReloadAll 返回空 map）置位 bootLoaded → 首连 FullRefresh 跳过
 // 五路 ReloadAll（健康启动下第二遍纯冗余消除，ReloadAll 至多一次）、仅补
 // ReloadSettings；断线重连（第二次调用）恒全量刷新不变。
@@ -529,4 +557,28 @@ func TestDispatcherFullRefreshBootFailedFallback(t *testing.T) {
 	require.Equal(t, 2, rg.snapAuth.calls())
 	require.Equal(t, 2, rg.snapSched.calls())
 	require.Equal(t, 2, rg.settings.calls())
+}
+
+// TestNotifyDispatcherRoutingDirtySurvivesOversizePayload 端到端（发布守卫 →
+// 去抖器 → sched 重载）验证 routing dirty 不丢：账号静态变更风暴的 Groups 载荷
+// 超 6KB → notify.Marshal 降级置 Templates=true → dispatcher.Apply → 去抖器把
+// 组级定向升格为 sched 全量重载（全量 ⊇ 组级），生产侧全量重载尾部武装
+// RequestCompile（scheduler 侧对偶见 routing_dirty_test）。断言经真实 Marshal/
+// Unmarshal 线格式往返，不直接构造降级 Change。
+func TestNotifyDispatcherRoutingDirtySurvivesOversizePayload(t *testing.T) {
+	rg := newTestDispatcher(t)
+	groups := make([]int64, 2000) // ~20KB > 6KB 守卫阈值
+	for i := range groups {
+		groups[i] = int64(10000000 + i)
+	}
+	payload := notify.Marshal(notify.Change{V: 1, Groups: groups})
+	ch, err := notify.Unmarshal(payload)
+	require.NoError(t, err)
+	require.True(t, ch.Templates, "降级载荷必须保留全量重载触发位（routing dirty 载体）")
+
+	rg.d.Apply(context.Background(), ch)
+	waitFlush(t, func() bool { f, _ := rg.sched.counts(); return f > 0 })
+	full, grp := rg.sched.counts()
+	require.Equal(t, 1, full, "routing dirty 经 sched 全量重载收敛")
+	require.Empty(t, grp, "全量 ⊇ 组级（去抖器 merge，不重复定向）")
 }

@@ -2,7 +2,7 @@
 // Dual-licensed: AGPL-3.0-or-later (open source) or commercial license (closed-source
 // deployment exemption); see LICENSE and LICENSE.commercial. Copyright (c) 2026 is7Qin.
 
-// Package protoconv 提供网关级协议转换（W5，只补差语义）：客户端协议请求体
+// Package protoconv 提供网关级协议转换（只补差语义）：客户端协议请求体
 // → 模板协议请求体（ConvertRequest）、模板协议响应 → 客户端协议响应
 // （ConvertResponse 非流式 JSON / StreamMapper 流式 SSE 事件映射）。
 //
@@ -10,13 +10,14 @@
 // OpenAI/Anthropic SDK 零耦合（缺名帧事件名推断与 sserelay 共用
 // InferEventName——热路径零分配锚定 + 回退全量解码）；四方向分派按
 // groups.protocol_convert 快照值（off 不经过本包——热路径分支在
-// internal/proxy 判定）；WS 帧流转换不做（resp-ws 1:1 透传，W3 范围）。
+// internal/proxy 判定）；WS 帧流转换不做（resp-ws 1:1 透传 范围）。
 package protoconv
 
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/pkg/sserelay"
@@ -57,7 +58,7 @@ func ConvertResponse(body []byte, dir domain.ProtocolConvert) ([]byte, error) {
 
 // NewStreamMapper 构造有状态的流式响应事件映射器（每 SSE 流一个实例；
 // 跨事件状态：id/model、用量累积、mess→resp 的块级输出累积）。块级累积
-// map（blockStarted 等）懒初始化（ensureBlocks，评审 I-4）——chat→resp 等
+// map（blockStarted 等）懒初始化（ensureBlocks）——chat→resp 等
 // 方向从不使用，免每流 6 个 map 分配。
 func NewStreamMapper(dir domain.ProtocolConvert) *StreamMapper {
 	return &StreamMapper{dir: dir}
@@ -73,6 +74,107 @@ func (m *StreamMapper) ensureBlocks() {
 		m.argsByIndex = make(map[int64]string)
 		m.fcNames = make(map[int64]string)
 		m.fcIDs = make(map[int64]string)
+		m.itemIndex = make(map[int64]int64)
+		m.owner = make(map[int64]int64)
+	}
+}
+
+// contentIndex 把 resp output_index 分配成 anthropic content index。
+// 同一 output_index 只分配一次：优先用 output_index 本身，已被占用则用
+// max(已占用)+1。output_index 缺省为 0（调用方 intOr0）。
+func (m *StreamMapper) contentIndex(outputIndex int64) int64 {
+	if m.itemIndex == nil {
+		m.itemIndex = make(map[int64]int64)
+		m.owner = make(map[int64]int64)
+	}
+	if idx, ok := m.itemIndex[outputIndex]; ok {
+		return idx
+	}
+	idx := outputIndex
+	if holder, taken := m.owner[idx]; taken && holder != outputIndex {
+		idx = m.nextIndex
+	}
+	for {
+		if holder, taken := m.owner[idx]; !taken || holder == outputIndex {
+			break
+		}
+		idx++
+	}
+	m.itemIndex[outputIndex] = idx
+	m.owner[idx] = outputIndex
+	if idx >= m.nextIndex {
+		m.nextIndex = idx + 1
+	}
+	return idx
+}
+
+// --- Responses / Anthropic usage 口径（唯一真相；改动前必读）---
+//
+// 网关内部 Responses（resp）侧 usage.input_tokens 恒为**总量（gross）**：
+//
+//	input_tokens = uncached_input + cache_read + cache_write
+//
+// input_tokens_details.cached_tokens（= cache_read）与
+// input_tokens_details.cache_write_tokens（= cache_write）都是 input_tokens 的
+// **子集**（cached ⊆ input、cache_write ⊆ input）。该包含关系由 codex 源码
+// 证实：codex-rs/protocol/src/protocol.rs:2426-2432 令
+// non_cached_input() = (input_tokens - cached_input_tokens).max(0)（cached ⊆
+// input）；codex-rs/codex-api/src/sse/responses.rs:128-143 把
+// input_tokens_details.cached_tokens / cache_write_tokens 作为 input_tokens 的
+// 明细子字段（其测试用例 input_tokens=100 配 cached=40 / cache_write=60）。
+//
+// Anthropic Messages（mess）侧相反：input_tokens 是**净额（net，不含缓存）**，
+// cache_read_input_tokens / cache_creation_input_tokens 是独立字段。故 resp↔mess
+// 必须换算（此前 resp→mess 不减、mess→resp 相加，往返把 input_tokens 从 10
+// 膨胀到 17——P0-1）：
+//
+//	resp→mess：net = input_tokens - cache_read - cache_write（下限 0）
+//	mess→resp：gross = input_tokens + cache_read + cache_write
+//
+// 计费侧同此口径（internal/proxy/usage_extract.go、internal/billing/cost.go）：
+// 按 net（uncached）计 input 单价，cache_read / cache_write 各自单价——消除
+// cache_write 被 input 价与 cache-write 价双重计费（P0-2）。
+
+// respInputGross 由 Anthropic 侧净额 + 缓存分量重建 resp（gross）input_tokens。
+func respInputGross(net, cacheRead, cacheWrite int64) int64 {
+	return net + cacheRead + cacheWrite
+}
+
+// respInputNet 由 resp（gross）input_tokens 反推 Anthropic 侧净额（下限 0——
+// 病态上游 input_tokens < cache_read + cache_write 时钳 0 防负值；口径见上）。
+func respInputNet(gross, cacheRead, cacheWrite int64) int64 {
+	net := gross - cacheRead - cacheWrite
+	if net < 0 {
+		return 0
+	}
+	return net
+}
+
+// messInputTotal Messages 净额 + cache_creation + cache_read → resp（gross）
+// input_tokens（口径见本文件上方「Responses / Anthropic usage 口径」）。
+func (m *StreamMapper) messInputTotal() int64 {
+	return respInputGross(m.it, m.cached, m.cacheCreate)
+}
+
+// setMessUsage 全量记录 Messages usage（message_start 首帧）：三项都写入
+// （缺失为 0）。
+func (m *StreamMapper) setMessUsage(u map[string]any) {
+	m.it = intOr0(u, "input_tokens")
+	m.cached = intOr0(u, "cache_read_input_tokens")
+	m.cacheCreate = intOr0(u, "cache_creation_input_tokens")
+}
+
+// mergeMessUsage 合并记录 Messages usage（message_delta 覆盖 message_start）：
+// 只覆盖出现的累计字段。
+func (m *StreamMapper) mergeMessUsage(u map[string]any) {
+	if _, ok := u["input_tokens"]; ok {
+		m.it = intOr0(u, "input_tokens")
+	}
+	if _, ok := u["cache_read_input_tokens"]; ok {
+		m.cached = intOr0(u, "cache_read_input_tokens")
+	}
+	if _, ok := u["cache_creation_input_tokens"]; ok {
+		m.cacheCreate = intOr0(u, "cache_creation_input_tokens")
 	}
 }
 
@@ -84,19 +186,28 @@ func (m *StreamMapper) ensureBlocks() {
 type StreamMapper struct {
 	dir domain.ProtocolConvert
 
-	started bool // 已发出首事件（防御重复的 created/start）
-	done    bool // 已发出终止帧（防御重复的 completed/stop）
-	id      string
-	model   string
-	created int64
-	it, ot  int64 // 用量（input/output tokens）
-	cached  int64 // cache_read / cached_tokens
-	reason  string
+	started     bool // 已发出首事件（防御重复的 created/start）
+	done        bool // 已发出终止帧（防御重复的 completed/stop）
+	id          string
+	model       string
+	created     int64
+	it, ot      int64 // 用量（input/output tokens；mess 侧 it 是未含缓存的 input_tokens）
+	cached      int64 // cache_read / cached_tokens
+	cacheCreate int64 // mess cache_creation_input_tokens（不计入 cached_tokens）
+	reason      string
+
+	// resp→mess：output_index → content index，以及 content index → 占用它的 output_index。
+	itemIndex map[int64]int64
+	owner     map[int64]int64
+	nextIndex int64
 
 	// 字节级帧组装复用缓冲（chat→resp 流式路径）：buf = 输出帧；dbuf =
-	// delta/usage 预组装。帧返回后下一帧覆盖，调用方不得跨帧保留。
+	// delta/usage 预组装；ubuf = completed 帧上从 dbuf 拷出的 usage，
+	// 避免 chatChunkFrame 覆盖 dbuf 前再分配一次。帧返回后下一帧覆盖，
+	// 调用方不得跨帧保留。
 	buf  []byte
 	dbuf []byte
+	ubuf []byte
 
 	// mess→resp（RespToMess）方向：块级累积状态。
 	blockStarted map[int64]bool
@@ -109,7 +220,7 @@ type StreamMapper struct {
 }
 
 // Map 把一个模板协议 SSE 事件映射为客户端协议帧；drop=true 丢弃该帧。
-// 缺 event: 名（data-only）帧不丢（P3）：data 为 JSON 对象且含字符串 type
+// 缺 event: 名（data-only）帧不丢：data 为 JSON 对象且含字符串 type
 // 字段时按该值推断事件名（resp/messages 帧 type 与事件名同值约定，非规范
 // 上游如仓库 fakeupstream /v1/responses 缺 event: 行），推断出 → 与具名帧
 // 同分派；无法推断（非 JSON / 无 type 字段）→ 原样透传 data 帧保留字节。
@@ -141,6 +252,43 @@ func (m *StreamMapper) Map(name string, data []byte) ([]byte, bool) {
 // itemID 合成 resp output item id（message item 专用；确定性，无需随机源）。
 func (m *StreamMapper) itemID(index int64) string {
 	return "msg_" + m.id + "_" + fmt.Sprint(index)
+}
+
+// BindableID 显式返回当前 mapper 已产出的**客户端可续接响应 id**（即映射帧
+// 中作为 response.id 内嵌的那个 id；resp→mess 方向取自上游 message.id），在首个
+// 携带 id 的事件（message_start）之前为空串。续接绑定的调用方在写出接缝处
+// 读取本方法，而非反向解析映射帧字节——映射帧的 response_id/嵌套结构不构成
+// 可绑定 id 的权威（连续绑定键必须与真实响应对象 id 同源）。
+func (m *StreamMapper) BindableID() string { return m.id }
+
+// Done 报告 mapper 是否已产出目标协议终止帧（completed / failed 事件置位——
+// 见各方向 map 的 m.done 去重）。codex converted 适配层在流末据此判定是否需
+// 补发终止帧（恰补一次：源协议仅 [DONE] 或无 [DONE] 正常 EOF 时 mapper 未产
+// 终止帧 → 补发）。
+func (m *StreamMapper) Done() bool { return m.done }
+
+// Finish 按方向返回**与目标 mapper 自产终止相同**的终止帧（流末补发用）。
+// 仅 codex converted 命中的两方向有定义：
+//   - MessToResp（client=Messages）→ mirror mapRespToMess 的 response.completed
+//     收尾：message_delta{stop_reason:"", stop_sequence:nil, usage:respUsageToMess(nil)}
+//     ++ message_stop；
+//   - ChatToResp（client=Chat）→ mirror mapRespToChat 终止：`data: [DONE]\n\n`。
+//
+// 其余方向 → nil（非 codex native converted 不在适配层覆盖内）。调用方须先查
+// Done()，仅在目标终止帧尚未产生时补发。
+func (m *StreamMapper) Finish() []byte {
+	switch m.dir {
+	case domain.ProtocolConvertMessToResp:
+		f := EncodeFrame("message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": "", "stop_sequence": nil},
+			"usage": respUsageToMess(nil),
+		})
+		return append(f, EncodeFrame("message_stop", map[string]any{"type": "message_stop"})...)
+	case domain.ProtocolConvertChatToResp:
+		return []byte("data: [DONE]\n\n")
+	}
+	return nil
 }
 
 // EncodeFrame 组装 SSE 帧字节：name 非空 → "event: name\n" 行；data 为 JSON
@@ -223,43 +371,58 @@ func num(m map[string]any, key string) (float64, bool) {
 	return 0, false
 }
 
-// intOr0 读整数字段（缺失/类型异常 → 0）。
+// intOr0 读整数字段（缺失/类型异常 → 0）。浮点越界（病态大数，超出 int64
+// 范围如 1e400 或 ±Inf）→ 0：Go 的 float64→int64 转换在越界时是**实现相关**的
+// 垃圾值（Go 规范未定义），与 scanIntValue/gjsonNumInt 的「保守 0」一致。
 func intOr0(m map[string]any, key string) int64 {
-	if f, ok := num(m, key); ok {
-		return int64(f)
+	f, ok := num(m, key)
+	if !ok {
+		return 0
 	}
-	return 0
+	if f > math.MaxInt64 || f < math.MinInt64 {
+		return 0
+	}
+	return int64(f)
 }
 
-// pass 按表透传字段：dst[key] = src[key]（仅当存在且非 nil）。
-func pass(dst, src map[string]any, keys ...string) {
-	for _, k := range keys {
-		if v, ok := src[k]; ok && v != nil {
-			dst[k] = v
-		}
+// messStopToChatFinish Messages stop_reason → Chat finish_reason。
+func messStopToChatFinish(reason string) string {
+	switch reason {
+	case "tool_use":
+		return "tool_calls"
+	case "max_tokens", "model_context_window_exceeded":
+		return "length"
+	case "refusal":
+		return "content_filter"
+	default:
+		// end_turn / stop_sequence / pause_turn / compaction / 缺省
+		return "stop"
 	}
 }
 
-// blockText 提取 anthropic 内容块 content（string 或 text 块数组 → 拼接文本）。
-func blockText(content any) (string, bool) {
-	switch c := content.(type) {
-	case string:
-		return c, true
-	case []any:
-		var parts []string
-		for _, p := range c {
-			if pm, ok := p.(map[string]any); ok && pm["type"] == "text" {
-				if t, ok := str(pm, "text"); ok {
-					parts = append(parts, t)
-				}
-			}
-		}
-		if len(parts) == 0 {
-			return "", false
-		}
-		return joinStrings(parts, "\n"), true
+// chatFinishFromIncomplete Responses incomplete_details.reason → Chat finish_reason。
+func chatFinishFromIncomplete(reason string) string {
+	switch reason {
+	case "content_filter":
+		return "content_filter"
+	case "steered":
+		return "stop"
+	default:
+		// max_output_tokens / max_messages / 缺 reason
+		return "length"
 	}
-	return "", false
+}
+
+// messStopFromIncomplete Responses incomplete_details.reason → Messages stop_reason。
+func messStopFromIncomplete(reason string) string {
+	switch reason {
+	case "content_filter":
+		return "refusal"
+	case "steered":
+		return "end_turn"
+	default:
+		return "max_tokens"
+	}
 }
 
 // marshalAny 任意值 → JSON 字符串（失败 → "{}"）；function_call arguments
@@ -272,7 +435,7 @@ func marshalAny(v any) string {
 	return string(b)
 }
 
-// toolCallID 工具调用匹配键（M-1 修复）：Responses 规范中 function_call 项含
+// toolCallID 工具调用匹配键（修复）：Responses 规范中 function_call 项含
 // 两个 ID——id（item id，fc_ 格式）与 call_id（工具调用匹配键，call_ 格式，
 // function_call_output 必须按它回匹配）。对外暴露/内部合成的工具调用 ID 一律
 // call_id 优先、item id 兜底（缺失防御），否则客户端回传的匹配键与上游不符，

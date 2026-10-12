@@ -57,48 +57,6 @@ func (_c *AccountCreate) SetUpstreamKey(v string) *AccountCreate {
 	return _c
 }
 
-// SetStatus sets the "status" field.
-func (_c *AccountCreate) SetStatus(v account.Status) *AccountCreate {
-	_c.mutation.SetStatus(v)
-	return _c
-}
-
-// SetNillableStatus sets the "status" field if the given value is not nil.
-func (_c *AccountCreate) SetNillableStatus(v *account.Status) *AccountCreate {
-	if v != nil {
-		_c.SetStatus(*v)
-	}
-	return _c
-}
-
-// SetCooldownUntil sets the "cooldown_until" field.
-func (_c *AccountCreate) SetCooldownUntil(v time.Time) *AccountCreate {
-	_c.mutation.SetCooldownUntil(v)
-	return _c
-}
-
-// SetNillableCooldownUntil sets the "cooldown_until" field if the given value is not nil.
-func (_c *AccountCreate) SetNillableCooldownUntil(v *time.Time) *AccountCreate {
-	if v != nil {
-		_c.SetCooldownUntil(*v)
-	}
-	return _c
-}
-
-// SetWeight sets the "weight" field.
-func (_c *AccountCreate) SetWeight(v int) *AccountCreate {
-	_c.mutation.SetWeight(v)
-	return _c
-}
-
-// SetNillableWeight sets the "weight" field if the given value is not nil.
-func (_c *AccountCreate) SetNillableWeight(v *int) *AccountCreate {
-	if v != nil {
-		_c.SetWeight(*v)
-	}
-	return _c
-}
-
 // SetMaxConcurrency sets the "max_concurrency" field.
 func (_c *AccountCreate) SetMaxConcurrency(v int) *AccountCreate {
 	_c.mutation.SetMaxConcurrency(v)
@@ -151,6 +109,104 @@ func (_c *AccountCreate) SetFailedAt(v time.Time) *AccountCreate {
 func (_c *AccountCreate) SetNillableFailedAt(v *time.Time) *AccountCreate {
 	if v != nil {
 		_c.SetFailedAt(*v)
+	}
+	return _c
+}
+
+// SetFailureSource sets the "failure_source" field.
+func (_c *AccountCreate) SetFailureSource(v string) *AccountCreate {
+	_c.mutation.SetFailureSource(v)
+	return _c
+}
+
+// SetNillableFailureSource sets the "failure_source" field if the given value is not nil.
+func (_c *AccountCreate) SetNillableFailureSource(v *string) *AccountCreate {
+	if v != nil {
+		_c.SetFailureSource(*v)
+	}
+	return _c
+}
+
+// SetEnabled sets the "enabled" field.
+func (_c *AccountCreate) SetEnabled(v bool) *AccountCreate {
+	_c.mutation.SetEnabled(v)
+	return _c
+}
+
+// SetNillableEnabled sets the "enabled" field if the given value is not nil.
+func (_c *AccountCreate) SetNillableEnabled(v *bool) *AccountCreate {
+	if v != nil {
+		_c.SetEnabled(*v)
+	}
+	return _c
+}
+
+// SetLifecycleRevision sets the "lifecycle_revision" field.
+func (_c *AccountCreate) SetLifecycleRevision(v int64) *AccountCreate {
+	_c.mutation.SetLifecycleRevision(v)
+	return _c
+}
+
+// SetNillableLifecycleRevision sets the "lifecycle_revision" field if the given value is not nil.
+func (_c *AccountCreate) SetNillableLifecycleRevision(v *int64) *AccountCreate {
+	if v != nil {
+		_c.SetLifecycleRevision(*v)
+	}
+	return _c
+}
+
+// SetIdentityRevision sets the "identity_revision" field.
+func (_c *AccountCreate) SetIdentityRevision(v int64) *AccountCreate {
+	_c.mutation.SetIdentityRevision(v)
+	return _c
+}
+
+// SetNillableIdentityRevision sets the "identity_revision" field if the given value is not nil.
+func (_c *AccountCreate) SetNillableIdentityRevision(v *int64) *AccountCreate {
+	if v != nil {
+		_c.SetIdentityRevision(*v)
+	}
+	return _c
+}
+
+// SetUpstreamCostMultiplierBp sets the "upstream_cost_multiplier_bp" field.
+func (_c *AccountCreate) SetUpstreamCostMultiplierBp(v int) *AccountCreate {
+	_c.mutation.SetUpstreamCostMultiplierBp(v)
+	return _c
+}
+
+// SetNillableUpstreamCostMultiplierBp sets the "upstream_cost_multiplier_bp" field if the given value is not nil.
+func (_c *AccountCreate) SetNillableUpstreamCostMultiplierBp(v *int) *AccountCreate {
+	if v != nil {
+		_c.SetUpstreamCostMultiplierBp(*v)
+	}
+	return _c
+}
+
+// SetCacheDomain sets the "cache_domain" field.
+func (_c *AccountCreate) SetCacheDomain(v string) *AccountCreate {
+	_c.mutation.SetCacheDomain(v)
+	return _c
+}
+
+// SetNillableCacheDomain sets the "cache_domain" field if the given value is not nil.
+func (_c *AccountCreate) SetNillableCacheDomain(v *string) *AccountCreate {
+	if v != nil {
+		_c.SetCacheDomain(*v)
+	}
+	return _c
+}
+
+// SetSupplierUserID sets the "supplier_user_id" field.
+func (_c *AccountCreate) SetSupplierUserID(v int64) *AccountCreate {
+	_c.mutation.SetSupplierUserID(v)
+	return _c
+}
+
+// SetNillableSupplierUserID sets the "supplier_user_id" field if the given value is not nil.
+func (_c *AccountCreate) SetNillableSupplierUserID(v *int64) *AccountCreate {
+	if v != nil {
+		_c.SetSupplierUserID(*v)
 	}
 	return _c
 }
@@ -273,17 +329,25 @@ func (_c *AccountCreate) ExecX(ctx context.Context) {
 
 // defaults sets the default values of the builder before save.
 func (_c *AccountCreate) defaults() {
-	if _, ok := _c.mutation.Status(); !ok {
-		v := account.DefaultStatus
-		_c.mutation.SetStatus(v)
-	}
-	if _, ok := _c.mutation.Weight(); !ok {
-		v := account.DefaultWeight
-		_c.mutation.SetWeight(v)
-	}
 	if _, ok := _c.mutation.MaxConcurrency(); !ok {
 		v := account.DefaultMaxConcurrency
 		_c.mutation.SetMaxConcurrency(v)
+	}
+	if _, ok := _c.mutation.Enabled(); !ok {
+		v := account.DefaultEnabled
+		_c.mutation.SetEnabled(v)
+	}
+	if _, ok := _c.mutation.LifecycleRevision(); !ok {
+		v := account.DefaultLifecycleRevision
+		_c.mutation.SetLifecycleRevision(v)
+	}
+	if _, ok := _c.mutation.IdentityRevision(); !ok {
+		v := account.DefaultIdentityRevision
+		_c.mutation.SetIdentityRevision(v)
+	}
+	if _, ok := _c.mutation.UpstreamCostMultiplierBp(); !ok {
+		v := account.DefaultUpstreamCostMultiplierBp
+		_c.mutation.SetUpstreamCostMultiplierBp(v)
 	}
 	if _, ok := _c.mutation.UpdatedAt(); !ok {
 		v := account.DefaultUpdatedAt()
@@ -306,19 +370,20 @@ func (_c *AccountCreate) check() error {
 	if _, ok := _c.mutation.UpstreamKey(); !ok {
 		return &ValidationError{Name: "upstream_key", err: errors.New(`ent: missing required field "Account.upstream_key"`)}
 	}
-	if _, ok := _c.mutation.Status(); !ok {
-		return &ValidationError{Name: "status", err: errors.New(`ent: missing required field "Account.status"`)}
-	}
-	if v, ok := _c.mutation.Status(); ok {
-		if err := account.StatusValidator(v); err != nil {
-			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Account.status": %w`, err)}
-		}
-	}
-	if _, ok := _c.mutation.Weight(); !ok {
-		return &ValidationError{Name: "weight", err: errors.New(`ent: missing required field "Account.weight"`)}
-	}
 	if _, ok := _c.mutation.MaxConcurrency(); !ok {
 		return &ValidationError{Name: "max_concurrency", err: errors.New(`ent: missing required field "Account.max_concurrency"`)}
+	}
+	if _, ok := _c.mutation.Enabled(); !ok {
+		return &ValidationError{Name: "enabled", err: errors.New(`ent: missing required field "Account.enabled"`)}
+	}
+	if _, ok := _c.mutation.LifecycleRevision(); !ok {
+		return &ValidationError{Name: "lifecycle_revision", err: errors.New(`ent: missing required field "Account.lifecycle_revision"`)}
+	}
+	if _, ok := _c.mutation.IdentityRevision(); !ok {
+		return &ValidationError{Name: "identity_revision", err: errors.New(`ent: missing required field "Account.identity_revision"`)}
+	}
+	if _, ok := _c.mutation.UpstreamCostMultiplierBp(); !ok {
+		return &ValidationError{Name: "upstream_cost_multiplier_bp", err: errors.New(`ent: missing required field "Account.upstream_cost_multiplier_bp"`)}
 	}
 	if _, ok := _c.mutation.UpdatedAt(); !ok {
 		return &ValidationError{Name: "updated_at", err: errors.New(`ent: missing required field "Account.updated_at"`)}
@@ -374,18 +439,6 @@ func (_c *AccountCreate) createSpec() (*Account, *sqlgraph.CreateSpec) {
 		_spec.SetField(account.FieldUpstreamKey, field.TypeString, value)
 		_node.UpstreamKey = value
 	}
-	if value, ok := _c.mutation.Status(); ok {
-		_spec.SetField(account.FieldStatus, field.TypeEnum, value)
-		_node.Status = value
-	}
-	if value, ok := _c.mutation.CooldownUntil(); ok {
-		_spec.SetField(account.FieldCooldownUntil, field.TypeTime, value)
-		_node.CooldownUntil = &value
-	}
-	if value, ok := _c.mutation.Weight(); ok {
-		_spec.SetField(account.FieldWeight, field.TypeInt, value)
-		_node.Weight = value
-	}
 	if value, ok := _c.mutation.MaxConcurrency(); ok {
 		_spec.SetField(account.FieldMaxConcurrency, field.TypeInt, value)
 		_node.MaxConcurrency = value
@@ -401,6 +454,34 @@ func (_c *AccountCreate) createSpec() (*Account, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.FailedAt(); ok {
 		_spec.SetField(account.FieldFailedAt, field.TypeTime, value)
 		_node.FailedAt = &value
+	}
+	if value, ok := _c.mutation.FailureSource(); ok {
+		_spec.SetField(account.FieldFailureSource, field.TypeString, value)
+		_node.FailureSource = &value
+	}
+	if value, ok := _c.mutation.Enabled(); ok {
+		_spec.SetField(account.FieldEnabled, field.TypeBool, value)
+		_node.Enabled = value
+	}
+	if value, ok := _c.mutation.LifecycleRevision(); ok {
+		_spec.SetField(account.FieldLifecycleRevision, field.TypeInt64, value)
+		_node.LifecycleRevision = value
+	}
+	if value, ok := _c.mutation.IdentityRevision(); ok {
+		_spec.SetField(account.FieldIdentityRevision, field.TypeInt64, value)
+		_node.IdentityRevision = value
+	}
+	if value, ok := _c.mutation.UpstreamCostMultiplierBp(); ok {
+		_spec.SetField(account.FieldUpstreamCostMultiplierBp, field.TypeInt, value)
+		_node.UpstreamCostMultiplierBp = value
+	}
+	if value, ok := _c.mutation.CacheDomain(); ok {
+		_spec.SetField(account.FieldCacheDomain, field.TypeString, value)
+		_node.CacheDomain = &value
+	}
+	if value, ok := _c.mutation.SupplierUserID(); ok {
+		_spec.SetField(account.FieldSupplierUserID, field.TypeInt64, value)
+		_node.SupplierUserID = &value
 	}
 	if value, ok := _c.mutation.UpdatedAt(); ok {
 		_spec.SetField(account.FieldUpdatedAt, field.TypeTime, value)
@@ -569,54 +650,6 @@ func (u *AccountUpsert) UpdateUpstreamKey() *AccountUpsert {
 	return u
 }
 
-// SetStatus sets the "status" field.
-func (u *AccountUpsert) SetStatus(v account.Status) *AccountUpsert {
-	u.Set(account.FieldStatus, v)
-	return u
-}
-
-// UpdateStatus sets the "status" field to the value that was provided on create.
-func (u *AccountUpsert) UpdateStatus() *AccountUpsert {
-	u.SetExcluded(account.FieldStatus)
-	return u
-}
-
-// SetCooldownUntil sets the "cooldown_until" field.
-func (u *AccountUpsert) SetCooldownUntil(v time.Time) *AccountUpsert {
-	u.Set(account.FieldCooldownUntil, v)
-	return u
-}
-
-// UpdateCooldownUntil sets the "cooldown_until" field to the value that was provided on create.
-func (u *AccountUpsert) UpdateCooldownUntil() *AccountUpsert {
-	u.SetExcluded(account.FieldCooldownUntil)
-	return u
-}
-
-// ClearCooldownUntil clears the value of the "cooldown_until" field.
-func (u *AccountUpsert) ClearCooldownUntil() *AccountUpsert {
-	u.SetNull(account.FieldCooldownUntil)
-	return u
-}
-
-// SetWeight sets the "weight" field.
-func (u *AccountUpsert) SetWeight(v int) *AccountUpsert {
-	u.Set(account.FieldWeight, v)
-	return u
-}
-
-// UpdateWeight sets the "weight" field to the value that was provided on create.
-func (u *AccountUpsert) UpdateWeight() *AccountUpsert {
-	u.SetExcluded(account.FieldWeight)
-	return u
-}
-
-// AddWeight adds v to the "weight" field.
-func (u *AccountUpsert) AddWeight(v int) *AccountUpsert {
-	u.Add(account.FieldWeight, v)
-	return u
-}
-
 // SetMaxConcurrency sets the "max_concurrency" field.
 func (u *AccountUpsert) SetMaxConcurrency(v int) *AccountUpsert {
 	u.Set(account.FieldMaxConcurrency, v)
@@ -686,6 +719,132 @@ func (u *AccountUpsert) UpdateFailedAt() *AccountUpsert {
 // ClearFailedAt clears the value of the "failed_at" field.
 func (u *AccountUpsert) ClearFailedAt() *AccountUpsert {
 	u.SetNull(account.FieldFailedAt)
+	return u
+}
+
+// SetFailureSource sets the "failure_source" field.
+func (u *AccountUpsert) SetFailureSource(v string) *AccountUpsert {
+	u.Set(account.FieldFailureSource, v)
+	return u
+}
+
+// UpdateFailureSource sets the "failure_source" field to the value that was provided on create.
+func (u *AccountUpsert) UpdateFailureSource() *AccountUpsert {
+	u.SetExcluded(account.FieldFailureSource)
+	return u
+}
+
+// ClearFailureSource clears the value of the "failure_source" field.
+func (u *AccountUpsert) ClearFailureSource() *AccountUpsert {
+	u.SetNull(account.FieldFailureSource)
+	return u
+}
+
+// SetEnabled sets the "enabled" field.
+func (u *AccountUpsert) SetEnabled(v bool) *AccountUpsert {
+	u.Set(account.FieldEnabled, v)
+	return u
+}
+
+// UpdateEnabled sets the "enabled" field to the value that was provided on create.
+func (u *AccountUpsert) UpdateEnabled() *AccountUpsert {
+	u.SetExcluded(account.FieldEnabled)
+	return u
+}
+
+// SetLifecycleRevision sets the "lifecycle_revision" field.
+func (u *AccountUpsert) SetLifecycleRevision(v int64) *AccountUpsert {
+	u.Set(account.FieldLifecycleRevision, v)
+	return u
+}
+
+// UpdateLifecycleRevision sets the "lifecycle_revision" field to the value that was provided on create.
+func (u *AccountUpsert) UpdateLifecycleRevision() *AccountUpsert {
+	u.SetExcluded(account.FieldLifecycleRevision)
+	return u
+}
+
+// AddLifecycleRevision adds v to the "lifecycle_revision" field.
+func (u *AccountUpsert) AddLifecycleRevision(v int64) *AccountUpsert {
+	u.Add(account.FieldLifecycleRevision, v)
+	return u
+}
+
+// SetIdentityRevision sets the "identity_revision" field.
+func (u *AccountUpsert) SetIdentityRevision(v int64) *AccountUpsert {
+	u.Set(account.FieldIdentityRevision, v)
+	return u
+}
+
+// UpdateIdentityRevision sets the "identity_revision" field to the value that was provided on create.
+func (u *AccountUpsert) UpdateIdentityRevision() *AccountUpsert {
+	u.SetExcluded(account.FieldIdentityRevision)
+	return u
+}
+
+// AddIdentityRevision adds v to the "identity_revision" field.
+func (u *AccountUpsert) AddIdentityRevision(v int64) *AccountUpsert {
+	u.Add(account.FieldIdentityRevision, v)
+	return u
+}
+
+// SetUpstreamCostMultiplierBp sets the "upstream_cost_multiplier_bp" field.
+func (u *AccountUpsert) SetUpstreamCostMultiplierBp(v int) *AccountUpsert {
+	u.Set(account.FieldUpstreamCostMultiplierBp, v)
+	return u
+}
+
+// UpdateUpstreamCostMultiplierBp sets the "upstream_cost_multiplier_bp" field to the value that was provided on create.
+func (u *AccountUpsert) UpdateUpstreamCostMultiplierBp() *AccountUpsert {
+	u.SetExcluded(account.FieldUpstreamCostMultiplierBp)
+	return u
+}
+
+// AddUpstreamCostMultiplierBp adds v to the "upstream_cost_multiplier_bp" field.
+func (u *AccountUpsert) AddUpstreamCostMultiplierBp(v int) *AccountUpsert {
+	u.Add(account.FieldUpstreamCostMultiplierBp, v)
+	return u
+}
+
+// SetCacheDomain sets the "cache_domain" field.
+func (u *AccountUpsert) SetCacheDomain(v string) *AccountUpsert {
+	u.Set(account.FieldCacheDomain, v)
+	return u
+}
+
+// UpdateCacheDomain sets the "cache_domain" field to the value that was provided on create.
+func (u *AccountUpsert) UpdateCacheDomain() *AccountUpsert {
+	u.SetExcluded(account.FieldCacheDomain)
+	return u
+}
+
+// ClearCacheDomain clears the value of the "cache_domain" field.
+func (u *AccountUpsert) ClearCacheDomain() *AccountUpsert {
+	u.SetNull(account.FieldCacheDomain)
+	return u
+}
+
+// SetSupplierUserID sets the "supplier_user_id" field.
+func (u *AccountUpsert) SetSupplierUserID(v int64) *AccountUpsert {
+	u.Set(account.FieldSupplierUserID, v)
+	return u
+}
+
+// UpdateSupplierUserID sets the "supplier_user_id" field to the value that was provided on create.
+func (u *AccountUpsert) UpdateSupplierUserID() *AccountUpsert {
+	u.SetExcluded(account.FieldSupplierUserID)
+	return u
+}
+
+// AddSupplierUserID adds v to the "supplier_user_id" field.
+func (u *AccountUpsert) AddSupplierUserID(v int64) *AccountUpsert {
+	u.Add(account.FieldSupplierUserID, v)
+	return u
+}
+
+// ClearSupplierUserID clears the value of the "supplier_user_id" field.
+func (u *AccountUpsert) ClearSupplierUserID() *AccountUpsert {
+	u.SetNull(account.FieldSupplierUserID)
 	return u
 }
 
@@ -842,62 +1001,6 @@ func (u *AccountUpsertOne) UpdateUpstreamKey() *AccountUpsertOne {
 	})
 }
 
-// SetStatus sets the "status" field.
-func (u *AccountUpsertOne) SetStatus(v account.Status) *AccountUpsertOne {
-	return u.Update(func(s *AccountUpsert) {
-		s.SetStatus(v)
-	})
-}
-
-// UpdateStatus sets the "status" field to the value that was provided on create.
-func (u *AccountUpsertOne) UpdateStatus() *AccountUpsertOne {
-	return u.Update(func(s *AccountUpsert) {
-		s.UpdateStatus()
-	})
-}
-
-// SetCooldownUntil sets the "cooldown_until" field.
-func (u *AccountUpsertOne) SetCooldownUntil(v time.Time) *AccountUpsertOne {
-	return u.Update(func(s *AccountUpsert) {
-		s.SetCooldownUntil(v)
-	})
-}
-
-// UpdateCooldownUntil sets the "cooldown_until" field to the value that was provided on create.
-func (u *AccountUpsertOne) UpdateCooldownUntil() *AccountUpsertOne {
-	return u.Update(func(s *AccountUpsert) {
-		s.UpdateCooldownUntil()
-	})
-}
-
-// ClearCooldownUntil clears the value of the "cooldown_until" field.
-func (u *AccountUpsertOne) ClearCooldownUntil() *AccountUpsertOne {
-	return u.Update(func(s *AccountUpsert) {
-		s.ClearCooldownUntil()
-	})
-}
-
-// SetWeight sets the "weight" field.
-func (u *AccountUpsertOne) SetWeight(v int) *AccountUpsertOne {
-	return u.Update(func(s *AccountUpsert) {
-		s.SetWeight(v)
-	})
-}
-
-// AddWeight adds v to the "weight" field.
-func (u *AccountUpsertOne) AddWeight(v int) *AccountUpsertOne {
-	return u.Update(func(s *AccountUpsert) {
-		s.AddWeight(v)
-	})
-}
-
-// UpdateWeight sets the "weight" field to the value that was provided on create.
-func (u *AccountUpsertOne) UpdateWeight() *AccountUpsertOne {
-	return u.Update(func(s *AccountUpsert) {
-		s.UpdateWeight()
-	})
-}
-
 // SetMaxConcurrency sets the "max_concurrency" field.
 func (u *AccountUpsertOne) SetMaxConcurrency(v int) *AccountUpsertOne {
 	return u.Update(func(s *AccountUpsert) {
@@ -979,6 +1082,153 @@ func (u *AccountUpsertOne) UpdateFailedAt() *AccountUpsertOne {
 func (u *AccountUpsertOne) ClearFailedAt() *AccountUpsertOne {
 	return u.Update(func(s *AccountUpsert) {
 		s.ClearFailedAt()
+	})
+}
+
+// SetFailureSource sets the "failure_source" field.
+func (u *AccountUpsertOne) SetFailureSource(v string) *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetFailureSource(v)
+	})
+}
+
+// UpdateFailureSource sets the "failure_source" field to the value that was provided on create.
+func (u *AccountUpsertOne) UpdateFailureSource() *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateFailureSource()
+	})
+}
+
+// ClearFailureSource clears the value of the "failure_source" field.
+func (u *AccountUpsertOne) ClearFailureSource() *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.ClearFailureSource()
+	})
+}
+
+// SetEnabled sets the "enabled" field.
+func (u *AccountUpsertOne) SetEnabled(v bool) *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetEnabled(v)
+	})
+}
+
+// UpdateEnabled sets the "enabled" field to the value that was provided on create.
+func (u *AccountUpsertOne) UpdateEnabled() *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateEnabled()
+	})
+}
+
+// SetLifecycleRevision sets the "lifecycle_revision" field.
+func (u *AccountUpsertOne) SetLifecycleRevision(v int64) *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetLifecycleRevision(v)
+	})
+}
+
+// AddLifecycleRevision adds v to the "lifecycle_revision" field.
+func (u *AccountUpsertOne) AddLifecycleRevision(v int64) *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.AddLifecycleRevision(v)
+	})
+}
+
+// UpdateLifecycleRevision sets the "lifecycle_revision" field to the value that was provided on create.
+func (u *AccountUpsertOne) UpdateLifecycleRevision() *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateLifecycleRevision()
+	})
+}
+
+// SetIdentityRevision sets the "identity_revision" field.
+func (u *AccountUpsertOne) SetIdentityRevision(v int64) *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetIdentityRevision(v)
+	})
+}
+
+// AddIdentityRevision adds v to the "identity_revision" field.
+func (u *AccountUpsertOne) AddIdentityRevision(v int64) *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.AddIdentityRevision(v)
+	})
+}
+
+// UpdateIdentityRevision sets the "identity_revision" field to the value that was provided on create.
+func (u *AccountUpsertOne) UpdateIdentityRevision() *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateIdentityRevision()
+	})
+}
+
+// SetUpstreamCostMultiplierBp sets the "upstream_cost_multiplier_bp" field.
+func (u *AccountUpsertOne) SetUpstreamCostMultiplierBp(v int) *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetUpstreamCostMultiplierBp(v)
+	})
+}
+
+// AddUpstreamCostMultiplierBp adds v to the "upstream_cost_multiplier_bp" field.
+func (u *AccountUpsertOne) AddUpstreamCostMultiplierBp(v int) *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.AddUpstreamCostMultiplierBp(v)
+	})
+}
+
+// UpdateUpstreamCostMultiplierBp sets the "upstream_cost_multiplier_bp" field to the value that was provided on create.
+func (u *AccountUpsertOne) UpdateUpstreamCostMultiplierBp() *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateUpstreamCostMultiplierBp()
+	})
+}
+
+// SetCacheDomain sets the "cache_domain" field.
+func (u *AccountUpsertOne) SetCacheDomain(v string) *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetCacheDomain(v)
+	})
+}
+
+// UpdateCacheDomain sets the "cache_domain" field to the value that was provided on create.
+func (u *AccountUpsertOne) UpdateCacheDomain() *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateCacheDomain()
+	})
+}
+
+// ClearCacheDomain clears the value of the "cache_domain" field.
+func (u *AccountUpsertOne) ClearCacheDomain() *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.ClearCacheDomain()
+	})
+}
+
+// SetSupplierUserID sets the "supplier_user_id" field.
+func (u *AccountUpsertOne) SetSupplierUserID(v int64) *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetSupplierUserID(v)
+	})
+}
+
+// AddSupplierUserID adds v to the "supplier_user_id" field.
+func (u *AccountUpsertOne) AddSupplierUserID(v int64) *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.AddSupplierUserID(v)
+	})
+}
+
+// UpdateSupplierUserID sets the "supplier_user_id" field to the value that was provided on create.
+func (u *AccountUpsertOne) UpdateSupplierUserID() *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateSupplierUserID()
+	})
+}
+
+// ClearSupplierUserID clears the value of the "supplier_user_id" field.
+func (u *AccountUpsertOne) ClearSupplierUserID() *AccountUpsertOne {
+	return u.Update(func(s *AccountUpsert) {
+		s.ClearSupplierUserID()
 	})
 }
 
@@ -1308,62 +1558,6 @@ func (u *AccountUpsertBulk) UpdateUpstreamKey() *AccountUpsertBulk {
 	})
 }
 
-// SetStatus sets the "status" field.
-func (u *AccountUpsertBulk) SetStatus(v account.Status) *AccountUpsertBulk {
-	return u.Update(func(s *AccountUpsert) {
-		s.SetStatus(v)
-	})
-}
-
-// UpdateStatus sets the "status" field to the value that was provided on create.
-func (u *AccountUpsertBulk) UpdateStatus() *AccountUpsertBulk {
-	return u.Update(func(s *AccountUpsert) {
-		s.UpdateStatus()
-	})
-}
-
-// SetCooldownUntil sets the "cooldown_until" field.
-func (u *AccountUpsertBulk) SetCooldownUntil(v time.Time) *AccountUpsertBulk {
-	return u.Update(func(s *AccountUpsert) {
-		s.SetCooldownUntil(v)
-	})
-}
-
-// UpdateCooldownUntil sets the "cooldown_until" field to the value that was provided on create.
-func (u *AccountUpsertBulk) UpdateCooldownUntil() *AccountUpsertBulk {
-	return u.Update(func(s *AccountUpsert) {
-		s.UpdateCooldownUntil()
-	})
-}
-
-// ClearCooldownUntil clears the value of the "cooldown_until" field.
-func (u *AccountUpsertBulk) ClearCooldownUntil() *AccountUpsertBulk {
-	return u.Update(func(s *AccountUpsert) {
-		s.ClearCooldownUntil()
-	})
-}
-
-// SetWeight sets the "weight" field.
-func (u *AccountUpsertBulk) SetWeight(v int) *AccountUpsertBulk {
-	return u.Update(func(s *AccountUpsert) {
-		s.SetWeight(v)
-	})
-}
-
-// AddWeight adds v to the "weight" field.
-func (u *AccountUpsertBulk) AddWeight(v int) *AccountUpsertBulk {
-	return u.Update(func(s *AccountUpsert) {
-		s.AddWeight(v)
-	})
-}
-
-// UpdateWeight sets the "weight" field to the value that was provided on create.
-func (u *AccountUpsertBulk) UpdateWeight() *AccountUpsertBulk {
-	return u.Update(func(s *AccountUpsert) {
-		s.UpdateWeight()
-	})
-}
-
 // SetMaxConcurrency sets the "max_concurrency" field.
 func (u *AccountUpsertBulk) SetMaxConcurrency(v int) *AccountUpsertBulk {
 	return u.Update(func(s *AccountUpsert) {
@@ -1445,6 +1639,153 @@ func (u *AccountUpsertBulk) UpdateFailedAt() *AccountUpsertBulk {
 func (u *AccountUpsertBulk) ClearFailedAt() *AccountUpsertBulk {
 	return u.Update(func(s *AccountUpsert) {
 		s.ClearFailedAt()
+	})
+}
+
+// SetFailureSource sets the "failure_source" field.
+func (u *AccountUpsertBulk) SetFailureSource(v string) *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetFailureSource(v)
+	})
+}
+
+// UpdateFailureSource sets the "failure_source" field to the value that was provided on create.
+func (u *AccountUpsertBulk) UpdateFailureSource() *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateFailureSource()
+	})
+}
+
+// ClearFailureSource clears the value of the "failure_source" field.
+func (u *AccountUpsertBulk) ClearFailureSource() *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.ClearFailureSource()
+	})
+}
+
+// SetEnabled sets the "enabled" field.
+func (u *AccountUpsertBulk) SetEnabled(v bool) *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetEnabled(v)
+	})
+}
+
+// UpdateEnabled sets the "enabled" field to the value that was provided on create.
+func (u *AccountUpsertBulk) UpdateEnabled() *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateEnabled()
+	})
+}
+
+// SetLifecycleRevision sets the "lifecycle_revision" field.
+func (u *AccountUpsertBulk) SetLifecycleRevision(v int64) *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetLifecycleRevision(v)
+	})
+}
+
+// AddLifecycleRevision adds v to the "lifecycle_revision" field.
+func (u *AccountUpsertBulk) AddLifecycleRevision(v int64) *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.AddLifecycleRevision(v)
+	})
+}
+
+// UpdateLifecycleRevision sets the "lifecycle_revision" field to the value that was provided on create.
+func (u *AccountUpsertBulk) UpdateLifecycleRevision() *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateLifecycleRevision()
+	})
+}
+
+// SetIdentityRevision sets the "identity_revision" field.
+func (u *AccountUpsertBulk) SetIdentityRevision(v int64) *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetIdentityRevision(v)
+	})
+}
+
+// AddIdentityRevision adds v to the "identity_revision" field.
+func (u *AccountUpsertBulk) AddIdentityRevision(v int64) *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.AddIdentityRevision(v)
+	})
+}
+
+// UpdateIdentityRevision sets the "identity_revision" field to the value that was provided on create.
+func (u *AccountUpsertBulk) UpdateIdentityRevision() *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateIdentityRevision()
+	})
+}
+
+// SetUpstreamCostMultiplierBp sets the "upstream_cost_multiplier_bp" field.
+func (u *AccountUpsertBulk) SetUpstreamCostMultiplierBp(v int) *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetUpstreamCostMultiplierBp(v)
+	})
+}
+
+// AddUpstreamCostMultiplierBp adds v to the "upstream_cost_multiplier_bp" field.
+func (u *AccountUpsertBulk) AddUpstreamCostMultiplierBp(v int) *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.AddUpstreamCostMultiplierBp(v)
+	})
+}
+
+// UpdateUpstreamCostMultiplierBp sets the "upstream_cost_multiplier_bp" field to the value that was provided on create.
+func (u *AccountUpsertBulk) UpdateUpstreamCostMultiplierBp() *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateUpstreamCostMultiplierBp()
+	})
+}
+
+// SetCacheDomain sets the "cache_domain" field.
+func (u *AccountUpsertBulk) SetCacheDomain(v string) *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetCacheDomain(v)
+	})
+}
+
+// UpdateCacheDomain sets the "cache_domain" field to the value that was provided on create.
+func (u *AccountUpsertBulk) UpdateCacheDomain() *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateCacheDomain()
+	})
+}
+
+// ClearCacheDomain clears the value of the "cache_domain" field.
+func (u *AccountUpsertBulk) ClearCacheDomain() *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.ClearCacheDomain()
+	})
+}
+
+// SetSupplierUserID sets the "supplier_user_id" field.
+func (u *AccountUpsertBulk) SetSupplierUserID(v int64) *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.SetSupplierUserID(v)
+	})
+}
+
+// AddSupplierUserID adds v to the "supplier_user_id" field.
+func (u *AccountUpsertBulk) AddSupplierUserID(v int64) *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.AddSupplierUserID(v)
+	})
+}
+
+// UpdateSupplierUserID sets the "supplier_user_id" field to the value that was provided on create.
+func (u *AccountUpsertBulk) UpdateSupplierUserID() *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.UpdateSupplierUserID()
+	})
+}
+
+// ClearSupplierUserID clears the value of the "supplier_user_id" field.
+func (u *AccountUpsertBulk) ClearSupplierUserID() *AccountUpsertBulk {
+	return u.Update(func(s *AccountUpsert) {
+		s.ClearSupplierUserID()
 	})
 }
 

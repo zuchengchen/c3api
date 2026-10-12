@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -24,12 +23,12 @@ import (
 	"github.com/is7qin/c3api/pkg/sserelay"
 )
 
-// convertedCaller 是协议转换路径的 UpstreamCaller（W5）：请求体已由
+// convertedCaller 是协议转换路径的 UpstreamCaller：请求体已由
 // handleFormat 按方向转换（route.body，含 stream/model 字段），本实现按模板
 // 协议调用上游（与 responsesCaller/anthropicCaller 同构），响应反向转换回
 // 客户端协议：
 //   - 流式：每帧经 protoconv.StreamMapper 映射后写出（sserelay Mapper；
-//     Observer 仍见原始帧 → 用量提取与模板 caller 逐字同构）
+//     OnEvent 仍见原始帧 → 用量提取与模板 caller 逐字同构）
 //   - 非流式：上游响应 JSON 整体 ConvertResponse 转换
 //
 // 日志按客户端协议记录（buildLog format 参数 = 客户端格式——客户端视角的
@@ -42,15 +41,19 @@ type convertedCaller struct {
 func (c *convertedCaller) Call(ctx context.Context, w http.ResponseWriter, r *http.Request, reqID string, groupID int64, start time.Time, sel *scheduler.Selection, cred string, body []byte, stream bool) (int, []byte, bool, error) {
 	p := c.p
 	client, target := clientAndTargetOf(c.dir)
+	opTag := convertedOpTag(c.dir)
+	// 转换路径按目标上游协议记录用量和质量，响应再反向转换回客户端协议。
+	// codex 凭证分流：目标协议 = openai-responses 且账号为 codex 类型 → 上游走
+	// codex SDK 适配层（不再经通用 aiclient——codex 模板 BaseURL=="" 走 aiclient
+	// 会得空 scheme → `unsupported protocol scheme ""`）。分流在 aiclient 分支前。
+	if target == domain.FormatOpenAIResponses && sel.CredentialType.IsCodex() {
+		return p.callConvertedCodexResponses(ctx, w, r, reqID, groupID, start, sel, body, stream, c.dir)
+	}
 
 	if stream {
-		// 客户端请求模型：转换器保证 model 字段原样保留（补差映射），gjson
-		// 顶层提取与模板 caller 同构。
 		reqModel := gjson.GetBytes(body, "model").String()
 		ctx, cancel := context.WithTimeout(ctx, p.cfg.UpstreamStreamTimeout)
 		defer cancel()
-		// 模型改写（ModelMapping 语义）：转换后请求体已含 stream:true（转换器
-		// 映射客户端 stream 标志），setModel 短路守卫与模板 caller 同构。
 		streamBody, err := setModel(body, sel.Model)
 		if err != nil {
 			return 0, nil, false, err
@@ -58,9 +61,9 @@ func (c *convertedCaller) Call(ctx context.Context, w http.ResponseWriter, r *ht
 		var resp *http.Response
 		switch target {
 		case domain.FormatOpenAIResponses:
-			resp, err = p.clients.ResponseStreamRaw(ctx, sel.TemplateID, sel.BaseURL, cred, streamBody)
+			resp, err = p.clients.ResponseStreamRaw(ctx, sel.TemplateID, sel.BaseURL, cred, streamBody, r.Header)
 		case domain.FormatAnthropic:
-			resp, err = p.clients.AnthMessageStreamRaw(ctx, sel.TemplateID, sel.BaseURL, cred, streamBody)
+			resp, err = p.clients.AnthMessageStreamRaw(ctx, sel.TemplateID, sel.BaseURL, cred, streamBody, r.Header)
 		}
 		if err != nil {
 			return statusOf(err), upstreamBody(err), false, err
@@ -68,25 +71,43 @@ func (c *convertedCaller) Call(ctx context.Context, w http.ResponseWriter, r *ht
 		if resp.StatusCode != http.StatusOK {
 			rb := readUpstreamBody(resp)
 			resp.Body.Close()
-			return resp.StatusCode, rb, false, nil
+			// 2xx-非-200 归一 502 再交 pipeline（attempt_outcome 拒绝 ResultFailed+2xx）。
+			return streamUpstreamStatus(resp.StatusCode), rb, false, nil
 		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("X-Accel-Buffering", "no")
+		writeSSEHeaders(w)
+		out := sserelay.NewOutput(w, p.cfg.StreamKeepaliveInterval, sserelay.OutputOptions{Ctx: ctx, Cancel: cancel})
+		defer out.Release()
 		mapper := protoconv.NewStreamMapper(c.dir)
 		var it, ot, tt, cr, cc int64
-		// TTFT 采集（首 token 时间毫秒）：与模板 caller 同构。
+		// 首帧到达即记录 TTFT（写出前 seam）；用量仍按目标协议原始帧提取。
 		var ttft *int64
 		clientModel := sel.ClientResponseModel(reqModel)
+		// 异步续接（仅 resp→mess 方向）：首个可续接映射结果 id 出现时快照入队
+		// 一次。id 由 mapper 显式返回（BindableID），不从映射帧机械解析。
+		var contEnqueued bool
+		var lastDrop bool
 		err = sserelay.Relay(ctx, w, resp.Body, sserelay.Config{
+			Output: out,
 			Mapper: func(ev sserelay.Event) ([]byte, bool) {
+				mapped, drop := mapper.Map(string(ev.Event), ev.Data)
+				lastDrop = drop
+				if drop {
+					return nil, true
+				}
+				if clientModel != "" {
+					mapped = rewriteConvertedFrames(mapped, clientModel)
+				}
+				return mapped, false
+			},
+			OnEvent: func(ev sserelay.Event) {
+				// 采样与续接入队统一到写出前 seam（含 drop 帧仍回调；用量走原始帧）。
 				if ttft == nil {
 					ms := time.Since(start).Milliseconds()
 					ttft = &ms
 				}
 				// 用量提取走原始帧（与模板 caller 逐字同构；映射只影响写出字节）。
 				// 原始 ev.Data 在 StreamMapper 转换前提取，转换后改写不影响用量。
-				// EventName：缺 event: 名帧按 data.type 推断（非规范上游，P3）。
+				// EventName：缺 event: 名帧按 data.type 推断（非规范上游）。
 				switch target {
 				case domain.FormatOpenAIResponses:
 					if bytes.Equal(ev.EventName(), []byte("response.completed")) {
@@ -104,58 +125,78 @@ func (c *convertedCaller) Call(ctx context.Context, w http.ResponseWriter, r *ht
 						ot = anthropicDeltaOutput(ev.Data)
 					}
 				}
-				mapped, drop := mapper.Map(string(ev.Event), ev.Data)
-				if drop {
-					return nil, true
+				if !lastDrop && !contEnqueued && p.contBindWired() && c.dir == domain.ProtocolConvertRespToMess {
+					if id := mapper.BindableID(); id != "" {
+						p.contEnqueue(ctx, contProtocolREST, id, groupID)
+						contEnqueued = true
+					}
 				}
-				if clientModel != "" {
-					mapped = rewriteConvertedFrames(mapped, clientModel)
-				}
-				return mapped, false
 			},
 		})
 		resp.Body.Close()
 		if ttft != nil {
 			ctx = context.WithValue(ctx, ctxKeyTTFT{}, ttft)
 		}
+		u := usageTuple{it: it, ot: ot, tt: it + ot, cr: cr, cc: cc}
+		usage := AttemptUsage{InputTokens: it, OutputTokens: ot, CacheReadTokens: cr, CacheCreationTokens: cc}
+		timing := AttemptTiming{LatencyMS: time.Since(start).Milliseconds(), TTFTMS: ttft}
 		if err != nil {
-			// 客户端断开/流中止语义与模板 caller 逐字同构（recordStreamAbort +
-			// MarkResult；客户端断开 finish ErrAbort 不转移）。errors.Is(err,
-			// context.Canceled) 即客户端断开——sserelay.normalize 已区分三类
-			// （C-P2-2）：上游停滞超时 → DeadlineExceeded 走上游错误分支。
-			if errors.Is(err, context.Canceled) {
-				p.finish(sel.AccountID, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), client, http.StatusOK, domain.ErrAbort, usageTuple{it: it, ot: ot, tt: it + ot, cr: cr, cc: cc}, start)))
+			// 统一出口判定（§3.7）：取消/写失败不补写；未提交交 pipeline；已提交写 SSE error。
+			switch classifyStreamExit(ctx, out, err, usage, ttft) {
+			case streamExitClientCancel:
+				// 客户端取消与上游中断区分：取消不计健康惩罚，仍需计费落账。
+				outcome := mergeDispatchBase(ctx, convertedOutcome(reqID, sel, reqModel, opTag, timing, usage, ResultClientCancel, 0, CommitResponseStarted, true, true, false))
+				p.observeDispatchOutcome(ctx, outcome, nil)
+				// 计费落账由 p.finish 统一收口，routeLog 负责构建日志与用量。
+				p.finish(sel, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), client, http.StatusOK, domain.ErrAbort, u, start)))
+				return 0, nil, true, nil
+			case streamExitUncommitted:
+				// 未提交读取失败 → pipeline（handled=false，可 failover/写 JSON）
+				return statusOf(err), nil, false, err
+			default: // 写失败 / 已提交
+				if out.Committed() {
+					writeClientStreamError(out, client, err)
+				}
+				code := statusOf(err)
+				commit := CommitUpstreamResponded
+				business := false
+				if code == 0 {
+					commit = CommitSentAmbiguous
+					business = true
+				}
+				outcome := mergeDispatchBase(ctx, convertedOutcome(reqID, sel, reqModel, opTag, timing, usage, ResultFailed, AttemptStatus(code), commit, business, true, false))
+				health := &AttemptHealthEvent{Kind: scheduler.RuleKindOf(code), ErrorMessage: err.Error()}
+				p.observeDispatchOutcome(ctx, outcome, health)
+				p.finish(sel, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), client, http.StatusOK, domain.ErrAbort, u, start)))
 				return 0, nil, true, nil
 			}
-			p.recordStreamAbort(ctx, reqID, groupID, start, sel, reqModel, usageTuple{it: it, ot: ot, tt: it + ot, cr: cr, cc: cc}, err)
-			p.sched.MarkResult(sel.AccountID, scheduler.RuleKindOf(statusOf(err)), nil, statusOf(err), err.Error(), sel.Model)
-			return 0, nil, true, nil
 		}
 		tt = it + ot
-		p.sched.MarkResult(sel.AccountID, rule.KindOK, nil, http.StatusOK, "", sel.Model)
-		p.finish(sel.AccountID, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), client, 200, domain.ErrNone, usageTuple{it: it, ot: ot, tt: tt, cr: cr, cc: cc}, start)))
+		usage = AttemptUsage{InputTokens: it, OutputTokens: ot, CacheReadTokens: cr, CacheCreationTokens: cc}
+		timing = AttemptTiming{LatencyMS: time.Since(start).Milliseconds(), TTFTMS: ttft}
+		outcome := mergeDispatchBase(ctx, convertedOutcome(reqID, sel, reqModel, opTag, timing, usage, ResultSuccess, 200, CommitResponseStarted, true, true, false))
+		health := &AttemptHealthEvent{Kind: rule.KindOK}
+		p.observeDispatchOutcome(ctx, outcome, health)
+		p.finish(sel, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), client, 200, domain.ErrNone, usageTuple{it: it, ot: ot, tt: tt, cr: cr, cc: cc}, start)))
 		return 200, nil, true, nil
 	}
 
-	// 非流式：以模板协议参数解析（转换后请求体）→ SDK 调用 → 响应 JSON 反向
-	// 转换回客户端协议。reqModel 在参数覆盖前从转换体提取（model 原样保留）。
 	reqModel := gjson.GetBytes(body, "model").String()
 	var data []byte
 	var it, ot, tt, cr, cc int64
-	tpl := tplOf(sel) // 非流式 SDK 路径（流式原始请求路径免模板对象分配）
+	tpl := tplOf(sel)
 	var upstreamErr error
 	switch target {
 	case domain.FormatOpenAIResponses:
 		var params responses.ResponseNewParams
 		if err := json.Unmarshal(body, &params); err != nil {
-			// 本地拒绝（handled=true，无记录）：同 chat caller 语义。
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "invalid request body: " + err.Error()}})
-			p.sched.Release(sel.AccountID)
+			sel.Release()
 			return 400, nil, true, nil
 		}
 		params.Model = responses.ResponsesModel(sel.Model)
 		var resp *responses.Response
-		resp, upstreamErr = p.clients.Response(ctx, tpl, cred, params)
+		resp, upstreamErr = p.clients.Response(ctx, tpl, cred, params, r.Header)
 		if upstreamErr == nil {
 			data, upstreamErr = json.Marshal(resp)
 			if resp.JSON.Usage.Valid() {
@@ -166,12 +207,12 @@ func (c *convertedCaller) Call(ctx context.Context, w http.ResponseWriter, r *ht
 		var params anthropic.MessageNewParams
 		if err := json.Unmarshal(body, &params); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "invalid request body: " + err.Error()}})
-			p.sched.Release(sel.AccountID)
+			sel.Release()
 			return 400, nil, true, nil
 		}
-		params.Model = sel.Model // Model = string 别名
+		params.Model = sel.Model
 		var resp *anthropic.Message
-		resp, upstreamErr = p.clients.AnthMessage(ctx, tpl, cred, params)
+		resp, upstreamErr = p.clients.AnthMessage(ctx, tpl, cred, params, r.Header)
 		if upstreamErr == nil {
 			data, upstreamErr = json.Marshal(resp)
 			if resp.JSON.Usage.Valid() {
@@ -184,33 +225,92 @@ func (c *convertedCaller) Call(ctx context.Context, w http.ResponseWriter, r *ht
 	}
 	conv, err := protoconv.ConvertResponse(data, c.dir)
 	if err != nil {
-		// 响应转换失败 = 网关内部错误（转换器 bug/上游异常字节）；按 500 返回，
-		// 骨架按 code>=500 转移（重试同 bug 无益，但语义与现状 5xx 一致）。
 		return http.StatusInternalServerError, nil, false, fmt.Errorf("protocol response conversion failed: %w", err)
 	}
 	if rm := sel.ClientResponseModel(reqModel); rm != "" {
 		conv = rewriteResponseModelJSON(conv, rm)
 	}
+	if c.dir == domain.ProtocolConvertRespToMess && p.cont != nil {
+		if id := gjson.GetBytes(conv, "id").String(); id != "" {
+			if ferr := p.contBind(ctx, contProtocolREST, id, groupID); ferr != nil {
+				outcome := mergeDispatchBase(ctx, convertedOutcome(reqID, sel, reqModel, opTag, AttemptTiming{LatencyMS: time.Since(start).Milliseconds()}, AttemptUsage{InputTokens: it, OutputTokens: ot, CacheReadTokens: cr, CacheCreationTokens: cc}, ResultFailed, AttemptStatus(ferr.status), CommitUpstreamResponded, false, true, false))
+				p.observeDispatchOutcome(ctx, outcome, nil)
+				p.finish(sel, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), client, ferr.status, domain.ErrAbort, usageTuple{it: it, ot: ot, tt: tt, cr: cr, cc: cc}, start)))
+				writeErr(w, ferr)
+				return ferr.status, nil, true, nil
+			}
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(conv)
-	p.sched.MarkResult(sel.AccountID, rule.KindOK, nil, http.StatusOK, "", sel.Model)
-	p.finish(sel.AccountID, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), client, 200, domain.ErrNone, usageTuple{it: it, ot: ot, tt: tt, cr: cr, cc: cc}, start)))
+	usage := AttemptUsage{InputTokens: it, OutputTokens: ot, CacheReadTokens: cr, CacheCreationTokens: cc}
+	timing := AttemptTiming{LatencyMS: time.Since(start).Milliseconds()}
+	outcome := mergeDispatchBase(ctx, convertedOutcome(reqID, sel, reqModel, opTag, timing, usage, ResultSuccess, 200, CommitResponseStarted, true, true, false))
+	health := &AttemptHealthEvent{Kind: rule.KindOK}
+	p.observeDispatchOutcome(ctx, outcome, health)
+	// 计费落账与日志由 p.finish 统一收口。
+	p.finish(sel, logWithCtx(ctx, p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), client, 200, domain.ErrNone, usageTuple{it: it, ot: ot, tt: tt, cr: cr, cc: cc}, start)))
 	return 200, nil, true, nil
 }
 
-// clientAndTargetOf 转换方向的客户端/模板协议格式（方向合法性由 W1 枚举校验
+// callConvertedCodexResponses 协议转换路径命中 codex 凭证类型 + 目标协议 =
+// openai-responses 时的上游调用：镜像 callCodexResponses 的入口前置（501 / ext
+// 缺失语义与直连一致），再调 codex resp core——注入协议转换 output（响应经
+// protoconv 反向映射回客户端协议 + 客户端模型回填；日志 Format 由 output 自报 =
+// clientAndTargetOf 的 client 侧——与转换路径其余分支一致；计费不读 format）。
+// outcome 取 codex 口径（CallerCodexHTTP / OpResponses，见 codexDispatchBase）。
+func (p *Proxy) callConvertedCodexResponses(ctx context.Context, w http.ResponseWriter, r *http.Request, reqID string, groupID int64, start time.Time, sel *scheduler.Selection, body []byte, stream bool, dir domain.ProtocolConvert) (int, []byte, bool, error) {
+	client, _ := clientAndTargetOf(dir)
+	// 客户端请求模型（日志/回填口径）：转换后请求体经 ConvertRequest 保持 model。
+	reqModel := gjson.GetBytes(body, "model").String()
+	if p.codex == nil {
+		// 适配层未装配（SetCodex 未调用）：显式 501（防 nil 误走凭据缺失 502）。
+		o := mergeDispatchBase(ctx, codexDispatchBase(sel, reqModel, reqID, start, usageTuple{}, nil))
+		o.Result = ResultFailed
+		o.HTTPStatus = AttemptStatus(http.StatusNotImplemented)
+		o.Commit = CommitUpstreamResponded
+		o.Terminal = true
+		o.BusinessFrameSent = false
+		emitCodexOutcome(ctx, p, sel, o, rule.Kind5xx, errCodexResponsesNotIntegrated.msg)
+		sel.Release()
+		p.recordRejected(r.Context(), reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), client, http.StatusNotImplemented, domain.ErrBilling, 0, usageTuple{}, start, errCodexResponsesNotIntegrated.msg)
+		writeErr(w, errCodexResponsesNotIntegrated)
+		return 0, nil, true, nil
+	}
+	if sel.Ext == nil {
+		// 配置损坏（codex 账号必有 ext 行——快照缺 account_ext 行）：连接级错误
+		// 转移（失败文本落盘，耗尽 502 语义）；不上报失效（与直连同语义）。
+		return 0, nil, false, errCodexExtMissing
+	}
+	cred := domain.CredentialFromExt(sel.Ext)
+	cm := sel.ClientResponseModel(reqModel)
+	if stream {
+		return p.streamCodexResponsesCore(ctx, w, r, reqID, groupID, start, sel, reqModel, &cred, body, codexConvertedStreamPlan(dir, cm))
+	}
+	return p.nonstreamCodexResponsesCore(ctx, r, reqID, groupID, start, sel, reqModel, &cred, body, newCodexConvertedOutput(w, dir, cm))
+}
+
+// convertedOpTag 转换方向对应的操作标签：由 domain.ProtocolConvert.Client()
+// 的客户端协议经本地 client→OperationTag 映射得出（Chat→chat_completions、
+// Anthropic→anthropic_messages、Responses→responses、未知/off→chat_completions，
+// 与重构前 proxy 单点映射的 op 列逐一等价）。
+func convertedOpTag(dir domain.ProtocolConvert) OperationTag {
+	switch dir.Client() {
+	case domain.FormatAnthropic:
+		return OperationTag(domain.OpAnthropicMessages)
+	case domain.FormatOpenAIResponses:
+		return OperationTag(domain.OpResponses)
+	}
+	return OperationTag(domain.OpChatCompletions)
+}
+
+// clientAndTargetOf 转换方向的客户端/模板协议格式（方向合法性由枚举校验
 // 保证；未知方向 → 客户端=模板=零值，仅防御）。
 func clientAndTargetOf(dir domain.ProtocolConvert) (domain.RequestFormat, domain.RequestFormat) {
-	switch dir {
-	case domain.ProtocolConvertChatToResp:
-		return domain.FormatOpenAIChat, domain.FormatOpenAIResponses
-	case domain.ProtocolConvertMessToResp:
-		return domain.FormatAnthropic, domain.FormatOpenAIResponses
-	case domain.ProtocolConvertRespToMess:
-		return domain.FormatOpenAIResponses, domain.FormatAnthropic
-	case domain.ProtocolConvertChatToMess:
-		return domain.FormatOpenAIChat, domain.FormatAnthropic
-	}
-	return "", ""
+	return dir.Client(), dir.Target()
+}
+
+func convertedOutcome(reqID string, sel *scheduler.Selection, reqModel string, op OperationTag, timing AttemptTiming, usage AttemptUsage, result AttemptResult, status AttemptStatus, commit CommitState, businessSent, terminal, malformed bool) AttemptOutcome {
+	return syntheticOutcome(CallerConverted, reqID, sel, reqModel, op, timing, usage, result, status, commit, businessSent, terminal, malformed)
 }

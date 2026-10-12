@@ -6,11 +6,7 @@ package main
 
 import (
 	"go/ast"
-	"go/parser"
 	"go/token"
-	"os"
-	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -26,24 +22,11 @@ func isWmRegister(ce *ast.CallExpr) bool {
 }
 
 func TestWorkerRegistrationPartialOrder(t *testing.T) {
-	_, file, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	srcPath := filepath.Join(filepath.Dir(file), "main.go")
-	src, err := os.ReadFile(srcPath)
-	require.NoError(t, err)
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, srcPath, src, parser.ParseComments)
-	require.NoError(t, err)
-	var mainFn *ast.FuncDecl
-	for _, d := range f.Decls {
-		if fn, ok := d.(*ast.FuncDecl); ok && fn.Name.Name == "main" && fn.Recv == nil {
-			mainFn = fn
-			break
-		}
-	}
-	require.NotNil(t, mainFn, "main func not found")
+	_, f := parseMainGo(t)
+	mainFn := findFuncDecl(t, f, "main")
 	var order []string
 	var ordered []string
+	var appendOrder []string
 	managedFound := false
 	expansionFound := false
 	guardedBilling := false
@@ -91,6 +74,17 @@ func TestWorkerRegistrationPartialOrder(t *testing.T) {
 									ordered = append(ordered, id.Name)
 								}
 							}
+							// managedWorkers = append(managedWorkers, ...)：供应商
+							// worker 切片 / 后续业务 worker 追加（spec §5.5 装配形态）。
+							if fun, ok := ce.Fun.(*ast.Ident); ok && fun.Name == "append" && len(ce.Args) >= 2 {
+								if head, ok := ce.Args[0].(*ast.Ident); ok && head.Name == "managedWorkers" {
+									for _, a := range ce.Args[1:] {
+										if id, ok := a.(*ast.Ident); ok {
+											appendOrder = append(appendOrder, id.Name)
+										}
+									}
+								}
+							}
 						}
 					}
 				}
@@ -104,6 +98,7 @@ func TestWorkerRegistrationPartialOrder(t *testing.T) {
 						require.True(t, managedFound, "wm.Register(managedWorkers...) without prior managedWorkers := orderedWorkers(...)")
 						require.NotEmpty(t, ordered, "orderedWorkers args empty")
 						order = append(order, ordered...)
+						order = append(order, appendOrder...)
 						expansionFound = true
 						continue
 					}
@@ -162,8 +157,17 @@ func TestWorkerRegistrationPartialOrder(t *testing.T) {
 	mustBefore("mailW", "warningWorker")
 	mustBefore("warningWorker", "billingWorker")
 	mustBefore("billingWorker", "rec")
+	// 供应商 worker 切片插在 healthW 之后、rec 之前（spec §5.5：reverse-shutdown
+	// 使 rec 先关，credit 再排空）。组合（thaw×credit）由 supplierWorkersFor 纯函数
+	// 的运行时断言覆盖；此处仅断言切片位置。
+	mustBefore("healthW", "supplierWorkers")
+	mustBefore("supplierWorkers", "rec")
 	mustBefore("rec", "errlogW")
-	business := []string{"mailW", "warningWorker", "billingWorker", "inv", "sched", "ruleEngine", "rec", "errlogW", "pricingSync", "retention", "statsAgg", "concSync", "accConcSync"}
+	// async-routing-quality-telemetry: the flow owner is registered BEFORE
+	// quality-sync so reverse shutdown closes quality-sync first (its failed
+	// flush may still refill the owner) and the owner second.
+	mustBefore("qualityFlowOwner", "qualitySync")
+	business := []string{"mailW", "warningWorker", "billingWorker", "inv", "schedW", "ruleEngine", "rec", "errlogW", "pricingSync", "retention", "statsAgg", "qualityFlowOwner", "qualitySync", "concSync", "accConcSync"}
 	for _, b := range business {
 		mustBefore(b, "disco")
 	}

@@ -8,7 +8,6 @@ import (
 	"github.com/is7qin/c3api/internal/credential"
 	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/ent"
-	"github.com/is7qin/c3api/internal/ent/template"
 )
 
 func toDomainUser(u *ent.User) *domain.User {
@@ -23,18 +22,35 @@ func toDomainUser(u *ent.User) *domain.User {
 }
 
 func toDomainKey(k *ent.Key) *domain.Key {
-	return &domain.Key{
+	d := &domain.Key{
 		ID: k.ID, UserID: k.UserID, GroupID: k.GroupID, Name: k.Name,
 		KeyRaw: k.KeyRaw,
 		Status: domain.KeyStatus(k.Status), MaxConcurrency: k.MaxConcurrency,
 		Quota: k.Quota, QuotaUsed: k.QuotaUsed,
 		CreatedAt: k.CreatedAt, UpdatedAt: k.UpdatedAt, DeletedAt: k.DeletedAt,
 	}
+	// 组名回填：仅当 eager-load 的组边非 nil（读路径经存活过滤挂边；写路径
+	// 无组边 → nil → 留空）。软删组被过滤 → nil → 前端回退 `#<GroupID>`。
+	if k.Edges.Group != nil {
+		d.GroupName = k.Edges.Group.Name
+	}
+	return d
+}
+
+// toDomainManagementKey ent 行 → domain.ManagementKey（管理 key 面全量映射；
+// 无 eager-load 边——owner 由 user_id 标量承载）。
+func toDomainManagementKey(m *ent.ManagementKey) *domain.ManagementKey {
+	return &domain.ManagementKey{
+		ID: m.ID, UserID: m.UserID, Name: m.Name, KeyRaw: m.KeyRaw,
+		Status:    domain.ManagementKeyStatus(m.Status),
+		CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt, DeletedAt: m.DeletedAt,
+	}
 }
 
 func toDomainGroup(g *ent.Group) *domain.Group {
 	return &domain.Group{
-		ID: g.ID, Name: g.Name, Visibility: domain.GroupVisibility(g.Visibility),
+		ID: g.ID, Name: g.Name, Description: g.Description,
+		Visibility:       domain.GroupVisibility(g.Visibility),
 		PriceMultiplier:  g.PriceMultiplier,
 		ProtocolConverts: toDomainProtocolConverts(g.ProtocolConvert),
 		CreatedAt:        g.CreatedAt, UpdatedAt: g.UpdatedAt, DeletedAt: g.DeletedAt,
@@ -138,25 +154,32 @@ func toDomainAccount(a *ent.Account) *domain.Account {
 	if a.Edges.Template != nil {
 		tpl = toDomainTemplate(a.Edges.Template)
 	}
+	multBp := a.UpstreamCostMultiplierBp
 	d := &domain.Account{
 		ID: a.ID, Name: a.Name, TemplateID: a.TemplateID, Template: tpl,
-		BaseURL:       a.BaseURL, // 账号级覆盖（nil = 继承模板；快照装配指针拷贝零分配）
-		UpstreamKey:   a.UpstreamKey,
-		Status:        domain.AccountStatus(a.Status),
-		CooldownUntil: a.CooldownUntil, Weight: a.Weight, MaxConcurrency: a.MaxConcurrency,
-		LastError: a.LastError, LastUsedAt: a.LastUsedAt,
-		FailedAt:  a.FailedAt,
-		CreatedAt: a.CreatedAt, UpdatedAt: a.UpdatedAt, DeletedAt: a.DeletedAt,
+		BaseURL:        a.BaseURL, // 账号级覆盖（nil = 继承模板；快照装配指针拷贝零分配）
+		UpstreamKey:    a.UpstreamKey,
+		MaxConcurrency: a.MaxConcurrency,
+		LastError:      a.LastError, LastUsedAt: a.LastUsedAt,
+		FailedAt:                 a.FailedAt,
+		FailureSource:            a.FailureSource,
+		Enabled:                  a.Enabled,
+		LifecycleRevision:        a.LifecycleRevision,
+		IdentityRevision:         a.IdentityRevision,
+		UpstreamCostMultiplierBp: &multBp, // 读路径恒有值（列 NOT NULL + 默认）——取址拷贝，不别名 ent 行
+		CacheDomain:              a.CacheDomain,
+		CreatedAt:                a.CreatedAt, UpdatedAt: a.UpdatedAt, DeletedAt: a.DeletedAt,
+	}
+	// 供应商归属（spec §2.5/§4.6）：列 NULL = 平台自有（0）。非 nil 落值。
+	if a.SupplierUserID != nil {
+		d.SupplierUserID = *a.SupplierUserID
 	}
 	// Ext 快照合并：仅调度器快照加载（LoadGroupsAccounts / LoadGroupAccounts
 	// ——全表/子查询扫描后内存装配 Edges.Ext）会带 account_ext 边；其余路径
-	// 无 ext 边 → nil（与 Template.StripImageTools 同款合并先例，T4 P3-4 定死
+	// 无 ext 边 → nil（与 Template.StripImageTools 同款合并先例，定死
 	// 路线）。
 	if len(a.Edges.Ext) > 0 {
 		d.Ext = toDomainAccountExt(a.Edges.Ext[0])
 	}
 	return d
 }
-
-// templatePredicate 供调用处过滤，避免未用 import 告警。
-var _ = template.FieldName

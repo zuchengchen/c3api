@@ -11,13 +11,14 @@ import (
 	"strconv"
 
 	"github.com/is7qin/c3api/internal/domain"
+	"github.com/is7qin/c3api/internal/handler/httpface"
 	"github.com/is7qin/c3api/internal/service"
 )
 
 // 本文件实现领域类型 → 生成的契约类型（api.gen.go）的转换。
 // oapi-codegen v2.4.1 对 required 属性生成值类型、非 required 生成指针 +
 // omitempty 字段，因此响应字段按生成类型取址/取值赋值；
-// 枚举类型（RequestFormat/AccountStatus/ErrorType）跨包需显式转换。
+// 枚举类型（RequestFormat/ErrorType）跨包需显式转换。
 
 // toAPITemplate 模板领域对象 → 契约类型。
 func toAPITemplate(t *domain.Template) Template {
@@ -29,7 +30,7 @@ func toAPITemplate(t *domain.Template) Template {
 		ID:               t.ID,
 		Name:             t.Name,
 		BaseURL:          t.BaseURL,
-		CredentialType:   ptr(TemplateCredentialType(t.CredentialType)),
+		CredentialType:   httpface.Ptr(TemplateCredentialType(t.CredentialType)),
 		SupportedFormats: formats,
 		Models:           &t.Models,
 		FormatModels:     toAPITemplateFormatModels(t.FormatModels),
@@ -64,7 +65,6 @@ func toAPIModelMapping(m domain.ModelMapping) *map[string]ModelMappingEntry {
 
 // toAPIAccount 账号领域对象 → 契约类型（Template 字段由仓库预加载）。
 func toAPIAccount(a *domain.Account) Account {
-	st := AccountStatus(a.Status)
 	var tpl *Template
 	if a.Template != nil {
 		t := toAPITemplate(a.Template)
@@ -77,22 +77,34 @@ func toAPIAccount(a *domain.Account) Account {
 		Template:       tpl,
 		BaseURL:        a.BaseURL, // 账号级覆盖（nil = 继承模板）
 		UpstreamKey:    &a.UpstreamKey,
-		Status:         &st,
-		CooldownUntil:  a.CooldownUntil,
-		Weight:         &a.Weight,
 		MaxConcurrency: &a.MaxConcurrency,
 		LastError:      a.LastError,
 		LastUsedAt:     a.LastUsedAt,
-		CreatedAt:      &a.CreatedAt,
-		UpdatedAt:      &a.UpdatedAt,
-		DeletedAt:      a.DeletedAt, // 软删除时间戳（只读字段，入参不接收）
+		// intelligent-routing 生命周期契约（只读回显；写面 = PATCH /accounts/{id}）
+		Enabled:                &a.Enabled,
+		FailedAt:               a.FailedAt,
+		FailureSource:          a.FailureSource,
+		LifecycleRevision:      &a.LifecycleRevision,
+		IdentityRevision:       &a.IdentityRevision,
+		UpstreamCostMultiplier: httpface.Ptr(multToNormal(domain.MultBp(a.UpstreamCostMultiplierBp))), // bp → 正常值（组倍率边界换算同构）
+		CacheDomain:            a.CacheDomain,
+		SupplierUserId:         supplierUserIDPtr(a.SupplierUserID), // 0 = 平台自有 ⇒ null
+		CreatedAt:              &a.CreatedAt,
+		UpdatedAt:              &a.UpdatedAt,
+		DeletedAt:              a.DeletedAt, // 软删除时间戳（只读字段，入参不接收）
 	}
+}
+
+// supplierUserIDPtr 归属只读回显：0（平台自有）⇒ nil（契约 null）；非 0 ⇒ 地址。
+func supplierUserIDPtr(uid int64) *int64 {
+	if uid == 0 {
+		return nil
+	}
+	return &uid
 }
 
 // toAPIAccountView 账号运行时视图 → 契约类型（AccountView 是平铺结构，
 // 非 allOf 嵌入：所有 Account 字段内联 + concurrency/err_rate/err_count）。
-// Status/CooldownUntil 取调度器内存合并值（A-4：列表显示与 Select 请求行为
-// 同源——回写丢失/失败时不再显示 DB 镜像的 active）。
 func toAPIAccountView(v *service.AccountView) AccountView {
 	base := toAPIAccount(v.Account)
 	return AccountView{
@@ -100,20 +112,26 @@ func toAPIAccountView(v *service.AccountView) AccountView {
 		Name:       base.Name,
 		TemplateID: base.TemplateID,
 		Template:   base.Template,
-		// BaseURL 平铺逐字段拷贝（C3——缺则列表/编辑回显恒缺，前端保存静默清空）
+		// BaseURL 平铺逐字段拷贝（缺则列表/编辑回显恒缺，前端保存静默清空）
 		BaseURL:        base.BaseURL,
 		UpstreamKey:    base.UpstreamKey,
-		Status:         ptr(AccountStatus(v.Status)), // A-4：调度器内存权威（快照未加载时 = DB 值，与合并块同构）
-		CooldownUntil:  v.CooldownUntil,              // A-4：同上
-		Weight:         base.Weight,
 		MaxConcurrency: base.MaxConcurrency,
 		LastError:      base.LastError,
 		LastUsedAt:     base.LastUsedAt,
-		CreatedAt:      base.CreatedAt,
-		UpdatedAt:      base.UpdatedAt,
-		Concurrency:    &v.Concurrency,
-		ErrRate:        &v.ErrRate,
-		ErrCount:       &v.ErrCount,
+		// 生命周期字段平铺拷贝（缺则列表编辑回显恒缺——base_url 同款教训）
+		Enabled:                base.Enabled,
+		FailedAt:               base.FailedAt,
+		FailureSource:          base.FailureSource,
+		LifecycleRevision:      base.LifecycleRevision,
+		IdentityRevision:       base.IdentityRevision,
+		UpstreamCostMultiplier: base.UpstreamCostMultiplier,
+		CacheDomain:            base.CacheDomain,
+		SupplierUserId:         base.SupplierUserId, // 归属回显（列表展示/清空入口依赖）
+		CreatedAt:              base.CreatedAt,
+		UpdatedAt:              base.UpdatedAt,
+		Concurrency:            &v.Concurrency,
+		ErrRate:                &v.ErrRate,
+		ErrCount:               &v.ErrCount,
 	}
 }
 
@@ -129,8 +147,9 @@ func toAPIGroup(g *domain.Group) Group {
 	return Group{
 		ID:              &g.ID,
 		Name:            &g.Name,
+		Description:     httpface.Ptr(g.Description),
 		Visibility:      &v,
-		PriceMultiplier: ptr(multToNormal(g.PriceMultiplier)),
+		PriceMultiplier: httpface.Ptr(multToNormal(g.PriceMultiplier)),
 		ProtocolConvert: &converts,
 		CreatedAt:       &g.CreatedAt,
 		UpdatedAt:       &g.UpdatedAt,
@@ -239,7 +258,7 @@ func multI64ToNormalPtr(v *int64) *float64 {
 	return &f
 }
 
-// --- 图片价格 API 边界换算（Task A；单位规则与 pricings 相同，独立函数自文档化） ---
+// --- 图片价格 API 边界换算（；单位规则与 pricings 相同，独立函数自文档化） ---
 //
 // 1 USD = 100,000 毫分。token 价：USD/1M image tokens ×1e5 → 毫分/1M——与
 // pricings 的 usdToMillis ×1e5 同系数同口径，直接复用不另设函数；per-image 价：
@@ -247,20 +266,14 @@ func multI64ToNormalPtr(v *int64) *float64 {
 // 不走 /1e6 除法，独立函数自文档化）。
 
 // usdPerImageToMilli USD/张 → 毫分/张（×1e5；与 token 价同为 ×1e5 系数但单位
-// 语义独立——按张 flat 计费，防混用）。
-func usdPerImageToMilli(usd float64) int64 { return int64(math.Round(usd * 1e5)) }
+// 语义独立——按张 flat 计费，防混用）。实现与 usdToMillis 共用（同系数同取整）。
+func usdPerImageToMilli(usd float64) int64 { return usdToMillis(usd) }
 
 // milliPerImageToUSD 毫分/张 → USD/张（/1e5；API 展示换算）。
 func milliPerImageToUSD(millis int64) float64 { return float64(millis) / 1e5 }
 
 // usdPerImageToMilliPtr *float64（USD/张）→ *int64（毫分/张）；nil 透传。
-func usdPerImageToMilliPtr(v *float64) *int64 {
-	if v == nil {
-		return nil
-	}
-	i := usdPerImageToMilli(*v)
-	return &i
-}
+func usdPerImageToMilliPtr(v *float64) *int64 { return usdToMillisPtr(v) }
 
 // milliPerImageToUSDPtr *int64（毫分/张）→ *float64（USD/张）；nil 透传。
 func milliPerImageToUSDPtr(v *int64) *float64 {
@@ -277,8 +290,9 @@ func milliPerImageToUSDPtr(v *int64) *float64 {
 // input_cost_per_query 原生口径；系数与 usdPerImageToMilli/usdToMillis 相同但
 // 单位语义独立——按次 flat 计费不走 /1e6 除法，独立函数防误用）。
 
-// usdPerCallToMilli USD/次 → 毫分/次（×1e5；math.Round 消除浮点取整误差）。
-func usdPerCallToMilli(usd float64) int64 { return int64(math.Round(usd * 1e5)) }
+// usdPerCallToMilli USD/次 → 毫分/次（×1e5）。实现与 usdToMillis 共用（同系数
+// 同取整）。
+func usdPerCallToMilli(usd float64) int64 { return usdToMillis(usd) }
 
 // milliPerCallToUSD 毫分/次 → USD/次（/1e5；API 展示换算，回显 litellm 原生
 // 口径 input_cost_per_query）。
@@ -286,13 +300,7 @@ func milliPerCallToUSD(millis int64) float64 { return float64(millis) / 1e5 }
 
 // usdPerCallToMilliPtr *float64（USD/次，litellm 原生口径）→ *int64（毫分/次）；
 // nil 透传。
-func usdPerCallToMilliPtr(v *float64) *int64 {
-	if v == nil {
-		return nil
-	}
-	i := usdPerCallToMilli(*v)
-	return &i
-}
+func usdPerCallToMilliPtr(v *float64) *int64 { return usdToMillisPtr(v) }
 
 // milliPerCallToUSDPtr *int64（毫分/次）→ *float64（USD/次）；nil 透传。
 func milliPerCallToUSDPtr(v *int64) *float64 {
@@ -313,7 +321,7 @@ func normalToMultI64Ptr(v *float64) *int64 {
 }
 
 // toAPIUser 用户领域对象 → 契约类型（PasswordHash 永不下发；Balance 毫分 →
-// USD 展示换算；价格倍率按组（T3.5 修正）挂在 group_assignment 上，User 无
+// USD 展示换算；价格倍率按组挂在 group_assignment 上，User 无
 // 倍率字段）。
 func toAPIUser(u *domain.User) User {
 	r := UserRole(u.Role)
@@ -324,9 +332,24 @@ func toAPIUser(u *domain.User) User {
 		Role:           &r,
 		Status:         &st,
 		MaxConcurrency: &u.MaxConcurrency,
-		Balance:        ptr(millisToUSD(u.Balance)),
+		Balance:        httpface.Ptr(millisToUSD(u.Balance)),
 		CreatedAt:      &u.CreatedAt,
 		UpdatedAt:      &u.UpdatedAt,
+	}
+}
+
+// toAPIBalanceLog 余额变动记录领域对象 → 契约类型（Amount/BalanceAfter 毫分 →
+// USD 展示换算；Amount 有符号——正=增加/负=减少）。
+func toAPIBalanceLog(l *domain.BalanceLog) BalanceLog {
+	return BalanceLog{
+		ID:           l.ID,
+		UserID:       l.UserID,
+		Amount:       millisToUSD(l.Amount),
+		BalanceAfter: millisToUSD(l.BalanceAfter),
+		Source:       BalanceLogSource(l.Source),
+		OperatorID:   l.OperatorID,
+		Note:         l.Note,
+		CreatedAt:    l.CreatedAt,
 	}
 }
 

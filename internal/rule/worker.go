@@ -16,7 +16,7 @@ import (
 // cleanupInterval 过期账号清理周期（窗口计数防 map 泄漏）。
 const cleanupInterval = time.Minute
 
-// Name 满足 worker.Worker 契约（Global Constraints #5）。
+// Name 满足 worker.Worker 契约（Global Constraints）。
 func (e *RuleEngine) Name() string { return "rule-engine" }
 
 // Start 启动事件消费循环（含周期性窗口清理）；重复 Start 返回错误（幂等）。
@@ -24,6 +24,12 @@ func (e *RuleEngine) Start(ctx context.Context) error {
 	if !e.startOnce.CompareAndSwap(false, true) {
 		return fmt.Errorf("rule-engine: already started")
 	}
+	persistCtx, cancel := context.WithCancel(ctx)
+	e.persistMu.Lock()
+	e.persistCtx = persistCtx
+	e.persistCancel = cancel
+	e.persistDone = worker.GoLoop(persistCtx, "rule-engine-persist", e.log, e.persistLoop)
+	e.persistMu.Unlock()
 	worker.GoLoop(ctx, "rule-engine", e.log, e.loop)
 	return nil
 }
@@ -59,7 +65,63 @@ func (e *RuleEngine) Flush(ctx context.Context) {
 			e.HandleEvent(ctx, ev)
 			e.resetDropWarnIfDrained()
 		default:
+			e.flushPersist(ctx)
 			return
+		}
+	}
+}
+
+func (e *RuleEngine) flushPersist(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case item := <-e.persistCh:
+			e.processPersistItem(ctx, item, false)
+		default:
+			return
+		}
+	}
+}
+
+func (e *RuleEngine) persistLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case item := <-e.persistCh:
+			// rethrow=true: a callback panic propagates to worker.GoLoop for restart.
+			e.processPersistItem(ctx, item, true)
+		}
+	}
+}
+
+// processPersistItem runs one persist queue item: release pending exactly once
+// (even on panic), log a callback panic, and count + warn on persistence
+// failure. rethrow distinguishes the callers: flushPersist (Flush/Close,
+// synchronous drain) swallows the panic after logging; persistLoop re-panics so
+// worker.GoLoop can restart the loop.
+func (e *RuleEngine) processPersistItem(ctx context.Context, item PersistItem, rethrow bool) {
+	defer func() {
+		if e.persistPending.Add(-1) < 0 {
+			e.persistPending.Store(0)
+		}
+		if r := recover(); r != nil {
+			if e.log != nil {
+				e.log.Warn("persist callback panicked", logx.Any("panic", r))
+			}
+			if rethrow {
+				panic(r)
+			}
+		}
+	}()
+	fn := e.persistFn
+	if fn != nil {
+		if err := fn(ctx, item); err != nil && ctx.Err() == nil {
+			e.persistFailures.Add(1)
+			if e.log != nil {
+				e.log.Warn("rule action persistence failed", logx.Int64("account_id", item.Event.AccountID), logx.Error(err))
+			}
 		}
 	}
 }
@@ -77,6 +139,7 @@ func (e *RuleEngine) resetDropWarnIfDrained() {
 
 // Close 排空剩余事件（限时，复用 scheduler.Close 模式）；幂等，
 // 未 Start 时也可安全排空。循环本身随 Start 的 ctx 取消而退出。
+// Fix: cancel persist loop and join in-flight callback; no callback may remain after Close.
 func (e *RuleEngine) Close(ctx context.Context) error {
 	done := make(chan struct{})
 	worker.GoRecover("rule-engine-close", e.log, func() {
@@ -98,11 +161,33 @@ func (e *RuleEngine) Close(ctx context.Context) error {
 			e.log.Warn("rule-engine close timeout, dropping queued events")
 		}
 	}
+	// Cancel persist loop and wait for in-flight callback to finish (worker pattern).
+	e.persistMu.Lock()
+	cancel := e.persistCancel
+	doneCh := e.persistDone
+	e.persistMu.Unlock()
+	if cancel != nil {
+		cancel()
+		if doneCh != nil {
+			select {
+			case <-doneCh:
+			case <-ctx.Done():
+				if e.log != nil {
+					e.log.Warn("rule-engine persist close timeout, waiting for callback")
+				}
+				<-doneCh
+			}
+		}
+	}
+	// Drain any remaining persist items that were queued but not yet processed
+	// (pending already includes them; flush will decrement per item).
+	// If Start was never called, background loop never ran, so synchronously drain.
+	e.flushPersist(ctx)
 	return nil
 }
 
 // Enqueue 投递事件：有界 channel，满则丢弃（dropped 原子计数）。热点修复 B：
-// 逐条 Warn → 阈值告警（errlog 同构）——丢弃累计 ≥ ruleDropWarnThreshold 且
+// 逐条 Warn → 阈值告警（errlog 同构）——丢弃累计 ≥ e.dropWarnThreshold 且
 // 边沿未告警 → Warn 恰好一次（带累计数），不再刷屏。热路径纪律：丢弃路径
 // 仅两个原子操作（Add + CompareAndSwap），零分配；日志只在阈值跨越时产生。
 func (e *RuleEngine) Enqueue(ev Event) {
@@ -110,11 +195,11 @@ func (e *RuleEngine) Enqueue(ev Event) {
 	case e.ch <- ev:
 	default:
 		n := e.dropped.Add(1)
-		if n >= uint64(ruleDropWarnThreshold) && e.warnDropped.CompareAndSwap(false, true) {
+		if n >= uint64(e.dropWarnThreshold) && e.warnDropped.CompareAndSwap(false, true) {
 			if e.log != nil {
 				e.log.Warn("rule-engine event queue full, dropping events",
 					logx.Int64("dropped", int64(n)),
-					logx.Int64("threshold", ruleDropWarnThreshold),
+					logx.Int64("threshold", e.dropWarnThreshold),
 					logx.Int("queue_cap", cap(e.ch)),
 				)
 			}

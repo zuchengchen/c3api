@@ -7,8 +7,11 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import { Plus, Pencil, Trash2, ScrollText, Ban, CircleCheck } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import type { TFunction } from 'i18next'
+import type { DynamicKey } from '@/lib/i18n'
 import { api } from '@/App'
 import { ApiUnauthorized } from '@/lib/api/client'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { BatchBar } from '@/components/batch-bar'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -20,17 +23,27 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { cn } from '@/lib/utils'
 import type { components } from '@/lib/api/schema'
 
 type Rule = components['schemas']['Rule']
 type RuleCreate = components['schemas']['RuleCreate']
-type AccountStatus = components['schemas']['AccountStatus']
 
 // 规则事件类型（spec：ok | 429 | 4xx | 5xx | network——error 已拆分为
 // 4xx/5xx/network，连接级独立 network）。
 const KINDS = ['ok', '429', '4xx', '5xx', 'network'] as const
-// then.status 可选值（空 = 不设置状态）。
-const STATUSES: AccountStatus[] = ['active', 'unhealthy', '429', 'disabled']
+
+// —— typed 路由动作（后端 domain.RuleThen 严格反序列化 + ValidateThen 语义校验）——
+// then.throttle = {scope: account|account_route, mode: retry_after|open, duration_ms?, use_reset}
+//   retry_after 强制 use_reset=true（上游 reset 窗口优先，duration_ms 为兜底）；
+//   open 强制 use_reset=false 且 duration_ms>0。
+// then.fail_account = true：终态摘除（lifecycle CAS），与 throttle 互斥。
+// use_reset 由 mode 唯一决定（校验不变量），表单不单独编辑，序列化时按 mode 派生。
+type RuleAction = 'none' | 'throttle' | 'fail_account'
+type ThrottleScope = 'account' | 'account_route'
+type ThrottleMode = 'retry_after' | 'open'
+interface ThrottleForm { scope: ThrottleScope; mode: ThrottleMode; durationMs: string }
+const ACTIONS: RuleAction[] = ['none', 'throttle', 'fail_account']
 
 // —— 条件行模型：when = kind 锚行（Select 常驻首行）+ 动态条件行 ——
 type WhenField =
@@ -74,15 +87,15 @@ const WHEN_FIELDS: WhenFieldMeta[] = [
 const MAX_CONDITIONS = 10
 
 // WhenField key → locale 键（rules.whenFields.*）。
-const WHEN_FIELD_LOCALE: Record<WhenField, string> = {
+const WHEN_FIELD_LOCALE = {
   http_status: 'httpStatus', http_status_in: 'httpStatusIn',
   error_message_contains: 'errorContains', error_message_contains_in: 'errorContainsIn',
   account_id: 'accountId', template_id: 'templateId', group_id: 'groupId',
   model: 'model', model_in: 'modelIn', window_seconds: 'windowSeconds', count_total_ge: 'countTotal',
   count_429_ge: 'count429', ratio_429_ge: 'ratio429',
   count_failure_ge: 'countFailure', ratio_failure_ge: 'ratioFailure', count_ok_ge: 'countOK',
-}
-const whenFieldLabel = (k: WhenField) => `rules.whenFields.${WHEN_FIELD_LOCALE[k]}`
+} as const satisfies Record<WhenField, string>
+const whenFieldLabel = (k: WhenField) => `rules.whenFields.${WHEN_FIELD_LOCALE[k]}` as const
 
 // kind 相关性过滤（"添加条件"与行内字段下拉共用）。
 // kind=''（不限）→ 全部字段；否则只留归属含该 kind 的字段——
@@ -92,11 +105,11 @@ function kindFilter(kind: string): WhenFieldMeta[] {
 }
 
 interface ThenForm {
-  status: string
-  cooldown: string
-  weight: string
+  action: RuleAction
+  throttle: ThrottleForm
   responseCode: string // empty = 透传；非空 = 400-599
   customMessage: string // empty = 透传
+  failConfirmed: boolean // FailAccount 终态确认闸（编辑回显已含 fail_account 时预置 true）
 }
 interface WhenForm {
   kind: string
@@ -111,7 +124,8 @@ interface FormState {
 }
 
 const emptyWhen = (): WhenForm => ({ kind: '', rows: [] })
-const emptyThen = (): ThenForm => ({ status: '', cooldown: '', weight: '', responseCode: '', customMessage: '' })
+const emptyThrottle = (): ThrottleForm => ({ scope: 'account', mode: 'retry_after', durationMs: '' })
+const emptyThen = (): ThenForm => ({ action: 'none', throttle: emptyThrottle(), responseCode: '', customMessage: '', failConfirmed: false })
 const emptyForm = (): FormState => ({ name: '', priority: '', enabled: true, when: emptyWhen(), then: emptyThen() })
 
 // 数字字段：空/NaN → 不发送；其他字符串化。
@@ -119,6 +133,16 @@ function num(s: string): number | undefined {
   if (s === '') return undefined
   const n = Number(s)
   return Number.isNaN(n) ? undefined : n
+}
+
+// then.throttle（unknown）→ 表单值；结构不合（缺 scope/mode 或枚举外）视为无 typed 动作。
+function parseThrottle(v: unknown): ThrottleForm | null {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return null
+  const o = v as Record<string, unknown>
+  const scope: ThrottleScope | null = o.scope === 'account' || o.scope === 'account_route' ? o.scope : null
+  const mode: ThrottleMode | null = o.mode === 'retry_after' || o.mode === 'open' ? o.mode : null
+  if (!scope || !mode) return null
+  return { scope, mode, durationMs: typeof o.duration_ms === 'number' ? String(o.duration_ms) : '' }
 }
 
 // Rule.When（[key: string]: unknown）→ 条件行（未知键忽略，编辑往返保留全部已知字段；
@@ -140,9 +164,14 @@ function whenToForm(w: Rule['When']): WhenForm {
 }
 function thenToForm(th: Rule['Then']): ThenForm {
   const f = emptyThen()
-  if (typeof th.status === 'string') f.status = th.status
-  if (typeof th.cooldown === 'string') f.cooldown = th.cooldown
-  if (th.weight !== undefined && th.weight !== null) f.weight = String(th.weight)
+  const t = parseThrottle(th.throttle)
+  if (t) {
+    f.action = 'throttle'
+    f.throttle = t
+  } else if (th.fail_account === true) {
+    f.action = 'fail_account'
+    f.failConfirmed = true // 回显即已确认（避免编辑无关字段被确认闸卡死）
+  }
   if (th.response_code !== undefined && th.response_code !== null) f.responseCode = String(th.response_code)
   if (typeof th.custom_message === 'string') f.customMessage = th.custom_message
   return f
@@ -192,10 +221,15 @@ function toWhen(f: WhenForm): Record<string, unknown> {
 }
 function toThen(f: ThenForm): Record<string, unknown> {
   const th: Record<string, unknown> = {}
-  if (f.status) th.status = f.status
-  if (f.cooldown) th.cooldown = f.cooldown
-  const w = num(f.weight)
-  if (w !== undefined) th.weight = w
+  if (f.action === 'throttle') {
+    // use_reset 由 mode 派生（ValidateThen 不变量：retry_after=true / open=false）
+    const t: Record<string, unknown> = { scope: f.throttle.scope, mode: f.throttle.mode, use_reset: f.throttle.mode === 'retry_after' }
+    const d = num(f.throttle.durationMs)
+    if (d !== undefined) t.duration_ms = d
+    th.throttle = t
+  } else if (f.action === 'fail_account') {
+    th.fail_account = true
+  }
   if (f.responseCode !== '') {
     const rc = Number(f.responseCode)
     if (!Number.isNaN(rc)) th.response_code = rc
@@ -209,23 +243,24 @@ function toBody(f: FormState): RuleCreate {
 
 // —— 预设模板（点击覆盖条件行 + 动作，name/priority/enabled 保留）——
 interface TemplatePreset {
-  id: string
+  id: 'throttle429' | 'throttleRoute429' | 'escalate' | 'failFatal' | 'overload503'
   when: { [key: string]: unknown }
   then: ThenForm
 }
+const presetThen = (over: Partial<ThenForm>): ThenForm => ({ ...emptyThen(), ...over })
 const TEMPLATES: TemplatePreset[] = [
-  { id: 'cooldown429', when: { kind: '429' }, then: { status: '429', cooldown: '30s', weight: '', responseCode: '', customMessage: '' } },
-  { id: '5xxBackoff', when: { kind: '5xx' }, then: { status: 'unhealthy', cooldown: '5s', weight: '', responseCode: '', customMessage: '' } },
-  { id: 'escalate', when: { kind: '429', window_seconds: 60, count_429_ge: 3 }, then: { status: '429', cooldown: '5m', weight: '', responseCode: '', customMessage: '' } },
-  { id: 'recover', when: { kind: 'ok' }, then: { status: 'active', cooldown: '', weight: '', responseCode: '', customMessage: '' } },
-  { id: 'overload503', when: { kind: '5xx', http_status: 503, error_message_contains: 'overload' }, then: { status: '', cooldown: '', weight: '', responseCode: '', customMessage: '' } },
+  { id: 'throttle429', when: { kind: '429' }, then: presetThen({ action: 'throttle', throttle: { scope: 'account', mode: 'retry_after', durationMs: '' } }) },
+  { id: 'throttleRoute429', when: { kind: '429' }, then: presetThen({ action: 'throttle', throttle: { scope: 'account_route', mode: 'retry_after', durationMs: '' } }) },
+  { id: 'escalate', when: { kind: '429', window_seconds: 60, count_429_ge: 3 }, then: presetThen({ action: 'throttle', throttle: { scope: 'account', mode: 'open', durationMs: '300000' } }) },
+  { id: 'failFatal', when: { kind: '4xx', http_status: 401, error_message_contains: 'invalid_api_key' }, then: presetThen({ action: 'fail_account' }) },
+  { id: 'overload503', when: { kind: '5xx', http_status: 503, error_message_contains: 'overload' }, then: presetThen({}) },
 ]
 
 // —— 摘要渲染 ——
-function WhenSummary({ w, t }: { w: Rule['When']; t: (k: string) => string }) {
+function WhenSummary({ w, t }: { w: Rule['When']; t: TFunction }) {
   if (!w || Object.keys(w).length === 0) return <span className="text-muted-foreground">—</span>
   const parts: string[] = []
-  if (typeof w.kind === 'string') parts.push(t(`rules.kind.${w.kind}`))
+  if (typeof w.kind === 'string') parts.push(t(`rules.kind.${w.kind}` as DynamicKey))
   if (typeof w.http_status === 'number') parts.push(`HTTP ${w.http_status}`)
   if (Array.isArray((w as Record<string, unknown>).http_status_in)) parts.push(`HTTP [${((w as Record<string, unknown>).http_status_in as unknown[]).join(',')}]`)
   if (typeof w.error_message_contains === 'string') parts.push(t('rules.when.errorContains') + ` "${w.error_message_contains}"`)
@@ -245,13 +280,13 @@ function WhenSummary({ w, t }: { w: Rule['When']; t: (k: string) => string }) {
   return <span className="block max-w-64 truncate text-xs" title={parts.join(' · ')}>{parts.join(' · ') || '—'}</span>
 }
 
-function ThenSummary({ th, t }: { th: Rule['Then']; t: (k: string, opts?: Record<string, unknown>) => string }) {
+function ThenSummary({ th, t }: { th: Rule['Then']; t: TFunction }) {
   if (!th || Object.keys(th).length === 0) return <span className="text-muted-foreground">—</span>
   const parts: string[] = []
-  if (typeof th.status === 'string') parts.push(`→${th.status}`)
-  if (typeof th.cooldown === 'string') parts.push(`⏱${th.cooldown}`)
-  if (typeof th.weight === 'number') parts.push(`w=${th.weight}`)
-  if (typeof th.response_code === 'number') parts.push(t('rules.then.overrideSummary', { code: th.response_code } as unknown as Record<string, unknown>))
+  const t5 = parseThrottle(th.throttle)
+  if (t5) parts.push(`${t('rules.then.summaryThrottle')} ${t5.scope}/${t5.mode}${t5.durationMs ? ` ${t5.durationMs}ms` : ''}`)
+  if (th.fail_account === true) parts.push(t('rules.then.summaryFail'))
+  if (typeof th.response_code === 'number') parts.push(t('rules.then.overrideSummary', { code: th.response_code }))
   if (typeof th.custom_message === 'string' && th.custom_message !== '') parts.push(t('rules.then.fixedMessage'))
   return <span className="block max-w-40 truncate text-xs" title={parts.join(' · ')}>{parts.join(' · ') || '—'}</span>
 }
@@ -357,6 +392,18 @@ export default function Rules() {
   // kind=ok + error_message_contains → 确定死配置（ok 事件错误信息恒空）；比例无总次数 → 缺失依赖。
   const submit = () => {
     if (!form.name.trim() || form.priority === '') return
+    if (form.then.action === 'throttle') {
+      const d = num(form.then.throttle.durationMs)
+      if (form.then.throttle.durationMs !== '' && (d === undefined || d <= 0)) {
+        setWhenErr(t('rules.then.errDurationPositive'))
+        return
+      }
+      if (form.then.throttle.mode === 'open' && (d === undefined || d <= 0)) {
+        setWhenErr(t('rules.then.errDurationRequired'))
+        return
+      }
+    }
+    if (form.then.action === 'fail_account' && !form.then.failConfirmed) return
     if (form.then.responseCode !== '') {
       const rc = Number(form.then.responseCode)
       if (Number.isNaN(rc) || rc < 400 || rc > 599) {
@@ -372,7 +419,7 @@ export default function Rules() {
     ]
     for (const [a, b] of exclusivePairs) {
       if (when[a] !== undefined && when[b] !== undefined) {
-        setWhenErr(t('rules.whenErrMutual', { a, b } as unknown as Record<string, unknown>) || `${a} and ${b} are mutually exclusive`)
+        setWhenErr(t('rules.whenErrMutual', { a, b }) || `${a} and ${b} are mutually exclusive`)
         return
       }
     }
@@ -407,7 +454,7 @@ export default function Rules() {
         }
       }
       if (new Set(arr).size !== arr.length) {
-        setWhenErr(t('rules.whenErrDuplicate', { field: s.key } as unknown as Record<string, unknown>) || `${s.key} contains duplicate value`)
+        setWhenErr(t('rules.whenErrDuplicate', { field: s.key }) || `${s.key} contains duplicate value`)
         return
       }
     }
@@ -415,7 +462,9 @@ export default function Rules() {
     save.mutate(form)
   }
   const errMsg = (e: unknown) => (e instanceof ApiUnauthorized ? null : (e as Error)?.message)
-  const setThen = (k: keyof ThenForm, v: string) => setForm(f => ({ ...f, then: { ...f.then, [k]: v } }))
+  const setThen = (k: 'responseCode' | 'customMessage', v: string) => setForm(f => ({ ...f, then: { ...f.then, [k]: v } }))
+  const setAction = (a: RuleAction) => setForm(f => ({ ...f, then: { ...f.then, action: a } }))
+  const setThrottle = (patch: Partial<ThrottleForm>) => setForm(f => ({ ...f, then: { ...f.then, throttle: { ...f.then.throttle, ...patch } } }))
 
   return (
     <div className="space-y-6">
@@ -451,7 +500,7 @@ export default function Rules() {
           </Card>
         </motion.div>
       ) : (
-        <ScrollArea data-od-id="table-scroll-rules" className="rounded-[14px] border border-transparent bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] after:pointer-events-none after:absolute after:inset-0 after:z-20 after:rounded-[14px] after:border after:border-[rgba(19,45,83,0.26)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:after:border-[rgba(148,180,220,0.32)]" showHorizontal>
+        <ScrollArea data-od-id="table-scroll-rules" className="rounded-[14px] border border-[rgba(19,45,83,0.26)] bg-[color:var(--glass-card-light)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_10px_36px_rgba(19,45,83,0.16)] backdrop-blur-[var(--glass-blur)] dark:bg-[color:var(--glass-card-dark)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.07),0_10px_36px_rgba(2,6,14,0.5)] dark:border-[rgba(148,180,220,0.32)]" showHorizontal>
           <Table className="min-w-[1050px]" containerClassName="overflow-x-visible border-0 shadow-none rounded-none bg-transparent backdrop-blur-none">
             <TableHeader>
               <TableRow>
@@ -528,8 +577,8 @@ export default function Rules() {
             </div>
 
             {/* 基础 */}
-            <div className="grid grid-cols-3 gap-3">
-              <div className="col-span-2 space-y-1.5">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <div className="space-y-1.5 sm:col-span-2">
                 <Label htmlFor="rl-name">{t('rules.nameLabel')}</Label>
                 <Input id="rl-name" value={form.name} placeholder={t('rules.namePlaceholder')} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} />
               </div>
@@ -546,7 +595,7 @@ export default function Rules() {
             {/* 匹配 when：kind 锚行 + 动态条件行（行渲染不过滤，仅添加下拉防呆） */}
             <div className="space-y-2">
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t('rules.whenTitle')}</p>
-              <div className="flex items-end gap-2">
+              <div className="grid gap-1 sm:flex sm:items-end sm:gap-2">
                 <div className="space-y-1.5">
                   <Label>{t('rules.when.kind')}</Label>
                   <Select
@@ -571,7 +620,7 @@ export default function Rules() {
               {form.when.rows.map((r, i) => {
                 const meta = WHEN_FIELDS.find(f => f.key === r.field)
                 // 行内下拉按 kind 过滤（用户反馈：选事件类型后不该出现无关条件）；
-                // 越界行（kind 切换后字段不在过滤集）附加为额外选项保留——不丢行（评审 I-1）。
+                // 越界行（kind 切换后字段不在过滤集）附加为额外选项保留——不丢行。
                 const rowOptions = kindFilter(form.when.kind)
                 if (!rowOptions.some(f => f.key === r.field)) {
                   const cur = WHEN_FIELDS.find(f => f.key === r.field)
@@ -634,35 +683,106 @@ export default function Rules() {
               )}
             </div>
 
-            {/* 动作 then（可选组合） */}
-            <div className="space-y-2">
+            {/* 动作 then：typed 互斥动作（none|throttle|fail_account）+ 独立 response shaping */}
+            <div className="space-y-3">
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t('rules.thenTitle')}</p>
-              <p className="text-xs text-muted-foreground">{t('rules.then.passthroughHint')}</p>
-              <div className="grid grid-cols-3 gap-3">
-                <div className="space-y-1.5">
-                  <Label>{t('rules.then.status')}</Label>
-                  <Select
-                    items={Object.fromEntries([['', t('rules.any')], ...STATUSES.map(s => [s, t(`status.${s}`)])])}
-                    value={form.then.status || null}
-                    onValueChange={v => setThen('status', v)}
-                  >
-                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="" label={t('rules.any')}>{t('rules.any')}</SelectItem>
-                      {STATUSES.map(s => <SelectItem key={s} value={s} label={t(`status.${s}`)}>{t(`status.${s}`)}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="rl-cd">{t('rules.then.cooldown')}</Label>
-                  <Input id="rl-cd" placeholder="30s / 5m / 1h" value={form.then.cooldown} onChange={e => setThen('cooldown', e.target.value)} />
-                </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="rl-w">{t('rules.then.weight')}</Label>
-                  <Input id="rl-w" type="number" min={0} max={100} placeholder="0" value={form.then.weight} onChange={e => setThen('weight', e.target.value)} />
-                </div>
+              <p className="text-xs text-muted-foreground">{t('rules.then.asyncHint')}</p>
+
+              <div role="radiogroup" aria-label={t('rules.then.actionTitle')} className="grid gap-2 sm:grid-cols-3">
+                {ACTIONS.map(a => {
+                  const selected = form.then.action === a
+                  return (
+                    <label
+                      key={a}
+                      htmlFor={`rl-act-${a}`}
+                      className={cn(
+                        'flex cursor-pointer items-start gap-2 rounded-lg border p-3 text-sm transition-colors',
+                        selected ? 'border-primary bg-primary/5' : 'border-border hover:bg-accent/50',
+                      )}
+                    >
+                      <input
+                        id={`rl-act-${a}`}
+                        type="radio"
+                        name="rl-action"
+                        value={a}
+                        checked={selected}
+                        onChange={() => setAction(a)}
+                        className="mt-0.5 size-4 shrink-0 accent-primary"
+                      />
+                      <span className="grid gap-0.5">
+                        <span className="font-medium">{t(`rules.then.action.${a}`)}</span>
+                        <span className="text-xs leading-snug text-muted-foreground">{t(`rules.then.action.${a}Hint`)}</span>
+                      </span>
+                    </label>
+                  )
+                })}
               </div>
-              <div className="grid grid-cols-2 gap-3">
+
+              {form.then.action === 'throttle' && (
+                <div className="grid gap-3 sm:grid-cols-3">
+                  <div className="space-y-1.5">
+                    <Label>{t('rules.then.throttle.scope')}</Label>
+                    <Select
+                      items={{ account: t('rules.then.throttle.scopeAccount'), account_route: t('rules.then.throttle.scopeAccountRoute') }}
+                      value={form.then.throttle.scope}
+                      onValueChange={v => v && setThrottle({ scope: v as ThrottleScope })}
+                    >
+                      <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="account" label={t('rules.then.throttle.scopeAccount')}>{t('rules.then.throttle.scopeAccount')}</SelectItem>
+                        <SelectItem value="account_route" label={t('rules.then.throttle.scopeAccountRoute')}>{t('rules.then.throttle.scopeAccountRoute')}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>{t('rules.then.throttle.mode')}</Label>
+                    <Select
+                      items={{ retry_after: t('rules.then.throttle.modeRetryAfter'), open: t('rules.then.throttle.modeOpen') }}
+                      value={form.then.throttle.mode}
+                      onValueChange={v => v && setThrottle({ mode: v as ThrottleMode })}
+                    >
+                      <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="retry_after" label={t('rules.then.throttle.modeRetryAfter')}>{t('rules.then.throttle.modeRetryAfter')}</SelectItem>
+                        <SelectItem value="open" label={t('rules.then.throttle.modeOpen')}>{t('rules.then.throttle.modeOpen')}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="rl-th-dur">{t('rules.then.throttle.duration')}</Label>
+                    <Input
+                      id="rl-th-dur"
+                      type="number"
+                      min={1}
+                      step={1000}
+                      placeholder="30000"
+                      value={form.then.throttle.durationMs}
+                      onChange={e => setThrottle({ durationMs: e.target.value })}
+                    />
+                  </div>
+                  <p className="text-xs text-muted-foreground sm:col-span-3">
+                    {form.then.throttle.mode === 'open' ? t('rules.then.throttle.durationOpenHint') : t('rules.then.throttle.durationRetryHint')}
+                  </p>
+                  <p className="text-xs text-muted-foreground sm:col-span-3">
+                    {form.then.throttle.scope === 'account' ? t('rules.then.throttle.scopeAccountHint') : t('rules.then.throttle.scopeAccountRouteHint')}
+                  </p>
+                </div>
+              )}
+
+              {form.then.action === 'fail_account' && (
+                <Alert variant="destructive">
+                  <AlertTitle>{t('rules.then.fail.title')}</AlertTitle>
+                  <AlertDescription className="space-y-2">
+                    <p>{t('rules.then.fail.desc')}</p>
+                    <label className="flex cursor-pointer items-center gap-2 text-sm font-medium">
+                      <Checkbox checked={form.then.failConfirmed} onCheckedChange={c => setForm(f => ({ ...f, then: { ...f.then, failConfirmed: c === true } }))} />
+                      {t('rules.then.fail.confirm')}
+                    </label>
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <div className="space-y-1.5">
                   <Label htmlFor="rl-rc">{t('rules.then.responseCode')}</Label>
                   <Input id="rl-rc" type="number" min={400} max={599} step={1} placeholder="503" value={form.then.responseCode} onChange={e => setThen('responseCode', e.target.value)} />
@@ -676,7 +796,6 @@ export default function Rules() {
               {form.then.responseCode !== '' && (() => { const n = Number(form.then.responseCode); return !Number.isNaN(n) && (n < 400 || n > 599) })() && (
                 <p className="text-sm text-destructive">{t('rules.then.errResponseRange')}</p>
               )}
-              <p className="text-xs text-muted-foreground">{t('rules.thenHint')}</p>
             </div>
 
             {save.isError && errMsg(save.error) && (
@@ -686,7 +805,10 @@ export default function Rules() {
           </ScrollArea>
           <DialogFooter>
             <Button variant="outline" onClick={() => setDialogOpen(false)} disabled={save.isPending}>{t('common.cancel')}</Button>
-            <Button onClick={submit} disabled={save.isPending || !form.name.trim() || form.priority === ''}>
+            <Button
+              onClick={submit}
+              disabled={save.isPending || !form.name.trim() || form.priority === '' || (form.then.action === 'fail_account' && !form.then.failConfirmed)}
+            >
               {save.isPending ? t('common.saving') : editing ? t('common.saveChanges') : t('common.create')}
             </Button>
           </DialogFooter>
@@ -699,7 +821,7 @@ export default function Rules() {
           <DialogHeader>
             <DialogTitle>{t('rules.deleteTitle')}</DialogTitle>
             <DialogDescription>
-              {t('rules.deleteDesc', { name: deleting?.Name })}
+              {t('rules.deleteDesc', { name: deleting?.Name ?? '' })}
             </DialogDescription>
           </DialogHeader>
           {remove.isError && errMsg(remove.error) && (

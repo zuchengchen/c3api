@@ -12,16 +12,17 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/is7qin/c3api/internal/credential"
 	"github.com/is7qin/c3api/internal/domain"
 	"github.com/is7qin/c3api/internal/notify"
-	"github.com/is7qin/c3api/internal/pricing"
 	"github.com/is7qin/c3api/internal/repository"
 	"github.com/is7qin/c3api/internal/scheduler"
 	serviceerr "github.com/is7qin/c3api/internal/service/errors"
+	"github.com/is7qin/c3api/internal/settingssnap"
 	"github.com/is7qin/c3api/pkg/logx"
 )
 
@@ -31,6 +32,9 @@ var (
 	ErrNotFound              = serviceerr.ErrNotFound
 	ErrInvalidInput          = serviceerr.ErrInvalidInput
 	ErrConflict              = serviceerr.ErrConflict
+	ErrEmailExists           = serviceerr.ErrEmailExists
+	ErrPreconditionFailed    = serviceerr.ErrPreconditionFailed
+	ErrForbidden             = serviceerr.ErrForbidden
 	ErrTooManyRequests       = serviceerr.ErrTooManyRequests
 	ErrMailNotConfigured     = serviceerr.ErrMailNotConfigured
 	ErrMailQueueFull         = serviceerr.ErrMailQueueFull
@@ -45,8 +49,10 @@ type Store interface {
 	AccountStore
 	GroupStore
 	KeyStore
+	ManagementKeyStore
 	GroupAssignmentStore
 	UserStore
+	BalanceLogStore
 	SettingStore
 	RuleStore
 	LogStore
@@ -56,16 +62,18 @@ type Store interface {
 	TemplateExtStore
 	AccountExtStore
 	EmailTemplateStore
+	SupplierStore
+	SupplierAdminStore
 	// EmailCodeStore 不在复合面：验证码已迁 Redis（spec 2026-08-25-emailcode-
-	// redis-migration §2.2/§2.3），经 SetEmailCodeStore 独立注入，repository
-	// 实现已随 PG 验证码表卸载。
-	// WithTx 在单事务内执行 fn（评审 I-1）：真实仓库为 tx 版 Repository（全部走
+	// redis-migration §2.2/§2.3），经 New 的 Deps.EmailCodeStore 独立注入，
+	// repository 实现已随 PG 验证码表卸载。
+	// WithTx 在单事务内执行 fn：真实仓库为 tx 版 Repository（全部走
 	// tx 连接）；fake 为事务语义模拟（fn 内变更先入暂存、成功提交/失败丢弃——
 	// 回滚断言的前提）。
 	WithTx(ctx context.Context, fn func(repository.TxStore) error) error
 }
 
-// UserStore 用户持久化（Phase 3a）。
+// UserStore 用户持久化。
 type UserStore interface {
 	CreateUser(ctx context.Context, u *domain.User) (*domain.User, error)
 	GetUser(ctx context.Context, id int64) (*domain.User, error)
@@ -75,7 +83,7 @@ type UserStore interface {
 	ListUsers(ctx context.Context, q repository.ListQuery) ([]*domain.User, int64, error)
 	UpdateUser(ctx context.Context, p *repository.UserPatch) (*domain.User, error)
 	UpdateUserPassword(ctx context.Context, id int64, passwordHash string) error
-	// 原子资源更新（评审 I-1：兑换码 applier 用；普通 client 与 tx client 均可用）。
+	// 原子资源更新（兑换码 applier 用；普通 client 与 tx client 均可用）。
 	UpdateUserBalance(ctx context.Context, userID, delta int64) error
 	UpdateUserMaxConcurrency(ctx context.Context, userID int64, value int) error
 	UpdateUserBalanceWarningThreshold(ctx context.Context, userID int64, threshold int64) (*domain.User, int64, error)
@@ -93,7 +101,12 @@ type UserStore interface {
 	ListUserEmails(ctx context.Context, ids []int64) (map[int64]string, error)
 }
 
-// SettingStore 类型化配置持久化（Phase 3a）。
+// BalanceLogStore 余额变动记录（管理面只读列表：/api/admin/users/{id}/balance-logs）。
+type BalanceLogStore interface {
+	ListUserBalanceLogs(ctx context.Context, userID int64, q repository.ListQuery) ([]*domain.BalanceLog, int64, error)
+}
+
+// SettingStore 类型化配置持久化。
 type SettingStore interface {
 	GetSetting(ctx context.Context, key string) (*domain.Setting, error)
 	GetAllSettings(ctx context.Context) ([]*domain.Setting, error)
@@ -108,7 +121,7 @@ type KeyStore interface {
 	// ListKeys 管理端全量 key 列表（/api/admin/keys：软删过滤 + UserID/GroupID
 	// 零值不过滤 + 3 键 sort 白名单；脱敏在 handler 转换面——明文字段不下发）。
 	ListKeys(ctx context.Context, q repository.ListQuery) ([]*domain.Key, int64, error)
-	// UpdateKey patch 语义更新（S3-F1）：仅 Set 非 nil 字段，nil = 不改——并发
+	// UpdateKey patch 语义更新：仅 Set 非 nil 字段，nil = 不改——并发
 	// 两个 PUT 改不同字段各自生效（对齐 UserPatch 范式）。
 	UpdateKey(ctx context.Context, p *repository.KeyPatch) (*domain.Key, error)
 	RotateKey(ctx context.Context, id int64, newRaw string) (*domain.Key, error)
@@ -117,13 +130,23 @@ type KeyStore interface {
 	DeleteKeysByGroup(ctx context.Context, groupID int64) ([]string, error)
 }
 
+// ManagementKeyStore 管理 API key（mk-，spec 2026-10-09）持久化。owner-only：
+// 更新/删除带 owner 作用域（越域/缺失 → ErrNotFound）。
+type ManagementKeyStore interface {
+	CreateManagementKey(ctx context.Context, k *domain.ManagementKey) (*domain.ManagementKey, error)
+	// ListManagementKeysByUser 列 owner 自身的管理 key（软删过滤；含明文）。
+	ListManagementKeysByUser(ctx context.Context, userID int64) ([]*domain.ManagementKey, error)
+	UpdateManagementKey(ctx context.Context, p *repository.ManagementKeyPatch) (*domain.ManagementKey, error)
+	DeleteManagementKey(ctx context.Context, userID, id int64) (string, error)
+}
+
 // GroupAssignmentStore private 组授予持久化（/api/admin/groups/{id}/assignments +
 // /api/user/groups 可选组列表）。
 type GroupAssignmentStore interface {
 	GrantGroup(ctx context.Context, groupID, userID int64) error
 	RevokeGroup(ctx context.Context, groupID, userID int64) error
-	// SetAssignmentMultiplier 设置/清除该用户在该组的专属价格倍率（T3.5 修正：
-	// 按组；m = nil → 清除为未设置 → 回退组倍率；0 = 免费）。
+	// SetAssignmentMultiplier 设置/清除该用户在该组的专属价格倍率：
+	// 按组；m = nil → 清除为未设置 → 回退组倍率；0 = 免费。
 	SetAssignmentMultiplier(ctx context.Context, groupID, userID int64, m *int) error
 	ListAssignmentsByUser(ctx context.Context, userID int64) ([]*domain.GroupAssignment, error)
 	ListAssignmentsByGroup(ctx context.Context, groupID int64) ([]*domain.GroupAssignment, error)
@@ -147,15 +170,19 @@ type AccountStore interface {
 	CreateAccount(ctx context.Context, a *domain.Account) (*domain.Account, error)
 	GetAccount(ctx context.Context, id int64) (*domain.Account, error)
 	ListAccounts(ctx context.Context, q repository.ListQuery) ([]*domain.Account, int64, error)
-	UpdateAccount(ctx context.Context, a *domain.Account, cooldownUntil *time.Time) (*domain.Account, error)
+	FailAccountCAS(ctx context.Context, id int64, expectedRevision int64, source string, failedAt time.Time, reason string) error
+	RecoverAccountCAS(ctx context.Context, id int64, expectedRevision int64) error
 	DeleteAccount(ctx context.Context, id int64) error
 	DeleteAccountsBatch(ctx context.Context, ids []int64) error
-	UpdateAccountsBatch(ctx context.Context, ids []int64, p repository.AccountPatch) error
+	UpdateAccountsBatch(ctx context.Context, ids []int64, p repository.AccountPatch) ([]repository.AccountWriteResult, error)
 	// SetAccountGroups 替换账号的全部分组（替换语义；空数组 = 清空）。
 	SetAccountGroups(ctx context.Context, accountID int64, groupIDs []int64) error
 	// GetAccountGroups 账号的分组 id 列表（编辑回显；账号缺 id 由调用方先
 	// GetAccount 拦截）。
 	GetAccountGroups(ctx context.Context, accountID int64) ([]int64, error)
+	// FindMissingOwnedAccountID ids 中第一个越出当前作用域的 id（usage 聚合面的整批
+	// 前置校验——§2.5「批量面任一越域即整事务失败」；作用域未注入 ⇒ 恒 false）。
+	FindMissingOwnedAccountID(ctx context.Context, ids []int64) (int64, bool, error)
 }
 
 type GroupStore interface {
@@ -171,31 +198,35 @@ type GroupStore interface {
 	LoadGroupAccounts(ctx context.Context, groupID int64) ([]*domain.Account, error)
 }
 
-// TemplateExtStore 模板类型化扩展持久化（template_ext 1:1；W1 数据层 CRUD，
-// 消费接线留给 W3/W4/W6）。
+// TemplateExtStore 模板类型化扩展持久化（template_ext 1:1；数据层 CRUD，
+// 消费接线留给后续扩展）。
 type TemplateExtStore interface {
 	UpsertTemplateExt(ctx context.Context, e *domain.TemplateExt) (*domain.TemplateExt, error)
 	GetTemplateExt(ctx context.Context, templateID int64) (*domain.TemplateExt, error)
 }
 
-// AccountExtStore 账号类型化鉴权扩展持久化（account_ext 1:1；W1 数据层 CRUD，
-// 消费接线留给 W6）。TryInsertAccountExt：首写原子性（ON CONFLICT DO NOTHING
+// AccountExtStore 账号类型化鉴权扩展持久化（account_ext 1:1；数据层 CRUD，
+// 消费接线留给后续扩展）。TryInsertAccountExt：首写原子性（ON CONFLICT DO NOTHING
 // 先写者胜）——并发双导入同一账号不覆盖不报错。
+//
+// 写入面只暴露**围栏动词**：管理面全量写走 AdminUpsertAccountExtCAS（CAS +
+// 推进 C，按值推进 K），凭据轮转走 AdminWrite*CAS；无围栏的 UpsertAccountExt
+// 只作为事务内动词存在（TxStore，批量导入在单事务里建行），不投给 service。
 type AccountExtStore interface {
-	UpsertAccountExt(ctx context.Context, e *domain.AccountExt) (*domain.AccountExt, error)
+	AdminUpsertAccountExtCAS(ctx context.Context, e *domain.AccountExt, expectedRevision int64) (*domain.AccountExt, error)
 	TryInsertAccountExt(ctx context.Context, e *domain.AccountExt) (bool, error)
 	GetAccountExt(ctx context.Context, accountID int64) (*domain.AccountExt, error)
-	// FindAccountExtByCodexKey 组合幂等键查重（Task B 批量导入——(codex_email,
+	// GetOwnedAccountExt 作用域内的 ext 单读（usage 上游凭据组装面）：owner 谓词
+	// AND 进同一 SQL，越域/缺失/无 ext 行 ⇒ ErrNotFound（调用方按无上游能力处理）。
+	GetOwnedAccountExt(ctx context.Context, accountID int64) (*domain.AccountExt, error)
+	// FindAccountExtByCodexKey 组合幂等键查重（批量导入——(codex_email,
 	// codex_account_id)；GetAccountExt 仅按 account_id，查重面不存在）；缺行 →
 	// ErrNotFound。
 	FindAccountExtByCodexKey(ctx context.Context, codexEmail, codexAccountID string) (*domain.AccountExt, error)
-	// WriteOAuthRotation oauth 凭据三列部分更新（Task B 导入 updated 路径——
-	// identity/email/其余列零触碰；SDK 轮转回写 sdkbridge.RotationStore 同签名
-	// 独立面，repository.AccountExts 一实现双面）；行缺失 → ErrNotFound。
+	// WriteOAuthRotation oauth 凭据三列部分更新（SDK 轮转回写，unfenced，不增 revision）。
 	WriteOAuthRotation(ctx context.Context, accountID int64, at, rt string, expiresAt *time.Time) error
-	// WritePATKey pat 凭据列部分更新（WriteOAuthRotation 的 pat 对称形态）；
-	// 行缺失 → ErrNotFound。
-	WritePATKey(ctx context.Context, accountID int64, patKey string) error
+	AdminWriteOAuthRotationCAS(ctx context.Context, accountID int64, expectedRevision int64, at, rt string, expiresAt *time.Time) error
+	AdminWritePATKeyCAS(ctx context.Context, accountID int64, expectedRevision int64, patKey string) error
 }
 
 // EmailTemplateStore 邮件模板持久化。
@@ -206,6 +237,30 @@ type EmailTemplateStore interface {
 	DeleteEmailTemplate(ctx context.Context, purpose string) error
 }
 
+// SupplierStore 供应商业务面持久化（spec 2026-10-09 §6.1/§6.2）：overview/
+// earnings/chunks/settlements + 申请结算（条件扣 + 期间链 + request_key 幂等）。
+type SupplierStore interface {
+	SupplierOverview(ctx context.Context, uid int64) (*domain.SupplierOverview, error)
+	SupplierChunks(ctx context.Context, uid int64, limit, offset int) ([]domain.SupplierChunk, int64, error)
+	SupplierEarnings(ctx context.Context, uid int64, limit, offset int) ([]domain.SupplierEarning, int64, error)
+	ListSupplierSettlements(ctx context.Context, uid int64, limit, offset int) ([]*domain.SupplierSettlement, int64, error)
+	ApplySettlement(ctx context.Context, req domain.ApplySettlementRequest, actor domain.FundsActor) (*domain.SupplierSettlement, error)
+}
+
+// SupplierAdminStore 管理面结算审批持久化（spec 2026-10-09 §6.3/§6.5）。
+// 资金命令以 domain.FundsActor 传具名操作者；写事务内的 I5 复核在 repository 完成。
+type SupplierAdminStore interface {
+	ListSupplierSettlementsAdmin(ctx context.Context, filter domain.SupplierSettlementFilter, limit, offset int) ([]*domain.SupplierSettlement, int64, error)
+	ListSupplierBalances(ctx context.Context, limit, offset int) ([]domain.SupplierBalance, int64, error)
+	PatchSupplierBalance(ctx context.Context, uid int64, p domain.SupplierBalancePatch) (*domain.SupplierBalance, error)
+	ApproveSettlement(ctx context.Context, id, expectedRevision int64, actor domain.FundsActor) (*domain.SupplierSettlement, error)
+	RejectSettlement(ctx context.Context, id, expectedRevision int64, reason *string, actor domain.FundsActor) (*domain.SupplierSettlement, error)
+	ClaimSettlement(ctx context.Context, id, expectedRevision, amountMillis int64, payee domain.SupplierPayeeSnapshot, risk domain.SupplierRiskEvidence, actor domain.FundsActor) (*domain.SupplierSettlement, error)
+	ConfirmFailedSettlement(ctx context.Context, id, expectedRevision int64, in domain.SupplierPayoutFailureConfirmation, actor domain.FundsActor) (*domain.SupplierSettlement, error)
+	PaidSettlement(ctx context.Context, id, expectedRevision int64, externalRef string, actor domain.FundsActor) (*domain.SupplierSettlement, error)
+	AdminApplySettlement(ctx context.Context, req domain.ApplySettlementRequest, actor domain.FundsActor) (*domain.SupplierSettlement, error)
+}
+
 // EmailCodeStore 验证码持久化。
 type EmailCodeStore interface {
 	GetEmailCode(ctx context.Context, email, purpose string) (*domain.EmailCode, error)
@@ -214,7 +269,7 @@ type EmailCodeStore interface {
 	DeleteEmailCode(ctx context.Context, email, purpose string) error
 }
 
-// RedemptionStore 兑换码 + 兑换审计持久化（Phase 5 计费前基础设施）。
+// RedemptionStore 兑换码 + 兑换审计持久化（计费前基础设施）。
 // 兑换事务编排（Redeem）经 Store.WithTx 以 repository.TxStore 面访问。
 type RedemptionStore interface {
 	CreateCodes(ctx context.Context, codes []*domain.RedemptionCode) error
@@ -253,40 +308,51 @@ type LogStore interface {
 }
 
 type StatStore interface {
-	// /api/admin/overview 聚合面（spec 2026-08-14）：SQL 侧聚合（F-P2-2 形态——
-	// 服务端 GROUP BY 返回日桶，不拉全行客户端聚合）。zone = 请求浏览器时区
-	// （handler 边界校验；nil/UTC = 现状 cube 路径）；repo 内按
-	// domain.ZoneCubeExact 路由 cube 重组 vs 原始行精确聚合。
-	SummarizeStats(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) (*repository.StatSummary, error)
-	ScanStatsDays(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) ([]*repository.StatDayAgg, error)
+	// /api/admin/overview 聚合面（spec 2026-08-14）：SQL 侧聚合——
+	// 服务端 GROUP BY 返回日桶，不拉全行客户端聚合。zone = 请求浏览器时区
+	// （handler 边界校验；nil/UTC = UTC）。**Cube/Raw 是两套同形 SQL 的纯执行
+	// 方法**：本接口与实现零存储判定、零时区路由知识——「cube 还是原始行」
+	// 唯一由 domain.Admit 判定，调用方（service）据 Exec.Storage 选择（spec
+	// stats-window-plan §4.1「调用选择而非数据标志」）。
+	SummarizeStatsCube(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) (*repository.StatSummary, error)
+	SummarizeStatsRaw(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) (*repository.StatSummary, error)
+	ScanStatsDaysCube(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) ([]*repository.StatDayAgg, error)
+	ScanStatsDaysRaw(ctx context.Context, from, to time.Time, groupID int64, zone *time.Location) ([]*repository.StatDayAgg, error)
 	CountOverviewResources(ctx context.Context) (*repository.OverviewResourceCounts, error)
-	StatsTrend(ctx context.Context, from, to time.Time, unit string, groupID int64, model string, zone *time.Location) ([]*domain.StatBucket, error)
+	StatsTrendCube(ctx context.Context, from, to time.Time, unit string, groupID int64, model string, zone *time.Location) ([]*domain.StatBucket, error)
+	StatsTrendRaw(ctx context.Context, from, to time.Time, unit string, groupID int64, model string, zone *time.Location) ([]*domain.StatBucket, error)
 	StatsTop(ctx context.Context, from, to time.Time, entityType string, by string, limit int) ([]*domain.EntityStatBucket, error)
-	StatsEntityTrend(ctx context.Context, from, to time.Time, unit string, entityType string, entityID int64, model string, zone *time.Location) ([]*domain.EntityStatBucket, error)
+	StatsEntityTrendCube(ctx context.Context, from, to time.Time, unit string, entityType string, entityID int64, model string, zone *time.Location) ([]*domain.EntityStatBucket, error)
+	StatsEntityTrendRaw(ctx context.Context, from, to time.Time, unit string, entityType string, entityID int64, model string, zone *time.Location) ([]*domain.EntityStatBucket, error)
 	StatsTTFTSketch(ctx context.Context, from, to time.Time, model string) (*domain.TTFTSummary, error)
 	StatsTTFTExact(ctx context.Context, from, to time.Time, entityType string, entityID int64, model string) (*domain.TTFTSummary, error)
 }
 
-// Invalidator 管理面变更的去抖定向失效回调（O2 接线矩阵，评审 M-1）：
+// Invalidator 管理面变更的去抖定向失效回调（接线矩阵）：
 // service 各 CRUD 在变更落库成功后调用对应方法；实现 = invalidate.Debouncer
 // （去抖窗口合并 + 单 goroutine 串行执行 + 按矩阵定向重载，main 装配）。
 // key/pricing 变更不走此接口（auth 增量 Upsert/Delete / 内部 reloadPricing，
 // 已轻量）。Mark 路径零锁零 DB，不阻塞任何调用方。
 type Invalidator interface {
 	// Users 用户 CRUD（含创建）与用户余额变更（含 Redeem）：auth + 余额快照
-	// 全量 Reload（去抖窗口内合并；新用户必须即刻进余额快照——评审 M-2，
+	// 全量 Reload（去抖窗口内合并；新用户必须即刻进余额快照
 	// 防 ≤10s 402 窗口，回归测试 tools/e2e）。
 	Users()
 	// Templates 模板（base_url/models/映射）变更：sched 全量 + clients 失效
 	// （base_url 变更需按新地址重建 SDK 客户端）。
 	Templates()
 	// Accounts 账号变更（创建/更新/删除/批量）：sched 组级定向重载受影响组
-	// （gids）；keyChanged（upstream_key 变更）→ clients 失效。
+	// （gids）；keyChanged（身份类字段变更）→ clients 失效。
 	Accounts(gids []int64, keyChanged bool)
 	// Multipliers 组倍率 / 用户-组专属倍率（price_multiplier）变更（含组创建/
 	// 删除与 group_assignment CRUD——新倍率须即刻进快照）：余额倍率快照定向
 	// 刷新（EffectiveMultiplier 陈旧 ≤10s 不可接受）。
 	Multipliers()
+	// Settings settings 变更（UpdateSetting）：scope 声明方（auth）快照重载
+	// （gate 预算按新 N 重算；≤200ms 去抖窗口与其余 Kind 一致）；settings
+	// 快照由 UpdateSetting 自身同步刷新后才 mark（顺序不变量：快照刷新
+	// 先于 auth.Reload）。
+	Settings()
 }
 
 // NopInvalidator 无效化 no-op（测试与无关路径）。
@@ -296,6 +362,7 @@ func (NopInvalidator) Users()                 {}
 func (NopInvalidator) Templates()             {}
 func (NopInvalidator) Accounts([]int64, bool) {}
 func (NopInvalidator) Multipliers()           {}
+func (NopInvalidator) Settings()              {}
 
 // RuleReloader 由 rule.RuleEngine 实现：规则 CRUD 后全量重载（invalidate 钩子）。
 // 独立于通用 invalidate——规则重载会重置窗口计数，不能随任意资源变更触发。
@@ -303,9 +370,9 @@ type RuleReloader interface {
 	Reload(ctx context.Context) error
 }
 
-// Publisher 多实例 NOTIFY 发布面（#14 T2）：实现 = *notify.Publisher（Publish
+// Publisher 多实例 NOTIFY 发布面：实现 = *notify.Publisher（Publish
 // 在 DB 写成功后调用，与 inv.* 调用点并排）；接口化供测试注入 fake（与
-// Invalidator 同模式）。nil = 单实例/未装配（T2 过渡），publish no-op。
+// Invalidator 同模式）。nil = 单实例/未装配（过渡），publish no-op。
 type Publisher interface {
 	Publish(ctx context.Context, ch notify.Change) error
 }
@@ -323,56 +390,193 @@ type KeyRegistrar interface {
 	Delete(hash string)
 }
 
+// ManagementKeyRegistrar 由 proxy.Auth 实现，供管理 key（mk-）变更时增量刷新
+// 鉴权快照：创建/禁用/删除在本实例即时生效；跨实例经 NOTIFY → Auth.Reload 收敛。
+type ManagementKeyRegistrar interface {
+	UpsertManagementKey(raw string, meta domain.ManagementKeyMeta)
+	DeleteManagementKey(raw string)
+}
+
+// AuthRegistrar 合并客户端 key 与管理 key 的鉴权快照增量面（spec 2026-10-09 §4.3）：
+// proxy.Auth 同时实现两者——同一 auth 只传一次。
+type AuthRegistrar interface {
+	KeyRegistrar
+	ManagementKeyRegistrar
+}
+
+// SupplierViewReloader 供应商财务视图装载面（*supplier.ViewLoader 实现）：账号
+// **归属/启用**写成功后触发本地有界 Reload，使旧归属尽早从视图消失、新归属尽早
+// 入选（spec 2026-10-09 §4.6.3 发布屏障）。nil = 功能关闭/未装配（no-op）。
+type SupplierViewReloader interface {
+	Reload(ctx context.Context) bool
+}
+
 type Service struct {
 	store Store
 	// emailCodes 验证码存储（Redis 实现，spec 2026-08-25-emailcode-redis-migration
-	// §2.2）：SetEmailCodeStore 回填（Set* 事后回填惯例），Redis 必选 ⇒ 非 nil。
+	// §2.2）：New 经 Deps.EmailCodeStore 一次性注入，Redis 必选 ⇒ 非 nil
+	//（nil panic fail-fast）。
 	emailCodes EmailCodeStore
 	sched      RuntimeProvider
-	inv        Invalidator // 管理面变更去抖失效（O2 接线矩阵；nil = 不失效）
-	pub        Publisher   // 多实例 NOTIFY 发布器（#14 T2；nil = 单实例/未装配，publish no-op）
+	inv        Invalidator // 管理面变更去抖失效（接线矩阵；nil = 不失效）
+	pub        Publisher   // 多实例 NOTIFY 发布器（nil = 单实例/未装配，publish no-op）
 	ruleReload RuleReloader
 	keys       KeyRegistrar
-	// local 本地变更分发器（#36 即时重算）：实现 = cmd/server dispatcher
-	// （notify.Dispatcher 接口——notify 不 import service，接口定义在 notify
-	// 包、装配侧实现，与 Invalidator/Publisher 同依赖方向）。settings 变更
-	// 本地直连 Apply（与远端 NOTIFY 同路径：同步 ReloadSettings + 注册表
-	// scope 精确重载 auth，gate 预算按新 N 重算）——自播 NOTIFY 被 Listener
-	// Src 跳过，本地实例不能依赖 NOTIFY 回环。nil = 未装配（单实例/测试）
-	// no-op。
-	local notify.Dispatcher
-	// settings 设置全量内存快照（默认值 + DB 覆盖）：公开读路径（注册等）
-	// 零 DB 直读；仅管理面 UpdateSetting 后重载（低频，无锁）。
-	settings atomic.Pointer[map[string]*domain.Setting]
+	// mgmtKeys 管理 key 鉴权快照增量面（*proxy.Auth 实现；nil = 不刷新——测试
+	// 降级路径）。管理 key 变更后本地 Upsert/Delete + publish(NOTIFY) 双写。
+	mgmtKeys ManagementKeyRegistrar
+	// supplierViewReload 财务视图装载面（账号归属/启用写成功后本地 Reload；
+	// §4.6.3 发布屏障）。nil = 功能关闭/未装配（见 Deps.SupplierViewReload）。
+	supplierViewReload SupplierViewReloader
+	// settings 设置全量内存快照（默认值 + DB 覆盖）：Service 与 MailWorker
+	// 同源共享单个 *settingssnap.Snapshot（根因重开——单指针，无双快照
+	// 分叉；NOTIFY 只刷这一处）。公开读路径零 DB 直读；仅管理面
+	// UpdateSetting 后重载（低频，无锁）。
+	settings *settingssnap.Snapshot
 	// priceSnapshot 统一价格快照：entries + variants
 	priceSnapshot atomic.Pointer[priceSnapshot]
-	// priceFetcher 价格拉取器（pricing.Fetcher 实现）：管理端手动 sync
-	// （SyncPricingNow）与 cron worker 共享同一实例（main 装配注入；nil 时
-	// SyncPricingNow 返回错误——启动配置缺失，不应发生）。
-	priceFetcher pricing.Fetcher
-	// usageSnapshots codex 额度快照数据源（*sdkbridge.Codex 满足；AccountUsage
-	// 调用——nil = 未装配（测试/单实例），AccountUsage 返回 nil 快照）。
-	usageSnapshots              CodexUsageSnapshotter
+	// recoverProber 恢复→PROBING 健康写入面（New 经 Deps.RecoverProber
+	// 注入；nil = 未装配，recover 仅完成持久恢复——调度器同步周期兜底）。
+	recoverProber RecoverProber
+	// recoverLatch 恢复→latch 显式释放面（New 经 Deps.RecoverLatch
+	// 注入；nil = 未装配，跳过释放）。
+	recoverLatch RecoverLatchReleaser
+	// recoverHealthClear 恢复→健康记录显式清除面（New 经
+	// Deps.RecoverHealthClear 注入；nil = 未装配，跳过清除）。
+	recoverHealthClear RecoverHealthClearer
+	// compileNotify 路由编译触发面（New 经 Deps.CompileNotify
+	// 一次性注入；nil = 未装配，定价写面静默——仅编译道装配后有效。
+	// 调用方承诺非阻塞，见 pricing.go）。
+	compileNotify               func()
 	mailEnqueue                 func(MailSendTask) error
 	clearBalanceWarningCooldown func(context.Context, int64, int64) error
-	tzLoc                       *time.Location
-	// statsRawSpan 浏览器时区原始行分组路径的窗口上限（usage_logs/err_logs
-	// 原始行保留期决定）：New 缺省 MaxStatsRawSpan（8d = errlog 默认保留 7d +
-	// 1d 日历余量），main 经 SetStatsRawSpan(min(log, errlog) 正保留) 按部署
-	// 配置换算；0 = 不限（双保留均禁用）。校验见 validateZoneSpan。
-	statsRawSpan time.Duration
-	// statsRawRetentionDays statsRawSpan 背后的正保留天数（main 传 usage_logs
-	// 与 err_logs 的最小正保留——raw 读两表，两者都须完整覆盖）：retention
-	// 兜底用——窗口起点早于保证存留的分区 cutoff 时，行已被 retention DROP，
-	// 宁 400 不静默残缺；0 = 禁用/不限（跳过兜底）。
-	statsRawRetentionDays int
-	// statsNow 当前时间源（nil = time.Now；Service 测试注入固定时钟）。
+	// defaultMaxConcurrency 创建期 max_concurrency 缺省落值（main 经
+	// Deps.DefaultMaxConcurrency 一次性注入；0 = 未装配，create 视为
+	// 未提供由校验拒绝）。
+	defaultMaxConcurrency int
+	// supplierGranularity 解冻粒度（main 传 cfg.Supplier.ThawGranularity）：管理面
+	// PATCH share_bp/freeze_hours 的跨字段上界校验用（§6.4 A16⑤）。0 = 未装配
+	//（测试/降级路径），仅做值域校验。
+	supplierGranularity time.Duration
+	tzLoc               *time.Location
+	// retention 统计面 coverage 步的保留期来源（usage_logs/err_logs/usage_stats
+	// 三表天数；New 经 Deps.Retention 一次性注入）。判定唯一入口
+	// domain.Admit 以**参数**接收它（纯函数：不读配置、不读全局）。Days(t) <= 0
+	// ⇒ 该表守卫关闭（分区保留被禁用）。
+	retention domain.Retention
+	// warnThrottleMu / warnThrottle 降级 Warn 节流（spec §4.3）：同
+	// (kind, zone 名, reason) 每分钟至多一条。状态随 Service（不用包级单例
+	// ——测试构造大量 Service，包级态会跨用例泄漏）。见 warnAllowed。
+	warnThrottleMu sync.Mutex
+	warnThrottle   map[warnThrottleKey]int64
+	// statsNow 当前时间源（nil = time.Now；Service 测试注入固定时钟——统计
+	// 窗口守卫与路由观测窗口守卫共用同一时钟源）。
 	statsNow func() time.Time
-	log      *logx.Logger
+	// routingRetentionDays 路由观测保留天数（New 经
+	// Deps.RoutingObservationRetentionDays 一次性注入；0 = 未装配，
+	// 守卫关闭）。见 validateRoutingRetention。
+	routingRetentionDays int
+	log                  *logx.Logger
 }
 
-func New(store Store, sched RuntimeProvider, invalidate Invalidator, pub Publisher, ruleReload RuleReloader, keys KeyRegistrar, log *logx.Logger) *Service {
-	s := &Service{store: store, sched: sched, inv: invalidate, pub: pub, ruleReload: ruleReload, keys: keys, log: log, statsRawSpan: MaxStatsRawSpan}
+// Deps 是 New 的**全部**构造依赖（S2/C4：原 8 位置参数折叠为单个具名结构——
+// 前 7 个为 store/sched/invalidate/pub/ruleReload/keys/log，其余为原尾部
+// Deps 的一次性依赖，合并入本结构）。具名字段自文档且调用点可只填所需
+// （缺省 nil/零值 = 未装配语义，与已删除的历史 setter 未调用一致；**无事后
+// Set* 回填**——历史 setter 已随构造折叠删除）。
+type Deps struct {
+	// Store 复合持久化面（repository.Repository 实现）。
+	Store Store
+	// Scheduler 账号运行时视图（overview/列表运行时视图；nil = 未装配）。
+	Scheduler RuntimeProvider
+	// Invalidate 管理面变更去抖失效（nil = 不失效）。
+	Invalidate Invalidator
+	// Publisher 多实例 NOTIFY 发布器（nil = 单实例/未装配，publish no-op）。
+	Publisher Publisher
+	// RuleReload 规则重载面（规则写后触发；nil = 不重载）。
+	RuleReload RuleReloader
+	// Auth 合并的鉴权快照增量面（客户端 key + 管理 key；*proxy.Auth 实现；
+	// nil = 不刷新）。同一 auth 只传一次（spec 2026-10-09 §4.3）。
+	Auth AuthRegistrar
+	// SupplierViewReload 供应商财务视图装载面（*supplier.ViewLoader 实现；
+	// 账号归属/启用写成功后本地 Reload——先让旧归属停止入选再换归属，§4.6.3）。
+	// nil = 功能关闭/未装配（no-op）。**注意 typed-nil**：调用方须传真 nil 接口，
+	// 不得把 nil *ViewLoader 装箱（否则写面 Reload 会打到 nil receiver）。
+	SupplierViewReload SupplierViewReloader
+	// Log 面日志（nil = 静默）。
+	Log *logx.Logger
+
+	// EmailCodeStore 验证码存储（Redis 实现，必选依赖）：nil 直接 panic
+	// fail-fast（与原 SetEmailCodeStore 同纪律——生产误接线必须启动即炸，
+	// 无降级路径）。
+	EmailCodeStore EmailCodeStore
+	// TimeLocation 定价时段解释用时区：nil = 进程本地（现状），
+	// 非 nil = at.In(tzLoc) 后再进 domain.ResolveEntryPrices（零热路径额外 DB/锁）。
+	TimeLocation *time.Location
+	// Retention 统计面 coverage 步的三表保留天数（main 传 usage.log/errlog/
+	// stats_retention_days 三者原件）：domain.Admit 的 step 4 据此算各表 floor
+	// （读 N 张表取最保守者）。**不再预先把 raw 双表折成 min 天数**——max-of-floors
+	// 是 Tables 的自然推论（spec §4.5）。各字段 <= 0 ⇒ 该表守卫关闭。
+	Retention domain.Retention
+	// ClearBalanceWarningCooldown 余额预警偏好变更后的 Redis 已知键清理：
+	// nil = 禁用清理（仅做偏好持久化）。
+	ClearBalanceWarningCooldown func(context.Context, int64, int64) error
+	// RecoverProber 恢复→PROBING 健康写入面：nil = 跳过 PROBING 写
+	// （调度器同步周期兜底收敛）。
+	RecoverProber RecoverProber
+	// RecoverLatch 恢复→latch 显式释放面：nil = 跳过释放。
+	RecoverLatch RecoverLatchReleaser
+	// RecoverHealthClear 恢复→健康记录显式清除面：nil = 跳过清除。
+	RecoverHealthClear RecoverHealthClearer
+	// CompileNotify 路由编译触发面（定价写面统一出口的 notify 回调）：
+	// nil = 未装配（测试/降级路径），定价写面纯重载 + 仍发布 NOTIFY，
+	// 同值写静默纪律见 reloadPricingAndNotifyCompiler。生产装配
+	// scheduler.RequestCompile（func 值注入，无 import 环）。
+	CompileNotify func()
+	// MailEnqueue 邮件异步入队面（auth_email.go 经此入队；nil = 未装配 →
+	// SendRegisterCode 退化为 ErrMailNotConfigured）。生产经构造一次性注入
+	// mailW.Enqueue（根因重开——构造参数，零事后回填）。
+	MailEnqueue func(MailSendTask) error
+	// SettingsSnapshot settings 快照共享指针（根因重开）：生产由 main
+	// 一次构造、Service 与 MailWorker 同源共享；nil = New 内自建（测试/
+	// 字面量 Service 兼容——各测自有快照，无跨实例语义）。
+	SettingsSnapshot *settingssnap.Snapshot
+	// DefaultMaxConcurrency 账号创建期 max_concurrency 缺省落值：main 传
+	// cfg.Scheduler.DefaultMaxConcurrency；0 = 未装配（create 显式给 0 即
+	// 落 0，由校验拒绝而非静默钳制）。
+	DefaultMaxConcurrency int
+	// RoutingObservationRetentionDays 路由观测保留天数（main 传
+	// cfg.Routing.ObservationRetentionDays）：/routing/flow 与 /routing/frontier
+	// 窗口守卫的 cutoff 来源，与 retention worker 同源（同一份天数 + 同一换算）。
+	// 0 = 未装配（测试/降级路径），守卫关闭。
+	RoutingObservationRetentionDays int
+	// SupplierThawGranularity 解冻粒度（main 传 cfg.Supplier.ThawGranularity）：
+	// 管理面 PATCH share_bp/freeze_hours 跨字段上界校验（§6.4 A16⑤）。0 = 未装配。
+	SupplierThawGranularity time.Duration
+}
+
+// New 构造 Service（全部依赖经单一 Deps 注入，S2 消重）。
+func New(deps Deps) *Service {
+	if deps.EmailCodeStore == nil {
+		panic("service: New(nil EmailCodeStore): Redis 是必选依赖，验证码存储无降级路径")
+	}
+	s := &Service{store: deps.Store, sched: deps.Scheduler, inv: deps.Invalidate, pub: deps.Publisher,
+		ruleReload: deps.RuleReload, keys: deps.Auth, mgmtKeys: deps.Auth, log: deps.Log,
+		supplierViewReload: deps.SupplierViewReload,
+		emailCodes:         deps.EmailCodeStore, tzLoc: deps.TimeLocation, recoverProber: deps.RecoverProber,
+		recoverLatch: deps.RecoverLatch, recoverHealthClear: deps.RecoverHealthClear,
+		defaultMaxConcurrency:       deps.DefaultMaxConcurrency,
+		compileNotify:               deps.CompileNotify,
+		mailEnqueue:                 deps.MailEnqueue,
+		clearBalanceWarningCooldown: deps.ClearBalanceWarningCooldown,
+		routingRetentionDays:        deps.RoutingObservationRetentionDays,
+		supplierGranularity:         deps.SupplierThawGranularity,
+		retention:                   deps.Retention}
+	if deps.SettingsSnapshot != nil {
+		s.settings = deps.SettingsSnapshot
+	} else {
+		s.settings = settingssnap.New(deps.Store, deps.Log)
+	}
 	// settings 快照构造时首载（注册表不覆盖 settings——NOTIFY 处理路径
 	// ReloadSettings 保持既有行为）；pricing 快照首载统一由快照注册表
 	// ReloadAll 承担（单一启动入口，消灭"构造即载 + 注册表再刷"双重加载）。
@@ -380,73 +584,46 @@ func New(store Store, sched RuntimeProvider, invalidate Invalidator, pub Publish
 	return s
 }
 
-// SetTimeLocation 注入定价时段解释用时区（D-TZ2）：nil = 进程本地（现状），
-// 非 nil = at.In(tzLoc) 后再进 domain.ResolveEntryPrices（零热路径额外 DB/锁）。
-func (s *Service) SetTimeLocation(l *time.Location) { s.tzLoc = l }
-
-// SetStatsRawSpan 按部署配置换算原始行分组 horizon（main 注入 usage_logs 与
-// err_logs 两者的最小正保留天数——raw 路径读两表，horizon 必须被双方都完整
-// 覆盖）：days > 0 → (days+1)×24h 窗口上限 + days 保留兜底 cutoff（1d DST/
-// 日界日历余量——默认 7d → 8d，与 MaxStatsRawSpan 缺省同值）；days <= 0 →
-// 0 = 不限窗口且无兜底（分区保留被禁用，既无固定 horizon 也无保证存留期）。
-// 绝不把 horizon 报得比配置保留期更长——超限窗口宁 400 不静默残缺。
-func (s *Service) SetStatsRawSpan(retentionDays int) {
-	if retentionDays > 0 {
-		s.statsRawSpan = time.Duration(retentionDays+1) * 24 * time.Hour
-		s.statsRawRetentionDays = retentionDays
-		return
-	}
-	s.statsRawSpan = 0
-	s.statsRawRetentionDays = 0
-}
-
-// SetMailEnqueue 注入邮件入队函数（D-W1异步化：svc 构造后回填 mailW.Enqueue——
-// 循环依赖先例 SetLocalDispatcher；未注入 → SendRegisterCode 退化为 ErrMailNotConfigured）。
-func (s *Service) SetMailEnqueue(fn func(MailSendTask) error) { s.mailEnqueue = fn }
-
-// SetEmailCodeStore 注入验证码存储（spec 2026-08-25-emailcode-redis-migration §2.2）：
-// 实现 = verification.Store（Redis HASH）。Redis 必选依赖 ⇒ 无 nil 分支，收到
-// nil 直接 panic fail-fast（与 redisx.Open 的 Ping fail-fast 同纪律）。main 在
-// svc 构造后回填；测试经同 setter 注入 fake。
-func (s *Service) SetEmailCodeStore(store EmailCodeStore) {
-	if store == nil {
-		panic("service: SetEmailCodeStore(nil): Redis 是必选依赖，验证码存储无降级路径")
-	}
-	s.emailCodes = store
-}
-
-// SetLocalDispatcher 注入本地变更分发器（#36 本地实例即时重算）：main 装配序
-// 上 dispatcher 需要 svc、svc 需要 dispatcher（本地分发）——构造环，svc
-// 构造完成后回填。
-// 未注入 = 单实例/测试：settings 变更不做本地 scope 分发（预算重算由 60s
-// auth-sync / 下次变更兜底收敛，单实例无多实例分摊语义）。
-func (s *Service) SetLocalDispatcher(d notify.Dispatcher) { s.local = d }
-
-// publish 发布一条 NOTIFY 变更（#14 T2）：与现有 inv.* 调用点并排，DB 写成功
+// publish 发布一条 NOTIFY 变更：与现有 inv.* 调用点并排，DB 写成功
 // 后调用。失败忽略——NOTIFY 是事件提示，丢一条由 60s 周期兜底收敛（Publisher
-// 内部已 Warn），不回滚业务。pub 为 nil（T2 过渡：main 未装配）→ no-op；
-// T3 main 装配后必非 nil。
-// 空 Change（评审 I-1）：全字段为空（Users/Templates/Clients/Multipliers/
-// Keys/Settings/Rules 全 false 且 Groups 空）→ 判空跳过不 Publish（no-op）。
-// CreateAccount 无 GroupIDs / UpdateAccount 无变更的空载荷在此统一覆盖（与
-// O2 inv.Accounts 空集 no-op 同语义）。
-// 发布脱离请求 ctx（评审 I-2）：请求 ctx 取消（客户端断开）不吞 NOTIFY——
+// 内部已 Warn），不回滚业务。pub 为 nil（过渡：main 未装配）→ no-op；
+// main 装配后必非 nil。
+// 空 Change：notify.Change.IsEmpty()（9 变更位全 false 且 Groups
+// 空）→ 判空跳过不 Publish（no-op）。创建无分组 / 补丁无分组变更的空载荷在此
+// 统一覆盖（与 inv.Accounts 的空分组集 no-op 同语义）。
+// 发布脱离请求 ctx：请求 ctx 取消（客户端断开）不吞 NOTIFY——
 // context.WithoutCancel 剥离取消/超时信号仅继承值；NOTIFY 是连接写无悬挂
 // 风险，发布必须到最后一个字节。
 func (s *Service) publish(ctx context.Context, ch notify.Change) {
 	if s.pub == nil {
 		return
 	}
-	if !ch.Users && !ch.Templates && !ch.Clients && !ch.Multipliers &&
-		!ch.Keys && !ch.Settings && !ch.Rules && len(ch.Groups) == 0 {
-		return // 空 Change：无任何变更语义（评审 I-1）
+	if ch.IsEmpty() {
+		return // 空 Change：无任何变更语义
 	}
 	_ = s.pub.Publish(context.WithoutCancel(ctx), ch)
 }
 
-// validateBaseURL 校验 base_url：可解析、有 scheme/host，且为裸根（不含尾
-// /v1）。/v1 是协议细节（aiclient 按格式追加；anthropic SDK 自带 v1 前缀，
-// base 含 /v1 会拼出 /v1/v1/messages 404）——约定裸根，防呆拒绝含 /v1。
+// supplierViewReloadTimeout 归属/启用写后财务视图本地 Reload 的有界超时。
+const supplierViewReloadTimeout = 3 * time.Second
+
+// reloadSupplierView 账号**归属/启用**写成功后触发财务视图换代（spec 2026-10-09
+// §4.6.3 发布屏障）：先让旧归属从视图消失、新归属尽早入选，否则调度快照已换代
+// 而财务视图仍陈旧，发布窗口内可能把流量记到旧 uid。脱离请求 ctx（WithoutCancel）
+// 避免客户端断开吞掉换代；有界超时避免写面被慢装载拖住。未装配（关闭态/测试）⇒
+// best-effort no-op（ticker 兜底收敛）。
+func (s *Service) reloadSupplierView(ctx context.Context) {
+	if s.supplierViewReload == nil {
+		return
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), supplierViewReloadTimeout)
+	defer cancel()
+	s.supplierViewReload.Reload(rctx)
+}
+
+// validateBaseURL 校验 base_url：可解析、有 scheme/host，且路径不以 /v1
+// 结尾。协议前缀（/zen、/zen/go）合法；/v1 是协议细节（aiclient 按格式追加，
+// anthropic SDK 自带 v1 前缀，以 /v1 结尾会拼出 /v1/v1/messages 404）。
 func validateBaseURL(base string) error {
 	u, err := url.Parse(base)
 	if err != nil || u.Scheme == "" || u.Host == "" {
@@ -458,8 +635,25 @@ func validateBaseURL(base string) error {
 	return nil
 }
 
+// dedupFormats supported_formats 非空+枚举合法+去重校验，返回去重集合（供
+// FormatModels 跨字段子集校验复用）。validateTemplate / validateTemplatePatch
+// 共用——两者语义一致（空列表非法；patch 侧 nil=未提供由调用方先行跳过）。
+func dedupFormats(fs []domain.RequestFormat) (map[domain.RequestFormat]bool, error) {
+	if len(fs) == 0 {
+		return nil, ErrInvalidInput
+	}
+	seen := make(map[domain.RequestFormat]bool, len(fs))
+	for _, f := range fs {
+		if !f.Valid() || seen[f] {
+			return nil, ErrInvalidInput
+		}
+		seen[f] = true
+	}
+	return seen, nil
+}
+
 func validateTemplate(t *domain.Template) error {
-	// 评审 M-1：默认值兜底在 service 层——repo 全字段 Set 会原样写空串，
+	// 默认值兜底在 service 层——repo 全字段 Set 会原样写空串，
 	// handler 直传也可能缺省；空/缺省在此归一为 api_key，随后才校验合法性。
 	if t.CredentialType == "" {
 		t.CredentialType = credential.TypeAPIKey
@@ -467,7 +661,7 @@ func validateTemplate(t *domain.Template) error {
 	if !t.CredentialType.Valid() {
 		return ErrInvalidInput
 	}
-	if isCodexCredentialType(t.CredentialType) && t.BaseURL != "" {
+	if t.CredentialType.IsCodex() && t.BaseURL != "" {
 		return ErrInvalidInput
 	}
 	if t.Name == "" {
@@ -475,26 +669,20 @@ func validateTemplate(t *domain.Template) error {
 	}
 	// base_url 全类型可选（用户裁决 2026-08-14：模板层级所有类型都可空——codex
 	// 走 SDK 默认端点；api_key 静态透传留空则路由时失败，管理面不拦截）；提供时
-	// 校验格式（可解析、裸根不含 /v1）。
+	// 校验格式（可解析、路径不以 /v1 结尾）。
 	if t.BaseURL != "" {
 		if err := validateBaseURL(t.BaseURL); err != nil {
 			return err
 		}
 	}
-	if len(t.SupportedFormats) == 0 {
-		return ErrInvalidInput
+	seen, err := dedupFormats(t.SupportedFormats)
+	if err != nil {
+		return err
 	}
-	seen := make(map[domain.RequestFormat]bool, len(t.SupportedFormats))
-	for _, f := range t.SupportedFormats {
-		if !f.Valid() || seen[f] {
-			return ErrInvalidInput
-		}
-		seen[f] = true
-	}
-	// 类型-格式约束（W1 + Task B/D 扩展）：responses-special/codex-oauth/codex-pat
+	// 类型-格式约束（扩展）：responses-special/codex-oauth/codex-pat
 	// 类型模板支持 resp / resp-ws / openai-images / openai-search 格式（images 直连
-	// 为 Task B 用户裁决：responses-special 与 api_key 同支持两图片端点，codex 类型
-	// 走 SDK 生图；search 为 Task D 用户裁决：search 端点四类型分派全可达——
+	// 为用户裁决：responses-special 与 api_key 同支持两图片端点，codex 类型
+	// 走 SDK 生图；search 为用户裁决：search 端点四类型分派全可达——
 	// codex 类型走 SDK Search、api_key/responses-special 静态透传）；api_key 类型全部格式任意。
 	if t.CredentialType != credential.TypeAPIKey {
 		for _, f := range t.SupportedFormats {
@@ -525,33 +713,30 @@ func validateTemplate(t *domain.Template) error {
 	return nil
 }
 
-// validateAccount 基础校验。upstream_key 必填性按模板类型由调用方判定
-// （api_key/responses-special 必填；codex-oauth/codex-pat 可选——凭据走
-// account_ext，Create/UpdateAccount 处查模板类型）。
-func validateAccount(a *domain.Account) error {
-	if a.Name == "" || a.TemplateID <= 0 {
+func validateCacheDomain(s string) error {
+	if len(s) == 0 || len(s) > 253 {
 		return ErrInvalidInput
 	}
-	if a.Weight < 0 {
+	// Simple domain validation: labels 1-63, alnum/hyphen, not start/end with hyphen, dot separated, lowercased.
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '.' {
+			continue
+		}
 		return ErrInvalidInput
 	}
-	if a.MaxConcurrency < 1 {
-		a.MaxConcurrency = 8
+	if s[0] == '-' || s[0] == '.' || s[len(s)-1] == '-' || s[len(s)-1] == '.' {
+		return ErrInvalidInput
 	}
-	if a.Status == "" {
-		a.Status = domain.StatusActive
-	} else {
-		switch a.Status {
-		case domain.StatusActive, domain.StatusUnhealthy, domain.Status429, domain.StatusDisabled:
-		default:
+	if len(s) != len(strings.Trim(s, ".")) {
+		return ErrInvalidInput
+	}
+	labels := strings.Split(s, ".")
+	for _, lab := range labels {
+		if len(lab) == 0 || len(lab) > 63 {
 			return ErrInvalidInput
 		}
-	}
-	// 账号级 base_url 提供时复用 validateBaseURL（对齐模板面先例；nil/空串
-	// 跳过——create 路径空串已归一 nil，此处双保险）。
-	if a.BaseURL != nil && *a.BaseURL != "" {
-		if err := validateBaseURL(*a.BaseURL); err != nil {
-			return err
+		if lab[0] == '-' || lab[len(lab)-1] == '-' {
+			return ErrInvalidInput
 		}
 	}
 	return nil
@@ -560,7 +745,7 @@ func validateAccount(a *domain.Account) error {
 // listSortFields 各资源允许的 sort 白名单（与 repo 层白名单一致，双保险）。
 var listSortFields = map[string][]string{
 	"templates": {"id", "name", "base_url", "created_at", "updated_at"},
-	"accounts":  {"id", "name", "template_id", "status", "cooldown_until", "weight", "max_concurrency", "last_used_at", "created_at", "updated_at"},
+	"accounts":  {"id", "name", "template_id", "max_concurrency", "last_used_at", "created_at", "updated_at"},
 	"groups":    {"id", "name", "created_at", "updated_at"},
 	"users":     {"id", "email", "role", "status", "max_concurrency", "created_at", "updated_at"},
 	"keys":      {"id", "name", "status", "max_concurrency", "quota", "quota_used", "created_at", "updated_at"},
@@ -575,6 +760,8 @@ var listSortFields = map[string][]string{
 	"temp_balances": {"expires_at", "amount", "created_at"},
 	// 与 repo 层 priceEntrySortFields 白名单一致（双保险；/api/admin/prices）。
 	"price_entries": {"model", "updated_at"},
+	// 与 repo 层 balanceLogSortFields 白名单一致（双保险；/api/admin/users/{id}/balance-logs）。
+	"balance_logs": {"id", "amount", "balance_after", "created_at"},
 }
 
 // validateListQuery sort/order 白名单校验（非法 → ErrInvalidInput；handler 依赖此 400）。
@@ -620,15 +807,10 @@ func validateTemplatePatch(p repository.TemplatePatch) error {
 	}
 	var supported map[domain.RequestFormat]bool
 	if p.SupportedFormats != nil {
-		if len(*p.SupportedFormats) == 0 {
-			return ErrInvalidInput
-		}
-		supported = make(map[domain.RequestFormat]bool, len(*p.SupportedFormats))
-		for _, f := range *p.SupportedFormats {
-			if !f.Valid() || supported[f] {
-				return ErrInvalidInput
-			}
-			supported[f] = true
+		var err error
+		supported, err = dedupFormats(*p.SupportedFormats)
+		if err != nil {
+			return err
 		}
 	}
 	if p.FormatModels != nil {
@@ -649,24 +831,29 @@ func validateTemplatePatch(p repository.TemplatePatch) error {
 	return nil
 }
 
-// validateAccountPatch 校验批量 patch 提供的字段（nil = 未提供，跳过）。
+// validateAccountPatch 校验 patch 提供的字段（nil = 未提供，跳过）。写面的唯一
+// 校验权威：handler 只做类型转换，不重复判定（重复判定只可能与此处分歧）。
 func validateAccountPatch(p repository.AccountPatch) error {
+	// 空补丁：无任何字段 = 无意义的空写（仍会推进 C）——拒绝而非静默接受。
+	if p.Name == nil && p.TemplateID == nil && p.UpstreamKey == nil &&
+		p.BaseURL == nil && p.MaxConcurrency == nil && p.GroupIDs == nil &&
+		p.Enabled == nil && p.UpstreamCostMultiplierBp == nil && p.CacheDomain == nil &&
+		p.SupplierUserID == nil {
+		return ErrInvalidInput
+	}
 	if p.Name != nil && *p.Name == "" {
 		return ErrInvalidInput
 	}
 	if p.UpstreamKey != nil && *p.UpstreamKey == "" {
 		return ErrInvalidInput
 	}
-	// 批量 base_url 三态（C1）：空串 = 清空（合法）；非空时复用 validateBaseURL。
+	// 批量 base_url 三态：空串 = 清空（合法）；非空时复用 validateBaseURL。
 	if p.BaseURL != nil && *p.BaseURL != "" {
 		if err := validateBaseURL(*p.BaseURL); err != nil {
 			return err
 		}
 	}
 	if p.TemplateID != nil && *p.TemplateID <= 0 {
-		return ErrInvalidInput
-	}
-	if p.Weight != nil && *p.Weight < 0 {
 		return ErrInvalidInput
 	}
 	if p.MaxConcurrency != nil && *p.MaxConcurrency < 1 {
@@ -690,16 +877,36 @@ func validateAccountPatch(p repository.AccountPatch) error {
 			seen[id] = struct{}{}
 		}
 	}
+	// 采购倍率下界 0（免费）、上界 ×10（100000 bp，与组倍率天花板一致）。
+	if p.UpstreamCostMultiplierBp != nil && (*p.UpstreamCostMultiplierBp < 0 || *p.UpstreamCostMultiplierBp > 100000) {
+		return ErrInvalidInput
+	}
+	if p.CacheDomain != nil && *p.CacheDomain != "" {
+		if err := validateCacheDomain(*p.CacheDomain); err != nil {
+			return ErrInvalidInput
+		}
+	}
+	// 归属（§2.5）：nil = 不变；&0 = 清空（回平台自有）；&uid>0 = 分配给该用户
+	// （目标值域校验在 repository 写入事务内锁 users 行后进行，见 ownership.go）。
+	if p.SupplierUserID != nil && *p.SupplierUserID < 0 {
+		return ErrInvalidInput
+	}
 	return nil
 }
 
 // mapRepoErr 存储错误映射：repository.ErrNotFound → ErrNotFound（保留缺失 id
 // 详情，404 响应带 "id=5 missing"）；repository.ErrConflict → ErrConflict
 // （保留冲突详情，409 响应带 "name=\"x\""）。其他错误原样返回。
-func mapRepoErr(err error) error {
-	switch {
-	case errors.Is(err, repository.ErrInvalidInput):
+func mapRepoErr(err error) error { return mapRepoErrCore(err, true) }
+
+// mapRepoErrCore 存储错误映射公共核心（mapRepoErr / mapRuleRepoErr 唯一差异 =
+// withInvalidInput：规则写面不做 repository.ErrInvalidInput 归类）。ErrNotFound /
+// ErrConflict 保留详情（404/409 响应带上下文），其余原样返回。
+func mapRepoErrCore(err error, withInvalidInput bool) error {
+	if withInvalidInput && errors.Is(err, repository.ErrInvalidInput) {
 		return ErrInvalidInput
+	}
+	switch {
 	case errors.Is(err, repository.ErrNotFound):
 		detail := strings.TrimPrefix(err.Error(), repository.ErrNotFound.Error()+": ")
 		return fmt.Errorf("%w: %s", ErrNotFound, detail)
@@ -708,8 +915,4 @@ func mapRepoErr(err error) error {
 		return fmt.Errorf("%w: %s", ErrConflict, detail)
 	}
 	return err
-}
-
-func isCodexCredentialType(typ credential.Type) bool {
-	return typ == credential.TypeCodexOAuth || typ == credential.TypeCodexPAT
 }

@@ -585,7 +585,7 @@ var (
 	resultKeyBytes     = []byte("result")
 	responseKeyBytes   = []byte("response")
 	outputKeyBytes     = []byte("output")
-	// usage 提取键（spec 2026-08-15-gc-opt-ab A-1：scanKeyValue 键名精确匹配
+	// usage 提取键（spec 2026-08-15-gc-opt-ab scanKeyValue 键名精确匹配
 	// 用——chat/responses/anthropic 三协议字段名；对齐 imageGenCallBytes 惯例）
 	usageKeyBytes                    = []byte("usage")
 	promptTokensKeyBytes             = []byte("prompt_tokens")
@@ -593,9 +593,7 @@ var (
 	totalTokensKeyBytes              = []byte("total_tokens")
 	promptTokensDetailsKeyBytes      = []byte("prompt_tokens_details")
 	cachedTokensKeyBytes             = []byte("cached_tokens")
-	cacheCreationKeyBytes            = []byte("cache_creation")
-	ephemeral5mKeyBytes              = []byte("ephemeral_5m_input_tokens")
-	ephemeral1hKeyBytes              = []byte("ephemeral_1h_input_tokens")
+	cacheWriteTokensKeyBytes         = []byte("cache_write_tokens")
 	inputTokensKeyBytes              = []byte("input_tokens")
 	outputTokensKeyBytes             = []byte("output_tokens")
 	inputTokensDetailsKeyBytes       = []byte("input_tokens_details")
@@ -616,5 +614,4 @@ var (
 	streamKeyBytes      = []byte("stream")
 	modelKeyBytes       = []byte("model")
 	serviceTierKeyBytes = []byte("service_tier")
-	streamModelTierKeys = [][]byte{streamKeyBytes, modelKeyBytes, serviceTierKeyBytes}
 )

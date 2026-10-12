@@ -9,8 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +24,7 @@ import (
 	"github.com/is7qin/c3api/internal/rule"
 	"github.com/is7qin/c3api/internal/scheduler"
 	"github.com/is7qin/c3api/internal/sdkbridge"
+	"github.com/is7qin/c3api/internal/testsupport/pgtest"
 	"github.com/is7qin/c3api/internal/usage"
 	"github.com/is7qin/c3api/pkg/aiclient"
 )
@@ -42,27 +41,13 @@ import (
 // + price_per_call_millis=1000 + cost=1000——applyBilling search 分支）+ cred
 // 传递（Bearer pat-pg-s 直供适配层）。
 
-const searchPGTestSchema = "c3api_test_search"
-
 func TestSearchEndpointBillingPG(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping real-PostgreSQL test")
-	}
-	if strings.Contains(dsn, "?") {
-		dsn += "&search_path=" + searchPGTestSchema
-	} else {
-		dsn += "?search_path=" + searchPGTestSchema
-	}
+	dsn := pgtest.Clone(t)
 	ctx := context.Background()
-	pool, err := repository.OpenPG(ctx, dsn, 5)
-	require.NoError(t, err)
-	t.Cleanup(pool.Close)
+	pool := pgtest.OpenPool(t, dsn)
 	db := stdlib.OpenDBFromPool(pool)
 	t.Cleanup(func() { _ = db.Close() })
-	_, err = db.ExecContext(ctx, `DROP SCHEMA IF EXISTS `+searchPGTestSchema+` CASCADE; CREATE SCHEMA `+searchPGTestSchema+`;`)
-	require.NoError(t, err)
-	repos, err := repository.New(entsql.OpenDB(dialect.Postgres, db), true)
+	repos, err := repository.New(entsql.OpenDB(dialect.Postgres, db), false)
 	require.NoError(t, err)
 	require.NoError(t, repos.EnsureUsageLogPartitioned(ctx, time.Now()))
 	require.NoError(t, repos.EnsureErrLogPartitioned(ctx, time.Now()))
@@ -83,7 +68,7 @@ func TestSearchEndpointBillingPG(t *testing.T) {
 	g, err := repos.Groups.CreateGroup(ctx, &domain.Group{Name: "g", Visibility: domain.GroupVisibilityPublic})
 	require.NoError(t, err)
 	acc, err := repos.Accounts.CreateAccount(ctx, &domain.Account{
-		Name: "codex-acc", TemplateID: tpl.ID, Weight: 100, MaxConcurrency: 4,
+		Name: "codex-acc", TemplateID: tpl.ID, MaxConcurrency: 4, Enabled: true,
 	})
 	require.NoError(t, err)
 	require.NoError(t, repos.Accounts.SetAccountGroups(ctx, acc.ID, []int64{g.ID}))
@@ -93,17 +78,18 @@ func TestSearchEndpointBillingPG(t *testing.T) {
 	require.NoError(t, err)
 
 	// 调度器接真实 loader（快照含 Ext eager-load；请求期零 DB）
-	re := rule.New(rule.Config{}, repos.Rules, nil)
-	sched := scheduler.New(scheduler.Config{DefaultMaxConcurrency: 4, SyncInterval: time.Hour}, repos.Groups, re, nil)
+	re := rule.New(rule.Config{}, repos.Rules, nil, nil, nil)
+	sched := scheduler.New(scheduler.Config{SyncInterval: time.Hour}, repos.Groups, re, nil, nil, nil, nil)
 	require.NoError(t, sched.InvalidateAllSync())
+	publishTestRoutes(t, sched)
 
 	auth := NewAuth(noopKeyLoader{keys: map[string]domain.KeyMeta{
 		"ck-1": activeKey(1, 1, g.ID),
-	}}, noopUserLoader{}, nil, true)
+	}}, noopUserLoader{}, nil, nil, true)
 	require.NoError(t, auth.Reload(context.Background()))
 
 	// 计费钩子：价格快照 + 按单元价快照 + 余额快照；单写点：billable 行经
-	// rec → repos.Usages 直落 usage_logs（F2：无 flusher 分流）。
+	// rec → repos.Usages 直落 usage_logs（无 flusher 分流）。
 	bal := billing.NewBalances(fakeBalanceLoader{m: map[int64]int64{1: 1_000_000}}, nil)
 	require.NoError(t, bal.Reload(ctx), "余额快照加载")
 	rec := usage.New(usage.UsageConfig{
@@ -116,8 +102,7 @@ func TestSearchEndpointBillingPG(t *testing.T) {
 		UpstreamTimeout:       5 * time.Second,
 		UpstreamStreamTimeout: 30 * time.Second,
 	})
-	codex := sdkbridge.NewCodex(nil)
-	codex.SetTransport(newProxyOfficialRewriteTransport(up.URL))
+	codex := sdkbridge.NewCodex(nil, newProxyOfficialRewriteTransport(up.URL), sdkbridge.RotationDeps{})
 	p := New(Config{
 		MaxBodySize: 1 << 20, FailoverAttempts: 2,
 		UpstreamTimeout:       5 * time.Second,
@@ -127,8 +112,7 @@ func TestSearchEndpointBillingPG(t *testing.T) {
 	}, sched, credential.New(), rec, clients, auth, nil, &BillingHooks{
 		Resolver: &fakeFunctionPriceLookup{entries: map[string]*domain.PriceEntry{}},
 		Balances: bal,
-	}, nil)
-	p.SetCodex(codex)
+	}, nil, Deps{Codex: codex})
 	srv := httptest.NewServer(AIRouter(p))
 	defer srv.Close()
 

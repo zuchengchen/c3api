@@ -22,19 +22,20 @@ import (
 	"github.com/is7qin/c3api/internal/sdkbridge"
 )
 
-// --- codex 独立 relay 变体（T4 §1：codex-oauth/codex-pat 类型 resp-ws 接线） ---
+// --- codex 独立 relay 变体（codex-oauth/codex-pat 类型 resp-ws 接线） ---
 // 独立文件族（用户拍板文件边界：codex 相关处理不散落现有 caller/forward 文件，
 // codexsdk import 仅限本文件族 + sdkbridge 扩展）。与 aiclient 路径同构的编
 // 排（合一骨架 relayWS + 传输适配 codexTransport——用户裁决抽 5 方法传输接口
-// wsRelayTransport，见 ws_relay.go）：双向帧透传 1:1 / usage 嗅探
-// （response.completed——sniffResponsesCompleted 复用）/ 关闭分类
-// （relayClassify/recordClose 复用）/ 心跳（30s Ping + 10s pong 超时同款）——
+// wsRelayTransport，见 ws_relay.go）：双向帧中继（客户端帧经 SDK 按 codex
+// 形状归一）/ usage 嗅探（response.completed——sniffResponsesCompletedUsage
+// 复用）/ 关闭分类（relayClassify/recordClose 复用）/ 心跳（30s Ping + 10s
+// pong 超时同款）——
 // 差异收口在本文件：传输适配层 = *codexsdk.Client 具体类型（Send/Recv/Ping/
 // Close/CloseNow——SDK 具体类型经 codexTransport 适配接口）与每帧判死钩子
-// frameHook（T5 §3，见 wsAttempt 调用点）；服务端 Accept 侧 = 既有
+// frameHook（见 wsAttempt 调用点）；服务端 Accept 侧 = 既有
 // *websocket.Conn 不动。
 //
-// 凭据双线分工（P2-B 定死）：relay 线 = 快照（sel.Ext → AccountExt）→
+// 凭据双线分工：relay 线 = 快照（sel.Ext → AccountExt）→
 // AccountCredential 派生直供适配层（不经 credentialFor 单字符串路径——复合
 // 凭据 oauth_token+refresh_token+expires_at+pat+accountID 单字符串契约表达不
 // 了）。Registry 线（codex-oauth/codex-pat provider 注册 = 单令牌语义）仅供
@@ -47,28 +48,27 @@ var errCodexWSNotIntegrated = errors.New("codex responses unavailable (adapter n
 
 // errCodexExtMissing codex 类型选号命中但账号快照缺 account_ext 行（配置损
 // 坏——codex 账号必有 ext 行）。本地配置错误按连接级错误转移（失败文本落盘，
-// 耗尽 502 语义）；不上报失效（避免 account 0 无谓上报——T2 P1-1 同款）。
+// 耗尽 502 语义）；不上报失效（避免 account 0 无谓上报——同款）。
 var errCodexExtMissing = errors.New("codex account missing account_ext snapshot (config error)")
 
-// codexAuthFailedMsg codex fatal 用户帧固定文案（M3 裁决：fatal 语义 = 授权
+// codexAuthFailedMsg codex fatal 用户帧固定文案（裁决：fatal 语义 = 授权
 // 失败——复用 "upstream rejected request" 语义不准；不泄 SDK 内部机制串如
 // "refresh 被拒绝"/重试次数）。落盘侧 ErrorMessage 仍写 dialErr 原文
 // （:125-127），此路径无 Warn——落盘是唯一留痕。
 const codexAuthFailedMsg = "codex authorization failed"
 
-// dialCodexWS 组装一次 codex WS Dial（T4 §2——凭当前请求选中账号 cred）：
+// dialCodexWS 组装一次 codex WS Dial（凭当前请求选中账号 cred）：
 //   - 凭据线：sel.Ext 快照 → AccountCredential 派生（relay 线；热路径零 DB）
 //   - 端点归 SDK 官方默认（wss://chatgpt.com/backend-api/codex/responses）
-//   - 伪装四元组（W1 持久化）：WithSession（握手头 + 帧内 metadata session/
+//   - 伪装四元组（运行时槽身份）：WithSession（握手头 + 帧内 metadata session/
 //     thread/window）+ WithCodexMeta（帧内 x-codex-installation-id——真实客户
 //     端该头不进握手头，仅帧 metadata）
 //   - WithPingInterval(0)：禁 SDK 内部心跳（心跳单源——编排层 30s+10s）
-//   - WithPayloadFiltering(false)（P2-A 必配）：Send 默认白名单过滤会剥
-//     max_output_tokens/api/user/metadata 等合法顶层键（过滤后为空整帧不入网）——
-//     与双向帧透传 1:1 等价直接矛盾；关闭过滤与 client_metadata 伪装注入独立
-//     （prepareFrame client.go:513-579——关闭后注入仍生效）
-//   - 透传头（P3-7/P3-8）：codexWSPassthroughHeaders——session 头族 +
-//     OpenAI-Beta 已剔除，其余可透传
+//   - SDK 侧按 codex 形状归一（无条件，不可关）：WS 19 键白名单过滤 + 强制
+//     store:false——违禁顶层键（如 max_output_tokens）被剥、store 恒 false
+//     （对齐真实 codex；归一后 prepareFrame 照常注入 client_metadata）
+//   - 透传头：**无**（spec §12）—— 该面只发 SDK 自己写的头，客户端头一律不递；
+//     握手头仅来自 SDK（伪装身份、beta、session 四元组、Authorization）。
 //
 // 错误经适配层翻译（DialError → 信封 + Refreshed；裸 fatal → 统一回调上报）。
 func (p *Proxy) dialCodexWS(r *http.Request, sel *scheduler.Selection) (*codexsdk.Client, error) {
@@ -79,18 +79,14 @@ func (p *Proxy) dialCodexWS(r *http.Request, sel *scheduler.Selection) (*codexsd
 		return nil, errCodexExtMissing
 	}
 	cred := domain.CredentialFromExt(sel.Ext)
-	sess, meta := codexIdentityFromExt(sel.Ext)
+	sess, meta := sel.CodexIdentity()
 	opts := []codexsdk.Option{
-		codexsdk.WithPayloadFiltering(false), // P2-A：帧透传 1:1（白名单过滤剥合法键）
-		codexsdk.WithPingInterval(0),         // 心跳单源：编排层 30s+10s 单一所有者
-		codexsdk.WithSession(sess),           // 伪装：握手头 + 帧内 session/thread/window
-		codexsdk.WithCodexMeta(meta),         // 伪装：帧内 x-codex-installation-id 等
+		codexsdk.WithPingInterval(0), // 心跳单源：编排层 30s+10s 单一所有者
+		codexsdk.WithSession(sess),   // 伪装：握手头 + 帧内 session/thread/window
+		codexsdk.WithCodexMeta(meta), // 伪装：帧内 x-codex-installation-id 等
 	}
-	for k, vs := range codexWSPassthroughHeaders(r.Header) {
-		for _, v := range vs {
-			opts = append(opts, codexsdk.WithHeader(k, v))
-		}
-	}
+	// 裁决（spec §12）：codex 面不透传任何客户端头，握手头全由 SDK 生成（伪装身份、
+	// beta、session 四元组、Authorization）；此处不喂任何客户端头。
 	// 拨号超时上限同款（黑洞上游不回 101）：超时 → SDK dialStatus(nil)=0 →
 	// DialError{StatusCode:0} → handleCodexDialError 既有 default 分支连接级
 	// 转移（零新分支；wrapped ctx 取消不向上传播，不落 499）。
@@ -99,13 +95,13 @@ func (p *Proxy) dialCodexWS(r *http.Request, sel *scheduler.Selection) (*codexsd
 	return p.codex.Dial(ctx, &cred, opts...)
 }
 
-// handleCodexDialError codex WS 拨号失败分类与收尾（T4 §5 错误契约适用；返回
+// handleCodexDialError codex WS 拨号失败分类与收尾（返回
 // stop=true 请求已终止，false = 连接级/429 转移——本函数已完成分类，调用方
 // MarkResult 后继续 failover 循环）：
 //   - 适配层未装配 → 501 语义本地拒绝（释放槽 + recordRejected + 错误帧）
 //   - 裸 fatal（Dial 401 轮转路径 refresh 失败——RefreshOAuthError/
 //     AccountDisabledError）：适配层已统一回调上报（账号失效剔除 + 摘除）；
-//     **该请求不转移**（P3-2 定死）——finish（code 0 ErrNetwork）+ 错误帧收尾
+//     **该请求不转移**——finish（code 0 ErrNetwork）+ 错误帧收尾
 //   - 信封 4xx（DialError → EnvelopeError：401/403 升级拒绝）→ 确定性拒绝透
 //     传不转移（与 aiclient 路径 4xx 同构：finish + 错误帧 + 记录）；
 //     Refreshed=true（已轮转重连一次仍失败）→ 4xx 分支天然不再触达同账号，
@@ -114,18 +110,21 @@ func (p *Proxy) dialCodexWS(r *http.Request, sel *scheduler.Selection) (*codexsd
 //     → RuleKindOf(code) 转移（正常 failover）
 func (p *Proxy) handleCodexDialError(r *http.Request, reqID string, groupID int64, start time.Time, sel *scheduler.Selection, reqModel string, client *websocket.Conn, dialErr error) (stop bool, lastCode int, lastErrMsg string) {
 	if errors.Is(dialErr, errCodexWSNotIntegrated) {
-		p.sched.Release(sel.AccountID)
+		sel.Release()
 		p.recordRejected(r.Context(), reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), domain.FormatOpenAIResponsesWS, http.StatusNotImplemented, domain.ErrBilling, 0, usageTuple{}, start, errCodexWSNotIntegrated.Error())
 		wsWriteError(client, errCodexWSNotIntegrated.Error())
 		return true, 0, ""
 	}
 	if sdkbridge.IsFatal(dialErr) {
+		// fatal 鉴权失败由 SDK 统一判定并回调上报，此处仅固定文案不泄内部细节，原文仅落盘
+		base := mergeDispatchBase(r.Context(), wsDispatchedBase(sel, reqModel, start))
+		out := wsOutcomeForUpstreamStatus(base, 500, usageTuple{}, nil)
+		// fatal 不计额外冷却（SDK 回调已上报失效）：观测无 health，仅 quality+flow。
+		p.observeDispatchOutcome(r.Context(), out, nil)
 		msg := domain.TruncateErrMsg(dialErr.Error())
 		l := logWithCtx(r.Context(), p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), sel.Format, 0, domain.ErrNetwork, usageTuple{}, start))
 		l.ErrorMessage = &msg
-		p.finish(sel.AccountID, l)
-		// fatal 用户帧固定文案（不泄 SDK 内部机制串）；:125-127 已落盘 dialErr
-		// 原文——落盘是唯一留痕。
+		p.finish(sel, l)
 		wsWriteError(client, codexAuthFailedMsg)
 		return true, 0, ""
 	}
@@ -135,14 +134,17 @@ func (p *Proxy) handleCodexDialError(r *http.Request, reqID string, groupID int6
 	case code == http.StatusTooManyRequests:
 		return false, code, domain.TruncateErrMsg(msg)
 	case code >= 400 && code < 500:
+		// 4xx 确定性拒绝不转移，走规则引擎仅 CustomMessage 生效
 		em := domain.TruncateErrMsg(msg)
+		base := mergeDispatchBase(r.Context(), wsDispatchedBase(sel, reqModel, start))
+		out := wsOutcomeForUpstreamStatus(base, code, usageTuple{}, nil)
+		// 观测归 owner（quality+flow 恰一次）；冷却仍由下方 Classify→MarkResult 单点负责。
+		p.observeDispatchOutcome(r.Context(), out, nil)
 		l := logWithCtx(r.Context(), p.buildLog(reqID, groupID, sel.AccountID, reqModel, sel.LogMappedModel(reqModel), sel.Format, code, domain.Err4xx, usageTuple{}, start))
 		if em != "" {
 			l.ErrorMessage = &em
 		}
-		p.finish(sel.AccountID, l)
-		// R-1 规则驱动（与 REST 4xx 同公式）：Classify(Kind4xx) → punish 投递 → UnifiedMessage/passthrough 帧。
-		// WS 无 HTTP 状态码，ResponseCode 维度自然无效，仅 CustomMessage 生效；DialError Refreshed=true 无特殊处理。
+		p.finish(sel, l)
 		then, punish := p.sched.Classify(rule.Event{AccountID: sel.AccountID, Kind: rule.Kind4xx, HTTPStatus: &code, Model: sel.Model, ErrorMessage: em})
 		if punish {
 			p.sched.MarkResult(sel.AccountID, rule.Kind4xx, nil, code, em, sel.Model)
@@ -154,10 +156,7 @@ func (p *Proxy) handleCodexDialError(r *http.Request, reqID string, groupID int6
 		}
 		return true, 0, ""
 	default:
-		// 5xx（信封）/ 裸 RefreshError / 网络（code 0）：连接级转移。5xx 归一
-		// （修复性声明）：code 原样回传（现状归 0 → 耗尽记 ErrNetwork +
-		// MarkResult httpStatus 0；统一后 et=Err5xx + httpStatus 5xx——对齐
-		// HTTP 路径与静态拨号分支）。
+		// 5xx/网络/刷新错误走连接级转移，5xx 保留原码便于规则匹配
 		return false, code, domain.TruncateErrMsg(msg)
 	}
 }
@@ -182,59 +181,18 @@ func sniffCodexWSDeath(f []byte) *codexsdk.AuthPermanentlyRevokedError {
 	return codexsdk.ClassifyAuthFatalFrame(f)
 }
 
-// codexIdentityFromExt 从账号 ext 快照组装伪装四元组（W1 数据层持久化——账号
-// 存在期间稳定：InstallationID 账号级永久 / SessionID==ThreadID 会话级 /
-// WindowID={thread}:0）。返回 SDK Session（握手头 + 帧内 metadata 双注入）与
-// CodexMeta（帧内 x-codex-installation-id 等；优先级 CodexMeta > WithSession，
-// 双选项同值无冲突）。身份 nil/缺列（codex_identity jsonb 可空——未配置/
-// 旧数据异常）→ 空值（SDK 内层 omit，不注入；sdkbridge identitySig 既有
-// 空身份兜底——零新增语义）；Session.ClientRequestID 留空——SDK 缺省回退
-// ThreadID（client.go:349-355）。
-func codexIdentityFromExt(ext *domain.AccountExt) (sess codexsdk.Session, meta codexsdk.CodexMeta) {
-	if ext == nil || ext.CodexIdentity == nil {
-		return sess, meta
-	}
-	id := ext.CodexIdentity
-	meta.InstallationID = id.InstallationID
-	if id.SessionID != "" {
-		sess.SessionID = id.SessionID
-		meta.SessionID = id.SessionID
-	}
-	if id.ThreadID != "" {
-		sess.ThreadID = id.ThreadID
-		meta.ThreadID = id.ThreadID
-	}
-	if id.WindowID != "" {
-		sess.WindowID = id.WindowID
-		meta.WindowID = id.WindowID
-	}
-	return sess, meta
-}
-
-// codexWSPassthroughHeaders codex 路径透传头（P3-7/P3-8 冲突面）：在
-// wsPassthroughHeaders 剔除面（hop-by-hop + 网关 key Authorization）之上再剔
-// 除 session 头族（session-id/thread-id/x-client-request-id/x-codex-window-id
-// ——SDK WithHeader 先删后加覆盖默认头，直通会覆盖伪装身份四元组）及
-// OpenAI-Beta（客户端可覆盖网关默认 beta 版本——与 aiclient 路径强制覆盖语义
-// 不对称；beta 为协议面关键值，错配可致上游拒连）。其余头原样透传。
-func codexWSPassthroughHeaders(h http.Header) http.Header {
-	out := wsPassthroughHeaders(h)
-	for _, k := range []string{
-		"Session-Id", "Thread-Id", "X-Client-Request-Id", "X-Codex-Window-Id", "OpenAI-Beta",
-	} {
-		out.Del(k)
-	}
-	return out
-}
+// 伪装身份注入源：scheduler.Selection.CodexIdentity 一次给全四元组
+// （installation_id / session_id / thread_id / window_id，全部取自槽状态）——
+// proxy 不再回账号 ext 拼装，杜绝 installation 双源。
 
 // codexTransport 上游侧 *codexsdk.Client 的 wsRelayTransport 适配（codex 路
-// 径）：typ 语义与现状 relayCodexWS 同款——Send 忽略 typ 恒 text（SDK Send
-// 内部恒 conn.Write MessageText，client.go:499-511）、Recv 丢帧类型 → Read 恒
-// 返回 MessageText（responses WS 协议全 text 帧，binary 帧降级 text 转发，风
-// 险低——现状既有降级语义）；Ping/Close/CloseNow 直通 SDK（Close 幂等
-// closeOnce；pong 由 relay 循环的常驻 Read 处理——SDK Client 并发语义
-// client.go:273-275 前提满足）。错误原样透传（SDK Recv 透传 coder/websocket
-// 错误 → errors.As *CloseError 成立，relayClassify/recordClose 直接复用）。
+// 径）：typ 语义沿用 relayWS 传输面约定——Send 忽略 typ 恒文本（SDK Send 内部
+// 恒以 MessageText 写连接）、Recv 丢弃帧类型 → Read 恒返回 MessageText
+// （responses WS 协议全 text 帧，binary 帧降级文本转发，风险低——既有降级
+// 语义）；Ping/Close/CloseNow 直通 SDK（Close 幂等 closeOnce；pong 由 relay
+// 循环的常驻 Read 处理——满足 SDK Client 并发读写前提）。错误原样透传（SDK Recv
+// 透传 coder/websocket 错误 → errors.As *CloseError 成立，relayClassify/recordClose
+// 直接复用）。
 type codexTransport struct{ up *codexsdk.Client }
 
 func newCodexTransport(up *codexsdk.Client) *codexTransport {

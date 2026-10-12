@@ -16,9 +16,9 @@ import (
 	"github.com/is7qin/c3api/internal/scheduler"
 )
 
-// --- 转发管线骨架（D3：三份内联管线合一） ---
+// --- 转发管线骨架（三份内联管线合一） ---
 // handleFormat / HandleSearch / HandleResponsesWS 三份内联管线（鉴权 → reqMeta
-// ctx 注入 → quota → 余额预检 → 两级门禁 → 限流 → 选号 → failover 循环 → 耗尽
+// ctx 注入 → quota → 余额预检/低余额钳制 → 两级门禁 → 限流 → 选号 → failover 循环 → 耗尽
 // 记录）同构复制，骨架收敛**逐字一致段**（guard 六段 + 循环分类 + 耗尽记录）；
 // 差异点收口成两个窄接口：
 //   - upstreamAttempt：单次上游尝试（chat/search/WS 各自实现——分流/拨号/
@@ -26,11 +26,21 @@ import (
 //   - pipelineSink：循环收尾写出（httpSink: HTTP 信封；wsSink: WS 错误事件帧）
 // 不造阶段表/配置驱动（过度抽象否决——评审 b06："抽共享阶段函数"）。
 
-// guardPipeline 鉴权 → reqMeta ctx 注入 → quota → 余额预检(可选) → 两级并发
+// 低余额用户级并发上限（纯函数）：原上限不限（cur==0）或大于 cap → 取 cap；
+// 否则维持原值（min 语义）。cur<0 不可达（用户写面拒绝负 max_concurrency）。
+func capLowBalanceUserConc(cur, cap int) int {
+	if cur == 0 || cur > cap {
+		return cap
+	}
+	return cur
+}
+
+// guardPipeline 鉴权 → reqMeta ctx 注入 → quota → 余额预检/低余额钳制(可选) → 两级并发
 // 门禁 → 限流；任一失败已写响应并记录，返回 ok=false（失败路径 inflight 减量
 // 由内部完成——等价现状各失败分支 return 时 defer 已生效；401/429/402 无并发
-// 槽占用，限流失败已回滚门禁）。precheckBalance=false 跳过余额预检（search
-// 无 402 语义）。成功返回 (r, rm, level, true)：
+// 槽占用，限流失败已回滚门禁）。precheckBalance=false 仅跳过余额预检的 402
+// （search 无 402 语义）；cap>0 时 search 仍读快照做低余额钳制。成功返回
+// (r, rm, level, true)：
 //   - r 已注入 reqMeta ctx（user_id/key_id 日志归属；rm 指针直接返回——chat/WS
 //     后续 tier 注入用，免从 ctx 重取）
 //   - level 为已 acquire 门禁层级，调用方须注册释放（两条 defer 即合并释放的
@@ -42,7 +52,7 @@ import (
 //     会话结束——门禁覆盖整个长会话（同现状语义）。
 func (p *Proxy) guardPipeline(w http.ResponseWriter, r *http.Request, format domain.RequestFormat, reqID string, start time.Time, precheckBalance bool) (*http.Request, *reqMeta, int, bool) {
 	p.inflight.Add(1) // 优雅停机等在途归零（main waitForInflight 轮询 Inflight()）
-	// reqMeta 创建 + ctx 注入整体提前到鉴权前（gate M1 方案）：401 及全部拒绝
+	// reqMeta 创建 + ctx 注入整体提前到鉴权前（方案）：401 及全部拒绝
 	// 路径（401/429/402/限流）ctx 统一带 rm → recordRejected 行自动带 client_ip
 	// （不变量：拒绝行恒有 client_ip）。rm 初始化只填 clientIP（clientIP 提取
 	// 只读 RemoteAddr/请求头，鉴权前安全执行）；鉴权成功后原地补 meta。
@@ -55,14 +65,14 @@ func (p *Proxy) guardPipeline(w http.ResponseWriter, r *http.Request, format dom
 	if !ok {
 		p.inflight.Add(-1)
 		writeErr(w, errInvalidKey)
-		// 评审 I-1：401 鉴权失败转 recordRejected（无效 key 洪水残留向量——
+		// 401 鉴权失败转 recordRejected（无效 key 洪水残留向量——
 		// 401 也进 err_logs 错误审计，不再走 usage_logs 明细路径）。
 		p.recordRejected(r.Context(), reqID, 0, 0, "", "", format, http.StatusUnauthorized, domain.ErrAuth, 0, usageTuple{}, start, errInvalidKey.msg)
 		return nil, nil, 0, false
 	}
 	groupID := meta.GroupID
 	// 请求元数据入 context（user_id/key_id 日志归属；不改变 Call/buildLog 签名）。
-	// 单键单值 + 指针原地补 tier（GC 削减 P6：计费路径免第二次 WithValue+
+	// 单键单值 + 指针原地补 tier（GC 削减 计费路径免第二次 WithValue+
 	// WithContext；rm 指针只在请求 goroutine 内被读取/改写，logWithCtx 全程同
 	// goroutine 同步访问——无跨 goroutine 竞态）。
 	rm.meta = meta
@@ -75,17 +85,25 @@ func (p *Proxy) guardPipeline(w http.ResponseWriter, r *http.Request, format dom
 		p.recordRejected(r.Context(), reqID, groupID, 0, "", "", format, http.StatusTooManyRequests, domain.Err429, 0, usageTuple{}, start, errQuotaExhausted.msg)
 		return nil, nil, 0, false
 	}
-	// 余额预检（Phase 5 计费；评审 I-1 无槽位问题）：快照读零 DB（滞后 ≤
-	// BalanceRefreshInterval，多实例条件扣 DB 兜底）。快照缺失或 <0 → 402
-	// errInsufficientBalance（不按 0 记账），但免费放行（T3.5，评审 I-1 修复）：
-	// 有效倍率 0 = 免费用户/组 → 缺失/0 余额不 402（与 applyBilling 同一快照
-	// 同一判定；cost 0 只记日志不扣费）。余额 0 放行——临时额度由 FEFO 扣费
-	// 消化（billing_repo.go:71-76 先扣 temp）；负余额持续负债拒绝。快照缺失
-	// 窗口内免费组照常放行；缺失且非免费 → 仍 402（用户不在快照 = 无余额
-	// 记录，语义不变）。在 Acquire 前 → 不占用并发槽。
-	if precheckBalance && p.cfg.BillingCapture && p.bill != nil {
+	// 余额预检 + 低余额用户级并发钳制（计费；无槽位问题）：快照读零 DB（滞后 ≤
+	// BalanceRefreshInterval，多实例条件扣 DB 兜底）。单次快照读——钳制判定与
+	// 预检共用同一读值，不二次读。快照缺失或 ≤0 → 402 errInsufficientBalance，
+	// 但免费放行：
+	// 有效倍率 0 = 免费用户/组 → 缺失/非正余额不 402（与 applyBilling 同一快照
+	// 同一判定；cost 0 只记日志不扣费）。余额 ≤0 拒绝——预检不读临时额度
+	// （临时额度由结算时 FEFO 消化），故余额非正的临时额度用户在预检即被拒。
+	// 快照缺失窗口内免费组照常放行；缺失且非免费 → 仍 402（用户不在快照 =
+	// 无余额记录）。在 Acquire 前 → 不占用并发槽。
+	// 低余额钳制（cap>0 且余额快照存在且余额严格小于阈值）→ 就地替换
+	// meta.UserMaxConc 为有效上限，再交 Acquire；快照缺失不钳（无法判定，保守）。
+	// cap==0（关闭）→ 条件化简为 precheckBalance，读点/分支与现状逐位一致。
+	capConc := p.cfg.LowBalanceConcCap
+	if p.cfg.BillingCapture && p.bill != nil && (precheckBalance || capConc > 0) {
 		bal, ok := p.bill.Balances.BalanceOf(meta.UserID)
-		if (!ok || bal < 0) && p.bill.Balances.EffectiveMultiplier(meta.UserID, groupID) != 0 {
+		if capConc > 0 && ok && bal < p.cfg.LowBalanceConcThresholdMilli {
+			meta.UserMaxConc = capLowBalanceUserConc(meta.UserMaxConc, capConc)
+		}
+		if precheckBalance && (!ok || bal <= 0) && p.bill.Balances.EffectiveMultiplier(meta.UserID, groupID) != 0 {
 			p.inflight.Add(-1)
 			writeErr(w, errInsufficientBalance)
 			p.recordRejected(r.Context(), reqID, groupID, 0, "", "", format, http.StatusPaymentRequired, domain.ErrBilling, 0, usageTuple{}, start, errInsufficientBalance.msg)
@@ -120,6 +138,9 @@ type attemptState struct {
 	firstTyp  websocket.MessageType
 	first     []byte
 	stripTier bool
+	// hardContinuation（Responses REST/WS）：previous_response_id 钉选派生——
+	// 类型化重试矩阵对 hard 尝试恒不迁移（绑定账号失败即终态）。
+	hardContinuation bool
 }
 
 // upstreamAttempt 一次上游尝试（三格式各自实现；语义与现状循环内分类输入一
@@ -129,9 +150,9 @@ type attemptState struct {
 //     已写出无记录）——骨架直接返回（不可转移）；false → respBody/callErr 供
 //     骨架分类
 //   - respBody：4xx 透传原文（chat/search 原始 body；WS 归一错误文本——上游
-//     body message，无则空——B1 分通道）；code==0 时亦携带错误文本（WS 纯文本
+//     body message，无则空——分通道）；code==0 时亦携带错误文本（WS 纯文本
 //     经骨架"直取原文"回退落盘，防 gjson 提取吃空）
-//   - callErr：连接级/凭据错（code==0）或 WS 拨号 4xx（dialErr 全文——B1 分
+//   - callErr：连接级/凭据错（code==0）或 WS 拨号 4xx（dialErr 全文——分
 //     通道：SDK 文本不进 respBody，帧面与落盘面解耦）时非 nil；Warn 由
 //     attempt 内部代发（Warn 文案两版本保留不统一——循环不代发；WS code==0
 //     恒 callErr=nil 不新增 Warn）
@@ -147,7 +168,7 @@ type pipelineSink interface {
 }
 
 // passthroughStatus 统一公式 status=ResponseCode!=nil?*ResponseCode:upstream
-// 单点共用，消除 4xx/耗尽分支重复（I-2）。
+// 单点共用，消除 4xx/耗尽分支重复。
 func passthroughStatus(then domain.RuleThen, upstream int) int {
 	if then.ResponseCode != nil {
 		return *then.ResponseCode
@@ -183,17 +204,18 @@ func applyPassthroughHeader(w http.ResponseWriter, then domain.RuleThen, hdr htt
 	}
 }
 
-// failoverLoop 共享 failover 骨架：precheckPrice(开关) → attempt.call → 分类
-// （429 MarkResult / 5xx、0 MarkResult / 4xx finish+透传）→ Release → attempted
-// 防呆 → 尾部 Select（最后一轮不预选——防并发槽泄漏）→ 耗尽记录（et 分类 +
-// recordLog + 防呆释放）→ sink.writeExhausted。任一终态（handled/4xx/499/预检
-// 失败）已收尾，返回即请求结束。format 用于记录（客户端协议——WS 现状
-// sel.Format 与 format 恒等，统一用 format）；selectFormat 用于尾部 Select
-// （chat 协议转换命中时为模板协议路由——convertedRoute 转换补差不抽象）。
-// precheck=false 跳过缺价预检（search——现状无预检语义）。
+// failoverLoopWithPlan 共享 failover 骨架（plan-only：入口选号必经
+// selectWithPlan，尾部推进必经 plan.ReserveAttempt——无计划即无第二次派生）：
+// precheckPrice(开关) → attempt.call → 分类（429 MarkResult / 5xx、0
+// MarkResult / 4xx finish+透传）→ Release → attempted 防呆 → 尾部计划推进
+// （最后一轮不预选——防并发槽泄漏）→ 耗尽记录（et 分类 + recordLog + 防呆释
+// 放）→ sink.writeExhausted。任一终态（handled/4xx/499/预检失败）已收尾，
+// 返回即请求结束。format 用于记录（客户端协议——WS 现状 sel.Format 与
+// format 恒等，统一用 format）。precheck=false 跳过缺价预检（search——现状
+// 无预检语义）。
 // 记录（recordRejected/buildLog/finish/recordLog/MarkResult）参数逐字段与三份
 // 原内联管线一致（行为契约：状态码/错误帧/Retry-After/固定文案逐字节不变）。
-func (p *Proxy) failoverLoop(w http.ResponseWriter, r *http.Request, format, selectFormat domain.RequestFormat, reqID string, groupID int64, start time.Time, reqModel string, body []byte, sel *scheduler.Selection, st attemptState, attempt upstreamAttempt, sink pipelineSink, precheck bool) {
+func (p *Proxy) failoverLoopWithPlan(w http.ResponseWriter, r *http.Request, format domain.RequestFormat, reqID string, groupID int64, start time.Time, reqModel string, body []byte, sel *scheduler.Selection, plan scheduler.AttemptPlan, attempt scheduler.Attempt, st attemptState, upstream upstreamAttempt, sink pipelineSink, precheck bool) {
 	lastSel := sel
 	var (
 		lastCode   int
@@ -201,166 +223,242 @@ func (p *Proxy) failoverLoop(w http.ResponseWriter, r *http.Request, format, sel
 		lastHdr    http.Header
 		lastBody   []byte
 	)
+	// Fold-at-source ownership: this loop is the SOLE producer. One
+	// request-local stash per plan-backed dispatched request, only when the
+	// quality recorder is wired; a dispatch without a canonical plan attempt
+	// never arms the stash and fabricates no fact.
+	// settle runs last (registered first): the completion walk emits exactly
+	// once on recorded chains, or records the Close-row signal on
+	// panic/abandon/no-terminal.
+	var flow *foldOwner
+	if p.qualityRecorder != nil {
+		flow = newFoldOwner(p.qualityRecorder, p.pipelineFlowAppend)
+	}
+	panicked := false
+	defer func() { flow.settle(panicked) }()
+	// ponytail: panic guard — any panic in attempt.call must release leased slot, otherwise concurrency leaks.
+	defer func() {
+		if rc := recover(); rc != nil {
+			panicked = true
+			if sel != nil {
+				sel.Release()
+			}
+			if lastSel != nil && lastSel != sel {
+				lastSel.Release()
+			}
+			panic(rc)
+		}
+	}()
+	// Owner cleanup: a dispatch that ends without a terminal observation
+	// (local reject after reservation, panic mid-call) abandons its
+	// AttemptContext pin. Completed observations abandon as a no-op (CAS).
+	var openDispatch *dispatchObservation
+	defer func() { openDispatch.abandon() }()
 	// 防呆（spec：failover_attempts=0 直构绕过 validate 下限）：循环零次执行时
 	// 首次 Select 已占并发槽，耗尽路径按此标志补 Release——N>=1 恒 true，不双释放。
 	attempted := false
-	for i := 0; i < p.cfg.FailoverAttempts; i++ {
+	maxAttempts := p.normalizedAttempts()
+	dispatched := 0
+	if sel != nil {
+		dispatched = 1
+	}
+	for dispatched <= maxAttempts && dispatched > 0 {
 		lastSel = sel
 		attempted = true
-		// 用量身份（Todo 3 规格 §3）：每轮当次选中解析——Search 走既有
+		// 用量身份（规格 §3）：每轮当次选中解析——Search 走既有
 		// mappedFor 推断（不触达 Selection 身份方法），其余格式直取
 		// Selection.LogMappedModel（implicit 留空）。终态日志只记录 explicit
 		// 非 identity 目标；价格模型由 Selection.PriceModel 独立派生。
 		mapped := usageIdentity(format, sel, reqModel)
-		// 缺价预检（评审 I-1 + P1-1 预检按格式切换）：每轮 sel 更新后、Call 前
+		// 缺价预检（预检按格式切换）：每轮 sel 更新后、Call 前
 		// 查价——计费启用时模型无价格 → 释放并发槽 + 402（不按 0 计价），零 DB
 		// （快照读）。Selection 保持模式语义：implicit 用客户端模型，explicit/
 		// 无映射用上游目标。images 格式查统一价格快照 image 分量（跳过 chat
 		// 价预检——纯 image 价模型无 token 行，chat 预检会先行 402 误杀，
 		// "image 分量定生死"轮不到执行）；其余格式照旧。
-		if precheck {
-			priceModel := sel.PriceModel(reqModel)
-			if err := p.precheckPrice(format, priceModel); err != nil {
-				p.sched.Release(sel.AccountID)
-				p.recordRejected(r.Context(), reqID, groupID, sel.AccountID, reqModel, mapped, format, http.StatusPaymentRequired, domain.ErrBilling, 0, usageTuple{}, start, errNoPrice.msg)
-				sink.writePrecheckRejected(w, st)
-				return
-			}
+		if precheck && p.failoverPrecheckPrice(w, r, format, reqID, groupID, start, reqModel, mapped, sel, st, sink) {
+			return
 		}
-		code, respBody, hdr, handled, callErr := attempt.call(r.Context(), w, r, reqID, groupID, start, sel, reqModel, body, st)
+		// Dispatch ownership: exactly one owner-created AttemptContext + observer
+		// per real upstream call, begun before the call and completed exactly
+		// once — by the caller (handled=true terminal) or by the loop here
+		// (handled=false classification). openDispatch tracks the unfinished one
+		// for the deferred owner cleanup.
+		callCtx, dispatch := p.beginDispatch(r.Context(), sel, attempt, flow)
+		openDispatch = dispatch
+		code, respBody, hdr, handled, callErr := upstream.call(callCtx, w, r, reqID, groupID, start, sel, reqModel, body, st)
 		if handled {
 			return // attempt 已处理完毕（成功/客户端断开/流中止已记录；本地拒绝已写出无记录）
 		}
+		p.observeDispatchFailure(callCtx, dispatch, code)
+		openDispatch = nil
 		lastCode = code
 		lastHdr = hdr
 		lastBody = respBody
-		if code == http.StatusTooManyRequests {
-			// 429：上游 body message（既有语义；域内截断 500）。WS 拨号 429 的
-			// 错误文本经 respBody 传递（可能为 SDK 纯文本）——提取为空时直取
-			// 原文（与 code==0 分支同款防丢失；chat/search 上游错误体恒 JSON
-			// message 键，该回退零影响）。
-			lastErrMsg = domain.TruncateErrMsg(upstreamErrMsg(respBody))
-			if lastErrMsg == "" && len(respBody) > 0 {
-				lastErrMsg = domain.TruncateErrMsg(string(respBody))
-			}
-			// 429 分支统一走 Classify（规则表 = 单一决策源）：seed-429 恒命中
-			// （punish=true → 恒投递，现状等价）；规则删改后按声明裁定投递。
-			// Model 口径 = 最终请求模型 sel.Model（映射后，与上游实际模型一致）。
-			_, punish := p.sched.Classify(rule.Event{
-				AccountID: sel.AccountID, Kind: rule.Kind429, HTTPStatus: &code,
-				Model: sel.Model, ErrorMessage: lastErrMsg,
-			})
-			if punish {
-				p.sched.MarkResult(sel.AccountID, rule.Kind429, nil, code, lastErrMsg, sel.Model)
-			}
-		} else if code >= 500 || code == 0 {
-			// 首字节前客户端断连（分类正确性，用户实证：模型思考期取消常见）：
-			// r.Context() 已取消 → SDK 返回 context.Canceled（statusOf=0）。这是
-			// 客户端行为，非上游错误——不 failover、不 MarkResult/冷却（否则
-			// 无辜账号冷却 + failover 空转 + error_type 误记 network）；记
-			// 499（nginx "client closed request" 约定）+ ErrAbort，立即返回。
-			// tokens 必然 0 → cost=0 不计费；客户端已断，不写 HTTP 响应。
-			// 流式路径的流中止/首字节后断连由 caller 内部分类（handled=true），
-			// 到不了这里——本分支只覆盖 SDK 请求阶段（首字节前）的断连。
-			// WS 修复性声明（gate Minor 2c）：WS 拨号/首帧转发阶段断连同样归
-			// 此分支（现状记连接级错误冷却无辜账号——统一 499 语义不冷却）。
-			if code == 0 && r.Context().Err() != nil {
-				l := logWithCtx(r.Context(), p.buildLog(reqID, groupID, sel.AccountID, reqModel, mapped, format, statusClientClosedRequest, domain.ErrAbort, usageTuple{}, start))
-				msg := "client closed request before upstream response"
-				l.ErrorMessage = &msg
-				p.finish(sel.AccountID, l)
-				return
-			}
-			// 5xx：上游 body message（既有语义）。连接级/凭据错（code==0）：
-			// err.Error() 全文填 last_error 与耗尽记录（域内截断 500）——Warn
-			// 由 attempt 内部代发（文案两版本保留不统一，循环不代发）。
-			// code==0 且 callErr==nil（WS 拨号/首帧转发失败）：错误文本经
-			// respBody 传递（可能为纯文本——upstreamErrMsg 只认 JSON 键，
-			// gjson 提取吃空）→ 直取原文（复审实证；chat/search 该分支不可达
-			// ——code==0 恒带 callErr，零影响）。
-			lastErrMsg = upstreamErrMsg(respBody)
-			if code == 0 && callErr != nil {
-				lastErrMsg = domain.TruncateErrMsg(callErr.Error())
-			} else if lastErrMsg != "" {
-				lastErrMsg = domain.TruncateErrMsg(lastErrMsg)
-			} else if len(respBody) > 0 {
-				lastErrMsg = domain.TruncateErrMsg(string(respBody))
-			}
-			// 5xx/0 分支统一走 Classify（seed-5xx/seed-network 恒命中 → 恒投递，
-			// 行为不变）。防呆 b（gate r4）：分支不拆 ≠ 恒传 Kind5xx——事件 kind
-			// 按单点分流 helper（code==0→network）计算，否则 code==0 事件不命中
-			// seed-network → 不投递 → 连接级冷却整体失效。
-			kind := scheduler.RuleKindOf(code)
-			var hp *int
-			if code > 0 {
-				hp = &code
-			}
-			_, punish := p.sched.Classify(rule.Event{
-				AccountID: sel.AccountID, Kind: kind, HTTPStatus: hp,
-				Model: sel.Model, ErrorMessage: lastErrMsg,
-			})
-			if punish {
-				p.sched.MarkResult(sel.AccountID, kind, nil, code, lastErrMsg, sel.Model)
-			}
-		} else {
-			// 4xx 确定性错误（统一公式 status=ResponseCode!=nil?*ResponseCode:code, msg=CustomMessage!=nil?*CustomMessage:respBody）
-			l := logWithCtx(r.Context(), p.buildLog(reqID, groupID, sel.AccountID, reqModel, mapped, format, code, domain.Err4xx, usageTuple{}, start))
-			em := domain.TruncateErrMsg(string(respBody))
-			if em == "" && callErr != nil {
-				em = domain.TruncateErrMsg(callErr.Error())
-			}
-			if em != "" {
-				l.ErrorMessage = &em
-			}
-			p.finish(sel.AccountID, l)
-			then, punish := p.sched.Classify(rule.Event{
-				AccountID: sel.AccountID, Kind: rule.Kind4xx, HTTPStatus: &code,
-				Model: sel.Model, ErrorMessage: em,
-			})
-			status := passthroughStatus(then, code)
-			applyPassthroughHeader(w, then, hdr, status)
-			// I-3: 代理日志保留原文 em，响应与 sanitize 同源 via rule.UnifiedMessage
-			if msg, isCustom := rule.UnifiedMessage(then, string(respBody)); isCustom {
-				if _, isWS := sink.(*wsSink); isWS {
-					sink.writeUpstreamRejection(w, st, status, []byte(msg))
-				} else {
-					writeJSON(w, status, map[string]any{"error": map[string]any{"message": msg, "type": "upstream_error"}})
-				}
-			} else {
-				sink.writeUpstreamRejection(w, st, status, respBody)
-			}
-			if punish {
-				p.sched.MarkResult(sel.AccountID, rule.Kind4xx, nil, code, em, sel.Model)
-			}
+		var terminate bool
+		lastErrMsg, terminate = p.classifyFailoverAttempt(w, r, format, reqID, groupID, start, reqModel, mapped, sel, code, respBody, hdr, callErr, st, sink)
+		if terminate {
 			return
 		}
-		p.sched.Release(sel.AccountID)
-		// 最后一轮不再为不存在的下一次尝试预选：尾部 Select 会抢占并发槽
-		// （CAS 递增、仅 Release 递减、无回收），耗尽时永不释放 → 永久占槽。
-		if i+1 >= p.cfg.FailoverAttempts {
+		// plan-aware retry gating: committed/ambiguous/client-cancel/hard-continuation
+		// do not migrate. The typed retry matrix consumes the canonical attempt
+		// identity; without a plan there is no failover lane at all.
+		if !p.shouldRetryWithPlan(r.Context(), code, callErr, attempt, st.hardContinuation) {
+			sel.Release()
 			break
 		}
-		var selErr error
-		if format == domain.FormatOpenAISearch {
-			sel, selErr = p.sched.SelectOpaque(groupID, selectFormat, reqModel)
-		} else {
-			sel, selErr = p.sched.Select(groupID, selectFormat, reqModel)
+		// release exactly once before retry
+		sel.Release()
+		if dispatched >= maxAttempts {
+			break
 		}
+		nextSel, nextAttempt, selErr := p.selectNextWithPlan(&plan)
 		if selErr != nil {
+			// distinguish ErrNoAvailable vs AttemptsExhausted preserved via error; both lead to exhausted handling
 			break
 		}
+		sel, attempt = nextSel, nextAttempt
+		dispatched++
 	}
-	// 耗尽：请求已完成（上游消费了请求），以最后一次尝试的结果记一条用量（统一公式 status=ResponseCode!=nil?*ResponseCode:lastCode, msg=CustomMessage!=nil?*CustomMessage:lastBody/lastErrMsg）。
-	// 防呆释放：循环零次执行（failover_attempts=0 直构）时首次 Select 的槽从未
-	// 释放——耗尽路径补 Release；N>=1 时 attempted 恒 true（循环尾已释放，不双释放）。
 	if !attempted {
-		p.sched.Release(lastSel.AccountID)
+		lastSel.Release()
 	}
+	p.writeFailoverExhausted(w, r, format, reqID, groupID, start, reqModel, lastSel, lastCode, lastErrMsg, lastHdr, lastBody, st, sink)
+}
+
+// failoverPrecheckPrice 缺价预检阶段（failoverLoopWithPlan 提取）：命中即
+// recordRejected + sel.Release + sink.writePrecheckRejected，返回 true（调用方直接
+// return）；未命中返回 false。记录/释放/写出时机与现状逐字一致。
+func (p *Proxy) failoverPrecheckPrice(w http.ResponseWriter, r *http.Request, format domain.RequestFormat, reqID string, groupID int64, start time.Time, reqModel, mapped string, sel *scheduler.Selection, st attemptState, sink pipelineSink) bool {
+	priceModel := sel.PriceModel(reqModel)
+	if err := p.precheckPrice(format, priceModel); err != nil {
+		p.recordRejected(r.Context(), reqID, groupID, sel.AccountID, reqModel, mapped, format, http.StatusPaymentRequired, domain.ErrBilling, 0, usageTuple{}, start, errNoPrice.msg)
+		sel.Release()
+		sink.writePrecheckRejected(w, st)
+		return true
+	}
+	return false
+}
+
+// classifyFailoverAttempt 单次失败分类阶段（failoverLoopWithPlan 提取）：
+// 429 → TruncateErrMsg + Classify/MarkResult；5xx/0 → 分类文本 + Classify/
+// MarkResult（首字节前客户端断连记 499 后 terminate）；4xx → finish + 透传 +
+// Classify/MarkResult 后 terminate。返回最后的错误文本与是否终止（terminate=true
+// 调用方直接 return）。错误分类/冷却/日志字段/时机逐字一致。
+func (p *Proxy) classifyFailoverAttempt(w http.ResponseWriter, r *http.Request, format domain.RequestFormat, reqID string, groupID int64, start time.Time, reqModel, mapped string, sel *scheduler.Selection, code int, respBody []byte, hdr http.Header, callErr error, st attemptState, sink pipelineSink) (lastErrMsg string, terminate bool) {
+	if code == http.StatusTooManyRequests {
+		// 429：上游 body message（既有语义；域内截断 500）。WS 拨号 429 的
+		// 错误文本经 respBody 传递（可能为 SDK 纯文本）——提取为空时直取
+		// 原文（与 code==0 分支同款防丢失；chat/search 上游错误体恒 JSON
+		// message 键，该回退零影响）。
+		lastErrMsg = domain.TruncateErrMsg(upstreamErrMsg(respBody))
+		if lastErrMsg == "" && len(respBody) > 0 {
+			lastErrMsg = domain.TruncateErrMsg(string(respBody))
+		}
+		// 429 分支统一走 Classify（规则表 = 单一决策源）：seed-429 恒命中
+		// （punish=true → 恒投递，现状等价）；规则删改后按声明裁定投递。
+		// Model 口径 = 最终请求模型 sel.Model（映射后，与上游实际模型一致）。
+		_, punish := p.sched.Classify(rule.Event{
+			AccountID: sel.AccountID, Kind: rule.Kind429, HTTPStatus: &code,
+			Model: sel.Model, ErrorMessage: lastErrMsg,
+		})
+		if punish {
+			p.sched.MarkResult(sel.AccountID, rule.Kind429, nil, code, lastErrMsg, sel.Model)
+		}
+	} else if code >= 500 || code == 0 {
+		// 首字节前客户端断连（分类正确性，用户实证：模型思考期取消常见）：
+		// r.Context() 已取消 → SDK 返回 context.Canceled（statusOf=0）。这是
+		// 客户端行为，非上游错误——不 failover、不 MarkResult/冷却（否则
+		// 无辜账号冷却 + failover 空转 + error_type 误记 network）；记
+		// 499（nginx "client closed request" 约定）+ ErrAbort，立即返回。
+		// tokens 必然 0 → cost=0 不计费；客户端已断，不写 HTTP 响应。
+		// 流式路径的流中止/首字节后断连由 caller 内部分类（handled=true），
+		// 到不了这里——本分支只覆盖 SDK 请求阶段（首字节前）的断连。
+		// WS 修复性声明（gate Minor 2c）：WS 拨号/首帧转发阶段断连同样归
+		// 此分支（现状记连接级错误冷却无辜账号——统一 499 语义不冷却）。
+		if code == 0 && r.Context().Err() != nil {
+			l := logWithCtx(r.Context(), p.buildLog(reqID, groupID, sel.AccountID, reqModel, mapped, format, statusClientClosedRequest, domain.ErrAbort, usageTuple{}, start))
+			msg := "client closed request before upstream response"
+			l.ErrorMessage = &msg
+			p.finish(sel, l)
+			return "", true
+		}
+		// 5xx：上游 body message（既有语义）。连接级/凭据错（code==0）：
+		// err.Error() 全文填 last_error 与耗尽记录（域内截断 500）——Warn
+		// 由 attempt 内部代发（文案两版本保留不统一，循环不代发）。
+		// code==0 且 callErr==nil（WS 拨号/首帧转发失败）：错误文本经
+		// respBody 传递（可能为纯文本——upstreamErrMsg 只认 JSON 键，
+		// gjson 提取吃空）→ 直取原文（复审实证；chat/search 该分支不可达
+		// ——code==0 恒带 callErr，零影响）。
+		lastErrMsg = upstreamErrMsg(respBody)
+		if code == 0 && callErr != nil {
+			lastErrMsg = domain.TruncateErrMsg(callErr.Error())
+		} else if lastErrMsg != "" {
+			lastErrMsg = domain.TruncateErrMsg(lastErrMsg)
+		} else if len(respBody) > 0 {
+			lastErrMsg = domain.TruncateErrMsg(string(respBody))
+		}
+		// 5xx/0 分支统一走 Classify（seed-5xx/seed-network 恒命中 → 恒投递，
+		// 行为不变）。防呆 b：分支不拆 ≠ 恒传 Kind5xx——事件 kind
+		// 按单点分流 helper（code==0→network）计算，否则 code==0 事件不命中
+		// seed-network → 不投递 → 连接级冷却整体失效。
+		kind := scheduler.RuleKindOf(code)
+		var hp *int
+		if code > 0 {
+			hp = &code
+		}
+		_, punish := p.sched.Classify(rule.Event{
+			AccountID: sel.AccountID, Kind: kind, HTTPStatus: hp,
+			Model: sel.Model, ErrorMessage: lastErrMsg,
+		})
+		if punish {
+			p.sched.MarkResult(sel.AccountID, kind, nil, code, lastErrMsg, sel.Model)
+		}
+	} else {
+		// 4xx 确定性错误（统一公式 status=ResponseCode!=nil?*ResponseCode:code, msg=CustomMessage!=nil?*CustomMessage:respBody）
+		l := logWithCtx(r.Context(), p.buildLog(reqID, groupID, sel.AccountID, reqModel, mapped, format, code, domain.Err4xx, usageTuple{}, start))
+		em := domain.TruncateErrMsg(string(respBody))
+		if em == "" && callErr != nil {
+			em = domain.TruncateErrMsg(callErr.Error())
+		}
+		if em != "" {
+			l.ErrorMessage = &em
+		}
+		p.finish(sel, l)
+		then, punish := p.sched.Classify(rule.Event{
+			AccountID: sel.AccountID, Kind: rule.Kind4xx, HTTPStatus: &code,
+			Model: sel.Model, ErrorMessage: em,
+		})
+		status := passthroughStatus(then, code)
+		applyPassthroughHeader(w, then, hdr, status)
+		// 代理日志保留原文 em，响应与 sanitize 同源 via rule.UnifiedMessage
+		if msg, isCustom := rule.UnifiedMessage(then, string(respBody)); isCustom {
+			if _, isWS := sink.(*wsSink); isWS {
+				sink.writeUpstreamRejection(w, st, status, []byte(msg))
+			} else {
+				writeJSON(w, status, map[string]any{"error": map[string]any{"message": msg, "type": "upstream_error"}})
+			}
+		} else {
+			sink.writeUpstreamRejection(w, st, status, respBody)
+		}
+		if punish {
+			p.sched.MarkResult(sel.AccountID, rule.Kind4xx, nil, code, em, sel.Model)
+		}
+		return "", true
+	}
+	return lastErrMsg, false
+}
+
+// writeFailoverExhausted 耗尽收尾阶段（failoverLoopWithPlan 提取）：按最后一次尝试
+// 的 kind/HTTPStatus/Message 重新分类取 then → status/头透传 → buildLog +
+// recordLog → 统一写出（via rule.UnifiedMessage；WS/HTTP 分流）。字段/文案/时机
+// 逐字一致。
+func (p *Proxy) writeFailoverExhausted(w http.ResponseWriter, r *http.Request, format domain.RequestFormat, reqID string, groupID int64, start time.Time, reqModel string, lastSel *scheduler.Selection, lastCode int, lastErrMsg string, lastHdr http.Header, lastBody []byte, st attemptState, sink pipelineSink) {
 	et := domain.Err5xx
-	switch {
-	case lastCode == http.StatusTooManyRequests:
+	switch lastCode {
+	case http.StatusTooManyRequests:
 		et = domain.Err429
-	case lastCode == 0:
+	case 0:
 		et = domain.ErrNetwork
 	}
 	// 耗尽统一公式：按最后一次尝试的 kind/HTTPStatus/Message 重新分类获取 then
@@ -386,7 +484,7 @@ func (p *Proxy) failoverLoop(w http.ResponseWriter, r *http.Request, format, sel
 	}
 	p.recordLog(l)
 	// 统一写出：via rule.UnifiedMessage，同 sanitize 同源；WS/HTTP 分流
-	// 代理日志保留原文 lastErrMsg（I-3 边界）
+	// 代理日志保留原文 lastErrMsg（边界）
 	if msg, isCustom := rule.UnifiedMessage(then, string(lastBody)); isCustom {
 		if _, isWS := sink.(*wsSink); isWS {
 			sink.writeExhausted(w, st, status, msg)

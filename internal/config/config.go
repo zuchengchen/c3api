@@ -17,12 +17,13 @@ import (
 	"github.com/knadh/koanf/providers/env/v2"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+
+	"github.com/is7qin/c3api/internal/domain"
 )
 
 type Config struct {
 	Server    ServerConfig    `koanf:"server"`
 	Log       LogConfig       `koanf:"log"`
-	Admin     AdminConfig     `koanf:"admin"`
 	Auth      AuthConfig      `koanf:"auth"`
 	DB        DBConfig        `koanf:"db"`
 	Redis     RedisConfig     `koanf:"redis"`
@@ -31,6 +32,21 @@ type Config struct {
 	Scheduler SchedulerConfig `koanf:"scheduler"`
 	Usage     UsageConfig     `koanf:"usage"`
 	Billing   BillingConfig   `koanf:"billing"`
+	Routing   RoutingConfig   `koanf:"routing"`
+	Supplier  SupplierConfig  `koanf:"supplier"`
+}
+
+// RoutingConfig 路由观测的**运维/存储**参数。策略参数（分层阈值、探索比例、
+// 窗口长度等）仍不可配——它们是算法事实（编译正确性输入），不是部署旋钮；
+// 保留深度则是存储成本与可查深度的权衡，必须可配。
+//
+// observation_retention_days 地板 = 正确性回看下界 + 24h 边际（见 validate）：
+// 低于地板则编译器/事故判定的 24h 基线窗会读到已被 retention DROP 的分钟，
+// 静默少算 → 启动即失败（fail-fast，不给"看起来能跑"的降级路径）。
+type RoutingConfig struct {
+	// ObservationRetentionDays 观测面（flow/frontier 读 + 保留 worker DROP）
+	// 保留天数。默认 7；地板 2（= BaselineLookback 24h + 24h 边际）。
+	ObservationRetentionDays int `koanf:"observation_retention_days"`
 }
 
 type ServerConfig struct {
@@ -45,10 +61,6 @@ type LogConfig struct {
 	Output string `koanf:"output"`
 }
 
-type AdminConfig struct {
-	Token string `koanf:"token"`
-}
-
 // AuthConfig JWT 密钥：强制（C3API_AUTH_JWT_SECRET），缺失启动失败——
 // 随机生成 = 重启全失效 + 多实例不一致（评审定夺①）。
 type AuthConfig struct {
@@ -56,7 +68,7 @@ type AuthConfig struct {
 }
 
 // DBConfig 数据库连接。DSN 无需手工写 lock_timeout——OpenPG 统一补丁
-// （F-P2-4：计费路径防卡死 lock_timeout=5s 会话级 + 计费结算事务 per-tx
+// （计费路径防卡死 lock_timeout=5s 会话级 + 计费结算事务 per-tx
 // 10s 超时 + MaxConnLifetime=30m 滚动轮换，详见 repository.OpenPG /
 // BillingRepo.SettleBalanceBatch/SettleFefoBatch；statement_timeout 不设
 // 会话级——与 admin 面 ScanStats 大窗口聚合实测冲突降级，见
@@ -82,17 +94,34 @@ type ProxyConfig struct {
 	MaxInflight           int64         `koanf:"max_inflight"`
 	UpstreamTimeout       time.Duration `koanf:"upstream_timeout"`
 	UpstreamStreamTimeout time.Duration `koanf:"upstream_stream_timeout"`
-	// FailoverAttempts 总尝试次数（含首次）——>= 1（0 启动即拒绝：failover 循环
-	// 零次执行，首次选号占用的并发槽永不释放，组内账号耗尽后全组 429 死锁）。
+	// FailoverAttempts 总尝试次数（含首次）——合法域 1..8（intelligent routing
+	// 契约：AttemptPlan 固定 [8] attempted-ID 集去重，>8 无法保证不重复选号；
+	// 0/负值启动即拒绝：failover 循环零次执行，首次选号占用的并发槽永不释放，
+	// 组内账号耗尽后全组 429 死锁）。
 	FailoverAttempts int  `koanf:"failover_attempts"`
 	UsageCapture     bool `koanf:"usage_capture"`
 	// BehindCDN 客户端 IP 识别开关（用户裁决 2026-08-17：config 文件键，非 admin
-	// setting）：false（默认）→ 完全不读供应商头（CF-Connecting-IP /
-	// True-Client-IP / X-Real-IP），直取 RemoteAddr（零伪造面，与直连行为一致）；
-	// true → 按序采信三头。部署前提：源站只对 CDN/反向代理暴露（防火墙层封
-	// 直连）——直连时可自填任意值，client_ip 为审计/排障的尽力而为标识，非安全
-	// 边界。可选键，旧配置不带此键照常加载（零值 false）。
+	// setting；2026-10-07 默认翻转 false → true）：true（默认）→ 按序采信
+	// CF-Connecting-IP / True-Client-IP / X-Real-IP（首个非空头），全空回退
+	// RemoteAddr；false → 完全不读供应商头，直取 RemoteAddr（零伪造面，与直连
+	// 行为一致）。部署前提：默认采信供应商头仅当源站只对 CDN/反向代理暴露
+	// （防火墙层封直连）时安全——直连公网暴露可自填任意值，此时须显式置 false；
+	// client_ip 为审计/排障的尽力而为标识，非安全边界。可选键，旧配置不带此键
+	// → 默认 true（注意：与旧版零值 false 行为不同）。
 	BehindCDN bool `koanf:"behind_cdn"`
+	// LowBalanceMaxConcurrency 低余额时用户级并发上限（默认 5；0 = 关闭该特性，
+	// 退回原 UserMaxConc）。
+	LowBalanceMaxConcurrency int `koanf:"low_balance_max_concurrency"`
+	// LowBalanceThresholdUSD 触发阈值（USD，默认 10）；余额严格小于它时把
+	// 用户级并发上限钳为 LowBalanceMaxConcurrency。派生毫分 = ×1e5 取整。
+	LowBalanceThresholdUSD float64 `koanf:"low_balance_threshold_usd"`
+	// StreamKeepaliveInterval 客户端 SSE 无业务输出时的保活注释间隔
+	// （默认 10s；0 = 关闭通用定时心跳）。仅网关新增/维护的注释受控——
+	// 不改写上游透传字节。五路（chat/responses/anthropic/converted）与
+	// typed images（真上游 SSE 流）均受此键控制；仅 codex images 合成路径
+	//（上游非流、SDK 合成 keepalive+completed）由 SDK 自带 60s 保活驱动，
+	// 不受此键影响（60s 不满足最严 LB 的 ≤60s 读超时）。
+	StreamKeepaliveInterval time.Duration `koanf:"stream_keepalive_interval"`
 }
 
 type UpstreamConfig struct {
@@ -115,7 +144,7 @@ type UsageConfig struct {
 	FlushInterval      time.Duration `koanf:"flush_interval"`
 	LogRetentionDays   int           `koanf:"log_retention_days"`
 	QuotaFlushInterval time.Duration `koanf:"quota_flush_interval"` // quota 增量批量回写 cadence
-	FlushWorkers       int           `koanf:"flush_workers"`        // flush 并行 worker 数（O1 管道化分片并行；明细/额度共用）
+	FlushWorkers       int           `koanf:"flush_workers"`        // flush 并行 worker 数（管道化分片并行；明细/额度共用）
 	// StatsAggInterval 离线聚合周期（spec 2026-08-14：使用量统计离线聚合化——
 	// 独立 worker 每周期从 DB 重建 usage_stats；默认 5m；0 = 禁用聚合）。
 	StatsAggInterval time.Duration `koanf:"stats_agg_interval"`
@@ -131,13 +160,13 @@ type UsageConfig struct {
 	StatsRetentionDays int `koanf:"stats_retention_days"`
 }
 
-// BillingConfig 计费（Phase 5 T3）：Enabled 默认开（全链默认开启：代码默认 +
+// BillingConfig 计费：Enabled 默认开（全链默认开启：代码默认 +
 // 模板默认一致；空价格表 = 全模型 402——首次启动需先同步价格（POST
 // /api/admin/pricing/sync）；余额预检 + FEFO 条件扣费 + 优雅停机排空全链随之生效。
 // 本地开发可用 enabled=false 显式退回纯代理模式）。
 type BillingConfig struct {
 	Enabled                bool          `koanf:"enabled"`
-	FlushInterval          time.Duration `koanf:"flush_interval"`           // 计费游标轮询周期（F2 ledger-cursor：每周期取批消费 unbilled 账本）
+	FlushInterval          time.Duration `koanf:"flush_interval"`           // 计费游标轮询周期（ledger-cursor：每周期取批消费 unbilled 账本）
 	BalanceRefreshInterval time.Duration `koanf:"balance_refresh_interval"` // 余额快照全量刷新周期
 }
 
@@ -145,16 +174,28 @@ func defaults() *Config {
 	return &Config{
 		Server: ServerConfig{Addr: ":8080", ReadHeaderTimeout: 10 * time.Second, MaxHeaderBytes: 1 << 20},
 		Log:    LogConfig{Level: "warn", Output: "stdout"},
-		// #17：10→20（billing 8 worker + stats 8 worker + 余量；统计 COPY 批量写已改毫秒级短事务）。
+		// 10→20（billing 8 worker + stats 8 worker + 余量；统计 COPY 批量写已改毫秒级短事务）。
 		// 连接参数（lock_timeout=5s 会话级 + 计费结算 per-tx 10s 超时 + MaxConnLifetime=30m，
-		// F-P2-4 计费路径防卡死）由 OpenPG/SettleBalance·SettleFefo 统一补，DSN 无需手工写（用户
+		// 计费路径防卡死）由 OpenPG/SettleBalance·SettleFefo 统一补，DSN 无需手工写（用户
 		// 显式配置同名参数时尊重不覆盖；statement_timeout 不设会话级——副作用核实见 f1-impl-report.md）。
 		DB:        DBConfig{MaxConns: 20},
-		Proxy:     ProxyConfig{MaxBodySize: 4 << 20, MaxInflight: 50000, UpstreamTimeout: 120 * time.Second, UpstreamStreamTimeout: 30 * time.Minute, FailoverAttempts: 3, UsageCapture: true},
+		Proxy:     ProxyConfig{MaxBodySize: 64 << 20, MaxInflight: 50000, UpstreamTimeout: 120 * time.Second, UpstreamStreamTimeout: 30 * time.Minute, FailoverAttempts: 3, UsageCapture: true, BehindCDN: true, LowBalanceMaxConcurrency: 5, LowBalanceThresholdUSD: 10, StreamKeepaliveInterval: 10 * time.Second},
 		Upstream:  UpstreamConfig{MaxIdleConns: 8192, MaxIdleConnsPerHost: 2048, IdleConnTimeout: 90 * time.Second, DialTimeout: 10 * time.Second, ForceHTTP2: true},
 		Scheduler: SchedulerConfig{DefaultMaxConcurrency: 8, SyncInterval: 30 * time.Second},
 		Usage:     UsageConfig{BatchSize: 500, FlushInterval: 500 * time.Millisecond, LogRetentionDays: 30, QuotaFlushInterval: 10 * time.Second, FlushWorkers: 8, StatsAggInterval: 5 * time.Minute, ErrLogQueueSize: 4096, ErrLogBatchSize: 500, ErrLogFlushInterval: 500 * time.Millisecond, ErrLogRetentionDays: 7, StatsRetentionDays: 180},
 		Billing:   BillingConfig{Enabled: true, FlushInterval: 250 * time.Millisecond, BalanceRefreshInterval: 10 * time.Second},
+		Routing:   RoutingConfig{ObservationRetentionDays: 7},
+		Supplier: SupplierConfig{
+			Enabled:              false,
+			FreezeEnabled:        true,
+			FreezeHours:          24,
+			ThawGranularity:      2 * time.Hour,
+			ShareBpDefault:       1000,
+			PayoutMaxBacklogRows: 10000,
+			PayoutMaxBacklogAge:  10 * time.Minute,
+			PayoutMaxObserveAge:  3 * time.Minute,
+			RiskReviewMaxAge:     24 * time.Hour,
+		},
 	}
 }
 
@@ -181,10 +222,10 @@ func Load(path string) (*Config, error) {
 	}), nil); err != nil {
 		return nil, err
 	}
-	// ErrorUnused：配置显式写未知键（拼写错误/已删旧键）→ 启动报错（D-P2-1）。
+	// ErrorUnused：配置显式写未知键（拼写错误/已删旧键）→ 启动报错。
 	// ⚠ DecoderConfig 必须完整复制 koanf 默认（StringToTimeDurationHookFunc +
 	// textUnmarshalerHookFunc + WeaklyTypedInput: true）——漏任一：duration 字符串
-	// 解析（"500ms"）全失效，且 env 路径裸数字 fail-fast 保护丢失（p2-14 P2-A 交叉风险）。
+	// 解析（"500ms"）全失效，且 env 路径裸数字 fail-fast 保护丢失（交叉风险）。
 	if err := k.UnmarshalWithConf("", c, koanf.UnmarshalConf{
 		DecoderConfig: &mapstructure.DecoderConfig{
 			DecodeHook: mapstructure.ComposeDecodeHookFunc(
@@ -202,21 +243,25 @@ func Load(path string) (*Config, error) {
 // validate Load 末尾统一校验（fail-fast，错误含 koanf 字段路径，形如
 // "scheduler.sync_interval must be > 0"）：
 //   - duration 字段 ≥1ms 硬校验：拦截 5 处 time.NewTicker panic 面（scheduler/
-//     usage×2/flusher×2）与 errlog.go:123 第 6 个 ticker 的 500ns 烧穿面（D-P2-2：
+//     usage×2/flusher×2）与 errlog.go:123 第 6 个 ticker 的 500ns 烧穿面（
 //     裸数字 `flush_interval = 500` → 500ns ticker → 队列非空 DB 写风暴 / 队列空
 //     CPU 忙轮询）。errlog_flush_interval=0 由"钳位到默认"变为"启动报错"——有意
-//     选择（errlog 无文档化"0=禁用"语义，取 p2-14"全部 duration 字段"立场）；
+//     选择（errlog 无文档化"0=禁用"语义，取"全部 duration 字段"立场）；
 //   - 数值字段 ≥1：DefaultMaxConcurrency（silent 全坏面——从"健康地拒绝全流量"
 //     转启动即报错）、DB.MaxConns（puddle 层报 MaxSize 无法归因到 db.max_conns）；
-//   - 必填：auth.jwt_secret / db.dsn（自 main.go:64-66 移入内聚；admin.token
-//     已可空——空 = 不启用静态 token 鉴权，/admin 仅接受 platform_admin JWT）；
+//   - 必填：auth.jwt_secret / db.dsn（自 main.go:64-66 移入内聚；静态管理面
+//     token 配置键已删除——/admin 仅接受 platform_admin 身份（JWT 或其管理 key））；
 //   - 占位密钥精确匹配拒绝（change-me 系列防原样部署鉴权绕过；精确匹配防误杀恰
 //     以 change-me 开头的合法随机值，派生占位由"空值 + 强制 env"形态兜底）。
 //
 // 明确排除：retention 天数（<=0 = 不删除，文档化惯例）、int 型钳位字段
 // （BatchSize/FlushWorkers/ErrLogQueueSize/ErrLogBatchSize）、
-// Proxy.MaxInflight（server 侧 0→50000 兜底，proxy 消费语义未核实——
-// 范围外）。
+// Proxy.MaxInflight（唯一消费方是 server 中间件，0 由 server 侧兜底为 50000——
+// 无死锁/静默失效面）。
+// routingRetentionMargin 观测保留地板在正确性回看下界之上的边际（24h）：覆盖
+// 日分区边界（分区按 UTC 日 DROP，cutoff 落在分区内时该分区仍存活）与时钟抖动。
+const routingRetentionMargin = 24 * time.Hour
+
 func validate(c *Config) error {
 	for _, d := range []struct {
 		path      string
@@ -225,6 +270,9 @@ func validate(c *Config) error {
 	}{
 		{"proxy.upstream_timeout", c.Proxy.UpstreamTimeout, false},
 		{"proxy.upstream_stream_timeout", c.Proxy.UpstreamStreamTimeout, false},
+		// stream_keepalive_interval：0 = 关闭通用定时心跳（合法语义）；
+		// 非 0 必须 ≥1ms（防 ticker panic 面）。
+		{"proxy.stream_keepalive_interval", c.Proxy.StreamKeepaliveInterval, true},
 		{"scheduler.sync_interval", c.Scheduler.SyncInterval, false},
 		{"usage.flush_interval", c.Usage.FlushInterval, false},
 		{"usage.quota_flush_interval", c.Usage.QuotaFlushInterval, false},
@@ -264,6 +312,21 @@ func validate(c *Config) error {
 			return fmt.Errorf("%s must be >= 1 (got %d)", n.path, n.value)
 		}
 	}
+	// proxy.failover_attempts 上限 8（intelligent routing 契约）：AttemptPlan 用
+	// 固定 [8] attempted-ID 集做跨账号去重，>8 无法保证不重复选号；启动即拒绝，
+	// 与下限 1 成对锁定合法域 1..8（默认 3）。
+	if c.Proxy.FailoverAttempts > 8 {
+		return fmt.Errorf("proxy.failover_attempts must be <= 8 (got %d)", c.Proxy.FailoverAttempts)
+	}
+	// proxy.low_balance_max_concurrency：并发上限不能为负——<0 启动即拒绝。
+	// 仅当 >0（特性开启）时才要求阈值 >0（否则阈值无意义/钳制恒不触发）；
+	// ==0（关闭）→ 两键均不参与校验，阈值任意值一律忽略。
+	if c.Proxy.LowBalanceMaxConcurrency < 0 {
+		return fmt.Errorf("proxy.low_balance_max_concurrency must be >= 0 (got %d)", c.Proxy.LowBalanceMaxConcurrency)
+	}
+	if c.Proxy.LowBalanceMaxConcurrency > 0 && c.Proxy.LowBalanceThresholdUSD <= 0 {
+		return fmt.Errorf("proxy.low_balance_threshold_usd must be > 0 (got %v) when proxy.low_balance_max_concurrency > 0", c.Proxy.LowBalanceThresholdUSD)
+	}
 	for _, r := range []struct {
 		path  string
 		value string
@@ -282,25 +345,50 @@ func validate(c *Config) error {
 		path  string
 		value string
 	}{
-		{"admin.token", c.Admin.Token},
 		{"auth.jwt_secret", c.Auth.JWTSecret},
 		// redis.password 复用既有占位密钥校验（foundation spec §2.1）；空 = 无鉴权，合法。
 		{"redis.password", c.Redis.Password},
 	} {
 		switch p.value {
-		case "change-me", "change-me-too", "dev-admin-token", "dev-jwt-secret-for-local":
-			return fmt.Errorf("%s must not be a placeholder value (got %q); inject via C3API_ADMIN_TOKEN/C3API_AUTH_JWT_SECRET", p.path, p.value)
+		case "change-me", "change-me-too", "dev-jwt-secret-for-local":
+			return fmt.Errorf("%s must not be a placeholder value (got %q); inject via C3API_AUTH_JWT_SECRET", p.path, p.value)
 		}
 	}
 	if c.Redis.DB < 0 {
 		return fmt.Errorf("redis.db must be >= 0 (got %d)", c.Redis.DB)
+	}
+	// routing.observation_retention_days 地板：观测保留深度必须完整覆盖
+	// 正确性回看下界（BaselineLookback 24h）再加 24h 边际——1day == 24h 精确
+	// 相等，故 24h 地板零边际，必须加 24h 覆盖日分区边界与时钟抖动。
+	// 低于地板 = 编译/事故判定的基线窗会读到已 DROP 的分钟（静默少算）→ 启动失败。
+	routingMinDays := int((domain.BaselineLookback + routingRetentionMargin) / (24 * time.Hour))
+	if c.Routing.ObservationRetentionDays < routingMinDays {
+		return fmt.Errorf("routing.observation_retention_days must be >= %d (got %d): the observation floor is BaselineLookback %s + %s margin",
+			routingMinDays, c.Routing.ObservationRetentionDays, domain.BaselineLookback, routingRetentionMargin)
 	}
 	if c.Server.TimeZone != "" {
 		if _, err := time.LoadLocation(c.Server.TimeZone); err != nil {
 			return fmt.Errorf("server.time_zone: invalid IANA timezone %q: %w", c.Server.TimeZone, err)
 		}
 	}
+	if _, err := EffectiveMaxInflight(c.Proxy.MaxInflight); err != nil {
+		return err
+	}
+	// 供应商收益（spec 2026-10-09 §6.4）：专用校验函数（非既有两个表）。
+	if err := validateSupplier(&c.Supplier); err != nil {
+		return err
+	}
 	return nil
+}
+
+func EffectiveMaxInflight(raw int64) (int64, error) {
+	if raw < 0 {
+		return 0, fmt.Errorf("proxy.max_inflight must be >= 0 (got %d)", raw)
+	}
+	if raw == 0 {
+		return 50000, nil
+	}
+	return raw, nil
 }
 
 // textUnmarshalerHookFunc 镜像 koanf v2.3.6 内部同名 hook（未导出，spec 要求完整

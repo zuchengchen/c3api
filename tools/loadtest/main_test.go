@@ -91,8 +91,8 @@ func TestDrainSSEFinalLineWithoutNewline(t *testing.T) {
 
 func TestRequestTemplateMatchesNewRequest(t *testing.T) {
 	buildReqTemplate()
-	got := newRequestFromTemplate("ck-test")
-	want := newLoadtestRequest(*addr, "ck-test", *mode)
+	got := newRequestFromTemplate("ck-test", -1)
+	want := newLoadtestRequest(*addr, "ck-test", *mode, "")
 	require.Equal(t, want.Method, got.Method)
 	require.Equal(t, want.URL.String(), got.URL.String())
 	require.Equal(t, "application/json", got.Header.Get("Content-Type"))
@@ -128,7 +128,7 @@ func (b *blockingBody) Read([]byte) (int, error) { <-b.done; return 0, io.EOF }
 func (b *blockingBody) Close() error { close(b.done); return nil }
 
 func TestChatRequestBodyOmitsStream(t *testing.T) {
-	req := newLoadtestRequest("http://example.test", "ck-test", "chat")
+	req := newLoadtestRequest("http://example.test", "ck-test", "chat", "")
 	var body map[string]any
 	require.NoError(t, json.NewDecoder(req.Body).Decode(&body))
 	_, ok := body["stream"]
@@ -137,10 +137,102 @@ func TestChatRequestBodyOmitsStream(t *testing.T) {
 }
 
 func TestStreamRequestBodyEnablesStream(t *testing.T) {
-	req := newLoadtestRequest("http://example.test", "ck-test", "stream")
+	req := newLoadtestRequest("http://example.test", "ck-test", "stream", "")
 	var body map[string]any
 	require.NoError(t, json.NewDecoder(req.Body).Decode(&body))
 	require.Equal(t, true, body["stream"])
+}
+
+// TestImagesStreamRequestBody images 双形态：-mode stream → JSON 带 stream:true
+// （网关 scanKeys 探测后走 SSE 透传）；-mode chat → 非流式 JSON 原样（无 stream
+// 键，data 数组计图计费路径不变）。
+func TestImagesStreamRequestBody(t *testing.T) {
+	prevFmt := *format
+	t.Cleanup(func() { *format = prevFmt })
+	*format = "images"
+
+	req := newLoadtestRequest("http://example.test", "ck-test", "stream", "")
+	require.Equal(t, "http://example.test/v1/images/generations", req.URL.String())
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(req.Body).Decode(&body))
+	require.Equal(t, true, body["stream"], "stream 模式必须发 stream:true")
+
+	req = newLoadtestRequest("http://example.test", "ck-test", "chat", "")
+	body = map[string]any{} // 重置：Decode 进非 nil map 是合并语义
+	require.NoError(t, json.NewDecoder(req.Body).Decode(&body))
+	_, ok := body["stream"]
+	require.False(t, ok, "非流式 images 保持原 JSON 契约（不带 stream）")
+}
+
+// TestDoRequestImagesStreamDrainsTerminal 压测端对 Images SSE 终态的排空：
+// completed 帧 + [DONE] 终帧的流正常计成功（首字节采样入直方图、零错误）。
+func TestDoRequestImagesStreamDrainsTerminal(t *testing.T) {
+	prevMode, prevFmt := *mode, *format
+	*mode, *format = "stream", "images"
+	t.Cleanup(func() { *mode, *format = prevMode, prevFmt })
+	srv, _ := connCountingServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"image_generation.completed\",\"data\":[{\"b64_json\":\"QUJD\"}]}\n\n")
+		fl.Flush()
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		fl.Flush()
+	})
+	useAddr(t, srv.URL) // 改 addr 后重建模板（模板按 flags 构建）
+	m := &metrics{errDetail: make(map[string]int64)}
+	doRequest(&http.Client{Timeout: 5 * time.Second}, m, rand.New(rand.NewPCG(1, 1)), true)
+	require.Equal(t, int64(1), m.total.Load())
+	require.Equal(t, int64(0), m.errs.Load())
+	require.GreaterOrEqual(t, p99(m), int64(0), "成功流必须入首字节直方图")
+}
+
+// TestAffinityInjectsPromptCacheKey 软亲和注入：chat/responses 格式带
+// prompt_cache_key（affinity 非空），anthropic 忽略（不吃该字段）。
+func TestAffinityInjectsPromptCacheKey(t *testing.T) {
+	prevFmt := *format
+	t.Cleanup(func() { *format = prevFmt })
+
+	*format = "chat"
+	req := newLoadtestRequest("http://example.test", "ck-test", "chat", "affinity-7")
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(req.Body).Decode(&body))
+	require.Equal(t, "affinity-7", body["prompt_cache_key"], "chat 注入显式亲和键")
+
+	*format = "anthropic"
+	req = newLoadtestRequest("http://example.test", "ck-test", "chat", "affinity-7")
+	require.NotContains(t, readAll(t, req), "prompt_cache_key", "anthropic 不注入（格式白名单外）")
+}
+
+// TestAffinityTemplateRotation -affinity-keys N 预构建 N 个亲和模板，
+// newRequestFromTemplate 按 idx 轮转取对应 prompt_cache_key。
+func TestAffinityTemplateRotation(t *testing.T) {
+	prevKeys, prevMode, prevFmt := *affinityKeys, *mode, *format
+	t.Cleanup(func() {
+		*affinityKeys, *mode, *format = prevKeys, prevMode, prevFmt
+		buildReqTemplate()
+	})
+	*affinityKeys, *mode, *format = 3, "chat", "chat"
+	buildReqTemplate()
+	require.Len(t, affinityTmpls, 3)
+	for i := 0; i < 3; i++ {
+		req := newRequestFromTemplate("ck-test", i)
+		b := readAll(t, req)
+		require.Contains(t, b, fmt.Sprintf("affinity-%d", i), "轮转下标 %d 命中对应亲和域", i)
+	}
+	// idx 超界取模回绕；idx<0 走无亲和单模板。
+	require.Contains(t, readAll(t, newRequestFromTemplate("ck-test", 7)), "affinity-1")
+	require.NotContains(t, readAll(t, newRequestFromTemplate("ck-test", -1)), "prompt_cache_key")
+}
+
+// readAll 读尽请求体（工具侧小辅助）。
+func readAll(t *testing.T, req *http.Request) string {
+	t.Helper()
+	if req.Body == nil {
+		return ""
+	}
+	b, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	return string(b)
 }
 
 // ---- fill 模式（管理面填充压测）----
@@ -149,9 +241,9 @@ func TestStreamRequestBodyEnablesStream(t *testing.T) {
 // 其余测试依赖默认 mode=stream）。
 func fillFlag(t *testing.T, m, ft, tok string) {
 	t.Helper()
-	prevMode, prevType, prevTok := *mode, *fillType, *adminToken
-	*mode, *fillType, *adminToken = m, ft, tok
-	t.Cleanup(func() { *mode, *fillType, *adminToken = prevMode, prevType, prevTok })
+	prevMode, prevType, prevTok := *mode, *fillType, *adminJWT
+	*mode, *fillType, *adminJWT = m, ft, tok
+	t.Cleanup(func() { *mode, *fillType, *adminJWT = prevMode, prevType, prevTok })
 }
 
 func TestFillTypeMixedCycles(t *testing.T) {
@@ -331,4 +423,29 @@ func TestDoRequestNon200DrainsBodyForReuse(t *testing.T) {
 			m.mu.Unlock()
 		})
 	}
+}
+
+// TestDoRequestRecordsDialAndConnWait 建连观测：首请求真实拨号记 dial，
+// 次请求复用 keep-alive 只记 conn_wait；两请求都必须有 conn_wait 样本。
+// dial 由 newLoadTransport 的自持 DialContext 记录（确定性；httptrace 的
+// Connect* 回调在拨号 goroutine 上偶发丢失，已弃用）。
+func TestDoRequestRecordsDialAndConnWait(t *testing.T) {
+	srv, _ := connCountingServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, "data: {\"ok\":true}\n\n")
+		fl.Flush()
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		fl.Flush()
+	})
+	useAddr(t, srv.URL)
+	m := &metrics{errDetail: make(map[string]int64)}
+	client := &http.Client{Timeout: 5 * time.Second, Transport: newLoadTransport(m)}
+	rng := rand.New(rand.NewPCG(1, 1))
+	doRequest(client, m, rng, true)
+	doRequest(client, m, rng, true)
+	require.Equal(t, int64(2), m.total.Load())
+	require.Equal(t, int64(2), m.connWaitN.Load(), "每次取连接都要有 conn_wait 样本")
+	require.GreaterOrEqual(t, m.dialN.Load(), int64(1), "首请求真实拨号必须记录")
+	require.LessOrEqual(t, m.dialN.Load(), int64(2), "复用后不应再拨号")
 }

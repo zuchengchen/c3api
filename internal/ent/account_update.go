@@ -93,61 +93,6 @@ func (_u *AccountUpdate) SetNillableUpstreamKey(v *string) *AccountUpdate {
 	return _u
 }
 
-// SetStatus sets the "status" field.
-func (_u *AccountUpdate) SetStatus(v account.Status) *AccountUpdate {
-	_u.mutation.SetStatus(v)
-	return _u
-}
-
-// SetNillableStatus sets the "status" field if the given value is not nil.
-func (_u *AccountUpdate) SetNillableStatus(v *account.Status) *AccountUpdate {
-	if v != nil {
-		_u.SetStatus(*v)
-	}
-	return _u
-}
-
-// SetCooldownUntil sets the "cooldown_until" field.
-func (_u *AccountUpdate) SetCooldownUntil(v time.Time) *AccountUpdate {
-	_u.mutation.SetCooldownUntil(v)
-	return _u
-}
-
-// SetNillableCooldownUntil sets the "cooldown_until" field if the given value is not nil.
-func (_u *AccountUpdate) SetNillableCooldownUntil(v *time.Time) *AccountUpdate {
-	if v != nil {
-		_u.SetCooldownUntil(*v)
-	}
-	return _u
-}
-
-// ClearCooldownUntil clears the value of the "cooldown_until" field.
-func (_u *AccountUpdate) ClearCooldownUntil() *AccountUpdate {
-	_u.mutation.ClearCooldownUntil()
-	return _u
-}
-
-// SetWeight sets the "weight" field.
-func (_u *AccountUpdate) SetWeight(v int) *AccountUpdate {
-	_u.mutation.ResetWeight()
-	_u.mutation.SetWeight(v)
-	return _u
-}
-
-// SetNillableWeight sets the "weight" field if the given value is not nil.
-func (_u *AccountUpdate) SetNillableWeight(v *int) *AccountUpdate {
-	if v != nil {
-		_u.SetWeight(*v)
-	}
-	return _u
-}
-
-// AddWeight adds value to the "weight" field.
-func (_u *AccountUpdate) AddWeight(v int) *AccountUpdate {
-	_u.mutation.AddWeight(v)
-	return _u
-}
-
 // SetMaxConcurrency sets the "max_concurrency" field.
 func (_u *AccountUpdate) SetMaxConcurrency(v int) *AccountUpdate {
 	_u.mutation.ResetMaxConcurrency()
@@ -226,6 +171,150 @@ func (_u *AccountUpdate) SetNillableFailedAt(v *time.Time) *AccountUpdate {
 // ClearFailedAt clears the value of the "failed_at" field.
 func (_u *AccountUpdate) ClearFailedAt() *AccountUpdate {
 	_u.mutation.ClearFailedAt()
+	return _u
+}
+
+// SetFailureSource sets the "failure_source" field.
+func (_u *AccountUpdate) SetFailureSource(v string) *AccountUpdate {
+	_u.mutation.SetFailureSource(v)
+	return _u
+}
+
+// SetNillableFailureSource sets the "failure_source" field if the given value is not nil.
+func (_u *AccountUpdate) SetNillableFailureSource(v *string) *AccountUpdate {
+	if v != nil {
+		_u.SetFailureSource(*v)
+	}
+	return _u
+}
+
+// ClearFailureSource clears the value of the "failure_source" field.
+func (_u *AccountUpdate) ClearFailureSource() *AccountUpdate {
+	_u.mutation.ClearFailureSource()
+	return _u
+}
+
+// SetEnabled sets the "enabled" field.
+func (_u *AccountUpdate) SetEnabled(v bool) *AccountUpdate {
+	_u.mutation.SetEnabled(v)
+	return _u
+}
+
+// SetNillableEnabled sets the "enabled" field if the given value is not nil.
+func (_u *AccountUpdate) SetNillableEnabled(v *bool) *AccountUpdate {
+	if v != nil {
+		_u.SetEnabled(*v)
+	}
+	return _u
+}
+
+// SetLifecycleRevision sets the "lifecycle_revision" field.
+func (_u *AccountUpdate) SetLifecycleRevision(v int64) *AccountUpdate {
+	_u.mutation.ResetLifecycleRevision()
+	_u.mutation.SetLifecycleRevision(v)
+	return _u
+}
+
+// SetNillableLifecycleRevision sets the "lifecycle_revision" field if the given value is not nil.
+func (_u *AccountUpdate) SetNillableLifecycleRevision(v *int64) *AccountUpdate {
+	if v != nil {
+		_u.SetLifecycleRevision(*v)
+	}
+	return _u
+}
+
+// AddLifecycleRevision adds value to the "lifecycle_revision" field.
+func (_u *AccountUpdate) AddLifecycleRevision(v int64) *AccountUpdate {
+	_u.mutation.AddLifecycleRevision(v)
+	return _u
+}
+
+// SetIdentityRevision sets the "identity_revision" field.
+func (_u *AccountUpdate) SetIdentityRevision(v int64) *AccountUpdate {
+	_u.mutation.ResetIdentityRevision()
+	_u.mutation.SetIdentityRevision(v)
+	return _u
+}
+
+// SetNillableIdentityRevision sets the "identity_revision" field if the given value is not nil.
+func (_u *AccountUpdate) SetNillableIdentityRevision(v *int64) *AccountUpdate {
+	if v != nil {
+		_u.SetIdentityRevision(*v)
+	}
+	return _u
+}
+
+// AddIdentityRevision adds value to the "identity_revision" field.
+func (_u *AccountUpdate) AddIdentityRevision(v int64) *AccountUpdate {
+	_u.mutation.AddIdentityRevision(v)
+	return _u
+}
+
+// SetUpstreamCostMultiplierBp sets the "upstream_cost_multiplier_bp" field.
+func (_u *AccountUpdate) SetUpstreamCostMultiplierBp(v int) *AccountUpdate {
+	_u.mutation.ResetUpstreamCostMultiplierBp()
+	_u.mutation.SetUpstreamCostMultiplierBp(v)
+	return _u
+}
+
+// SetNillableUpstreamCostMultiplierBp sets the "upstream_cost_multiplier_bp" field if the given value is not nil.
+func (_u *AccountUpdate) SetNillableUpstreamCostMultiplierBp(v *int) *AccountUpdate {
+	if v != nil {
+		_u.SetUpstreamCostMultiplierBp(*v)
+	}
+	return _u
+}
+
+// AddUpstreamCostMultiplierBp adds value to the "upstream_cost_multiplier_bp" field.
+func (_u *AccountUpdate) AddUpstreamCostMultiplierBp(v int) *AccountUpdate {
+	_u.mutation.AddUpstreamCostMultiplierBp(v)
+	return _u
+}
+
+// SetCacheDomain sets the "cache_domain" field.
+func (_u *AccountUpdate) SetCacheDomain(v string) *AccountUpdate {
+	_u.mutation.SetCacheDomain(v)
+	return _u
+}
+
+// SetNillableCacheDomain sets the "cache_domain" field if the given value is not nil.
+func (_u *AccountUpdate) SetNillableCacheDomain(v *string) *AccountUpdate {
+	if v != nil {
+		_u.SetCacheDomain(*v)
+	}
+	return _u
+}
+
+// ClearCacheDomain clears the value of the "cache_domain" field.
+func (_u *AccountUpdate) ClearCacheDomain() *AccountUpdate {
+	_u.mutation.ClearCacheDomain()
+	return _u
+}
+
+// SetSupplierUserID sets the "supplier_user_id" field.
+func (_u *AccountUpdate) SetSupplierUserID(v int64) *AccountUpdate {
+	_u.mutation.ResetSupplierUserID()
+	_u.mutation.SetSupplierUserID(v)
+	return _u
+}
+
+// SetNillableSupplierUserID sets the "supplier_user_id" field if the given value is not nil.
+func (_u *AccountUpdate) SetNillableSupplierUserID(v *int64) *AccountUpdate {
+	if v != nil {
+		_u.SetSupplierUserID(*v)
+	}
+	return _u
+}
+
+// AddSupplierUserID adds value to the "supplier_user_id" field.
+func (_u *AccountUpdate) AddSupplierUserID(v int64) *AccountUpdate {
+	_u.mutation.AddSupplierUserID(v)
+	return _u
+}
+
+// ClearSupplierUserID clears the value of the "supplier_user_id" field.
+func (_u *AccountUpdate) ClearSupplierUserID() *AccountUpdate {
+	_u.mutation.ClearSupplierUserID()
 	return _u
 }
 
@@ -395,11 +484,6 @@ func (_u *AccountUpdate) defaults() {
 
 // check runs all checks and user-defined validators on the builder.
 func (_u *AccountUpdate) check() error {
-	if v, ok := _u.mutation.Status(); ok {
-		if err := account.StatusValidator(v); err != nil {
-			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Account.status": %w`, err)}
-		}
-	}
 	if _u.mutation.TemplateCleared() && len(_u.mutation.TemplateIDs()) > 0 {
 		return errors.New(`ent: clearing a required unique edge "Account.template"`)
 	}
@@ -430,21 +514,6 @@ func (_u *AccountUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if value, ok := _u.mutation.UpstreamKey(); ok {
 		_spec.SetField(account.FieldUpstreamKey, field.TypeString, value)
 	}
-	if value, ok := _u.mutation.Status(); ok {
-		_spec.SetField(account.FieldStatus, field.TypeEnum, value)
-	}
-	if value, ok := _u.mutation.CooldownUntil(); ok {
-		_spec.SetField(account.FieldCooldownUntil, field.TypeTime, value)
-	}
-	if _u.mutation.CooldownUntilCleared() {
-		_spec.ClearField(account.FieldCooldownUntil, field.TypeTime)
-	}
-	if value, ok := _u.mutation.Weight(); ok {
-		_spec.SetField(account.FieldWeight, field.TypeInt, value)
-	}
-	if value, ok := _u.mutation.AddedWeight(); ok {
-		_spec.AddField(account.FieldWeight, field.TypeInt, value)
-	}
 	if value, ok := _u.mutation.MaxConcurrency(); ok {
 		_spec.SetField(account.FieldMaxConcurrency, field.TypeInt, value)
 	}
@@ -468,6 +537,48 @@ func (_u *AccountUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if _u.mutation.FailedAtCleared() {
 		_spec.ClearField(account.FieldFailedAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.FailureSource(); ok {
+		_spec.SetField(account.FieldFailureSource, field.TypeString, value)
+	}
+	if _u.mutation.FailureSourceCleared() {
+		_spec.ClearField(account.FieldFailureSource, field.TypeString)
+	}
+	if value, ok := _u.mutation.Enabled(); ok {
+		_spec.SetField(account.FieldEnabled, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.LifecycleRevision(); ok {
+		_spec.SetField(account.FieldLifecycleRevision, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedLifecycleRevision(); ok {
+		_spec.AddField(account.FieldLifecycleRevision, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.IdentityRevision(); ok {
+		_spec.SetField(account.FieldIdentityRevision, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedIdentityRevision(); ok {
+		_spec.AddField(account.FieldIdentityRevision, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.UpstreamCostMultiplierBp(); ok {
+		_spec.SetField(account.FieldUpstreamCostMultiplierBp, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.AddedUpstreamCostMultiplierBp(); ok {
+		_spec.AddField(account.FieldUpstreamCostMultiplierBp, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.CacheDomain(); ok {
+		_spec.SetField(account.FieldCacheDomain, field.TypeString, value)
+	}
+	if _u.mutation.CacheDomainCleared() {
+		_spec.ClearField(account.FieldCacheDomain, field.TypeString)
+	}
+	if value, ok := _u.mutation.SupplierUserID(); ok {
+		_spec.SetField(account.FieldSupplierUserID, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedSupplierUserID(); ok {
+		_spec.AddField(account.FieldSupplierUserID, field.TypeInt64, value)
+	}
+	if _u.mutation.SupplierUserIDCleared() {
+		_spec.ClearField(account.FieldSupplierUserID, field.TypeInt64)
 	}
 	if value, ok := _u.mutation.UpdatedAt(); ok {
 		_spec.SetField(account.FieldUpdatedAt, field.TypeTime, value)
@@ -682,61 +793,6 @@ func (_u *AccountUpdateOne) SetNillableUpstreamKey(v *string) *AccountUpdateOne 
 	return _u
 }
 
-// SetStatus sets the "status" field.
-func (_u *AccountUpdateOne) SetStatus(v account.Status) *AccountUpdateOne {
-	_u.mutation.SetStatus(v)
-	return _u
-}
-
-// SetNillableStatus sets the "status" field if the given value is not nil.
-func (_u *AccountUpdateOne) SetNillableStatus(v *account.Status) *AccountUpdateOne {
-	if v != nil {
-		_u.SetStatus(*v)
-	}
-	return _u
-}
-
-// SetCooldownUntil sets the "cooldown_until" field.
-func (_u *AccountUpdateOne) SetCooldownUntil(v time.Time) *AccountUpdateOne {
-	_u.mutation.SetCooldownUntil(v)
-	return _u
-}
-
-// SetNillableCooldownUntil sets the "cooldown_until" field if the given value is not nil.
-func (_u *AccountUpdateOne) SetNillableCooldownUntil(v *time.Time) *AccountUpdateOne {
-	if v != nil {
-		_u.SetCooldownUntil(*v)
-	}
-	return _u
-}
-
-// ClearCooldownUntil clears the value of the "cooldown_until" field.
-func (_u *AccountUpdateOne) ClearCooldownUntil() *AccountUpdateOne {
-	_u.mutation.ClearCooldownUntil()
-	return _u
-}
-
-// SetWeight sets the "weight" field.
-func (_u *AccountUpdateOne) SetWeight(v int) *AccountUpdateOne {
-	_u.mutation.ResetWeight()
-	_u.mutation.SetWeight(v)
-	return _u
-}
-
-// SetNillableWeight sets the "weight" field if the given value is not nil.
-func (_u *AccountUpdateOne) SetNillableWeight(v *int) *AccountUpdateOne {
-	if v != nil {
-		_u.SetWeight(*v)
-	}
-	return _u
-}
-
-// AddWeight adds value to the "weight" field.
-func (_u *AccountUpdateOne) AddWeight(v int) *AccountUpdateOne {
-	_u.mutation.AddWeight(v)
-	return _u
-}
-
 // SetMaxConcurrency sets the "max_concurrency" field.
 func (_u *AccountUpdateOne) SetMaxConcurrency(v int) *AccountUpdateOne {
 	_u.mutation.ResetMaxConcurrency()
@@ -815,6 +871,150 @@ func (_u *AccountUpdateOne) SetNillableFailedAt(v *time.Time) *AccountUpdateOne 
 // ClearFailedAt clears the value of the "failed_at" field.
 func (_u *AccountUpdateOne) ClearFailedAt() *AccountUpdateOne {
 	_u.mutation.ClearFailedAt()
+	return _u
+}
+
+// SetFailureSource sets the "failure_source" field.
+func (_u *AccountUpdateOne) SetFailureSource(v string) *AccountUpdateOne {
+	_u.mutation.SetFailureSource(v)
+	return _u
+}
+
+// SetNillableFailureSource sets the "failure_source" field if the given value is not nil.
+func (_u *AccountUpdateOne) SetNillableFailureSource(v *string) *AccountUpdateOne {
+	if v != nil {
+		_u.SetFailureSource(*v)
+	}
+	return _u
+}
+
+// ClearFailureSource clears the value of the "failure_source" field.
+func (_u *AccountUpdateOne) ClearFailureSource() *AccountUpdateOne {
+	_u.mutation.ClearFailureSource()
+	return _u
+}
+
+// SetEnabled sets the "enabled" field.
+func (_u *AccountUpdateOne) SetEnabled(v bool) *AccountUpdateOne {
+	_u.mutation.SetEnabled(v)
+	return _u
+}
+
+// SetNillableEnabled sets the "enabled" field if the given value is not nil.
+func (_u *AccountUpdateOne) SetNillableEnabled(v *bool) *AccountUpdateOne {
+	if v != nil {
+		_u.SetEnabled(*v)
+	}
+	return _u
+}
+
+// SetLifecycleRevision sets the "lifecycle_revision" field.
+func (_u *AccountUpdateOne) SetLifecycleRevision(v int64) *AccountUpdateOne {
+	_u.mutation.ResetLifecycleRevision()
+	_u.mutation.SetLifecycleRevision(v)
+	return _u
+}
+
+// SetNillableLifecycleRevision sets the "lifecycle_revision" field if the given value is not nil.
+func (_u *AccountUpdateOne) SetNillableLifecycleRevision(v *int64) *AccountUpdateOne {
+	if v != nil {
+		_u.SetLifecycleRevision(*v)
+	}
+	return _u
+}
+
+// AddLifecycleRevision adds value to the "lifecycle_revision" field.
+func (_u *AccountUpdateOne) AddLifecycleRevision(v int64) *AccountUpdateOne {
+	_u.mutation.AddLifecycleRevision(v)
+	return _u
+}
+
+// SetIdentityRevision sets the "identity_revision" field.
+func (_u *AccountUpdateOne) SetIdentityRevision(v int64) *AccountUpdateOne {
+	_u.mutation.ResetIdentityRevision()
+	_u.mutation.SetIdentityRevision(v)
+	return _u
+}
+
+// SetNillableIdentityRevision sets the "identity_revision" field if the given value is not nil.
+func (_u *AccountUpdateOne) SetNillableIdentityRevision(v *int64) *AccountUpdateOne {
+	if v != nil {
+		_u.SetIdentityRevision(*v)
+	}
+	return _u
+}
+
+// AddIdentityRevision adds value to the "identity_revision" field.
+func (_u *AccountUpdateOne) AddIdentityRevision(v int64) *AccountUpdateOne {
+	_u.mutation.AddIdentityRevision(v)
+	return _u
+}
+
+// SetUpstreamCostMultiplierBp sets the "upstream_cost_multiplier_bp" field.
+func (_u *AccountUpdateOne) SetUpstreamCostMultiplierBp(v int) *AccountUpdateOne {
+	_u.mutation.ResetUpstreamCostMultiplierBp()
+	_u.mutation.SetUpstreamCostMultiplierBp(v)
+	return _u
+}
+
+// SetNillableUpstreamCostMultiplierBp sets the "upstream_cost_multiplier_bp" field if the given value is not nil.
+func (_u *AccountUpdateOne) SetNillableUpstreamCostMultiplierBp(v *int) *AccountUpdateOne {
+	if v != nil {
+		_u.SetUpstreamCostMultiplierBp(*v)
+	}
+	return _u
+}
+
+// AddUpstreamCostMultiplierBp adds value to the "upstream_cost_multiplier_bp" field.
+func (_u *AccountUpdateOne) AddUpstreamCostMultiplierBp(v int) *AccountUpdateOne {
+	_u.mutation.AddUpstreamCostMultiplierBp(v)
+	return _u
+}
+
+// SetCacheDomain sets the "cache_domain" field.
+func (_u *AccountUpdateOne) SetCacheDomain(v string) *AccountUpdateOne {
+	_u.mutation.SetCacheDomain(v)
+	return _u
+}
+
+// SetNillableCacheDomain sets the "cache_domain" field if the given value is not nil.
+func (_u *AccountUpdateOne) SetNillableCacheDomain(v *string) *AccountUpdateOne {
+	if v != nil {
+		_u.SetCacheDomain(*v)
+	}
+	return _u
+}
+
+// ClearCacheDomain clears the value of the "cache_domain" field.
+func (_u *AccountUpdateOne) ClearCacheDomain() *AccountUpdateOne {
+	_u.mutation.ClearCacheDomain()
+	return _u
+}
+
+// SetSupplierUserID sets the "supplier_user_id" field.
+func (_u *AccountUpdateOne) SetSupplierUserID(v int64) *AccountUpdateOne {
+	_u.mutation.ResetSupplierUserID()
+	_u.mutation.SetSupplierUserID(v)
+	return _u
+}
+
+// SetNillableSupplierUserID sets the "supplier_user_id" field if the given value is not nil.
+func (_u *AccountUpdateOne) SetNillableSupplierUserID(v *int64) *AccountUpdateOne {
+	if v != nil {
+		_u.SetSupplierUserID(*v)
+	}
+	return _u
+}
+
+// AddSupplierUserID adds value to the "supplier_user_id" field.
+func (_u *AccountUpdateOne) AddSupplierUserID(v int64) *AccountUpdateOne {
+	_u.mutation.AddSupplierUserID(v)
+	return _u
+}
+
+// ClearSupplierUserID clears the value of the "supplier_user_id" field.
+func (_u *AccountUpdateOne) ClearSupplierUserID() *AccountUpdateOne {
+	_u.mutation.ClearSupplierUserID()
 	return _u
 }
 
@@ -997,11 +1197,6 @@ func (_u *AccountUpdateOne) defaults() {
 
 // check runs all checks and user-defined validators on the builder.
 func (_u *AccountUpdateOne) check() error {
-	if v, ok := _u.mutation.Status(); ok {
-		if err := account.StatusValidator(v); err != nil {
-			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Account.status": %w`, err)}
-		}
-	}
 	if _u.mutation.TemplateCleared() && len(_u.mutation.TemplateIDs()) > 0 {
 		return errors.New(`ent: clearing a required unique edge "Account.template"`)
 	}
@@ -1049,21 +1244,6 @@ func (_u *AccountUpdateOne) sqlSave(ctx context.Context) (_node *Account, err er
 	if value, ok := _u.mutation.UpstreamKey(); ok {
 		_spec.SetField(account.FieldUpstreamKey, field.TypeString, value)
 	}
-	if value, ok := _u.mutation.Status(); ok {
-		_spec.SetField(account.FieldStatus, field.TypeEnum, value)
-	}
-	if value, ok := _u.mutation.CooldownUntil(); ok {
-		_spec.SetField(account.FieldCooldownUntil, field.TypeTime, value)
-	}
-	if _u.mutation.CooldownUntilCleared() {
-		_spec.ClearField(account.FieldCooldownUntil, field.TypeTime)
-	}
-	if value, ok := _u.mutation.Weight(); ok {
-		_spec.SetField(account.FieldWeight, field.TypeInt, value)
-	}
-	if value, ok := _u.mutation.AddedWeight(); ok {
-		_spec.AddField(account.FieldWeight, field.TypeInt, value)
-	}
 	if value, ok := _u.mutation.MaxConcurrency(); ok {
 		_spec.SetField(account.FieldMaxConcurrency, field.TypeInt, value)
 	}
@@ -1087,6 +1267,48 @@ func (_u *AccountUpdateOne) sqlSave(ctx context.Context) (_node *Account, err er
 	}
 	if _u.mutation.FailedAtCleared() {
 		_spec.ClearField(account.FieldFailedAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.FailureSource(); ok {
+		_spec.SetField(account.FieldFailureSource, field.TypeString, value)
+	}
+	if _u.mutation.FailureSourceCleared() {
+		_spec.ClearField(account.FieldFailureSource, field.TypeString)
+	}
+	if value, ok := _u.mutation.Enabled(); ok {
+		_spec.SetField(account.FieldEnabled, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.LifecycleRevision(); ok {
+		_spec.SetField(account.FieldLifecycleRevision, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedLifecycleRevision(); ok {
+		_spec.AddField(account.FieldLifecycleRevision, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.IdentityRevision(); ok {
+		_spec.SetField(account.FieldIdentityRevision, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedIdentityRevision(); ok {
+		_spec.AddField(account.FieldIdentityRevision, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.UpstreamCostMultiplierBp(); ok {
+		_spec.SetField(account.FieldUpstreamCostMultiplierBp, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.AddedUpstreamCostMultiplierBp(); ok {
+		_spec.AddField(account.FieldUpstreamCostMultiplierBp, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.CacheDomain(); ok {
+		_spec.SetField(account.FieldCacheDomain, field.TypeString, value)
+	}
+	if _u.mutation.CacheDomainCleared() {
+		_spec.ClearField(account.FieldCacheDomain, field.TypeString)
+	}
+	if value, ok := _u.mutation.SupplierUserID(); ok {
+		_spec.SetField(account.FieldSupplierUserID, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedSupplierUserID(); ok {
+		_spec.AddField(account.FieldSupplierUserID, field.TypeInt64, value)
+	}
+	if _u.mutation.SupplierUserIDCleared() {
+		_spec.ClearField(account.FieldSupplierUserID, field.TypeInt64)
 	}
 	if value, ok := _u.mutation.UpdatedAt(); ok {
 		_spec.SetField(account.FieldUpdatedAt, field.TypeTime, value)

@@ -33,6 +33,18 @@ func (f AccountExtFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, 
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.AccountExtMutation", m)
 }
 
+// The BalanceLogFunc type is an adapter to allow the use of ordinary
+// function as BalanceLog mutator.
+type BalanceLogFunc func(context.Context, *ent.BalanceLogMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f BalanceLogFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.BalanceLogMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.BalanceLogMutation", m)
+}
+
 // The EmailTemplateFunc type is an adapter to allow the use of ordinary
 // function as EmailTemplate mutator.
 type EmailTemplateFunc func(context.Context, *ent.EmailTemplateMutation) (ent.Value, error)
@@ -91,6 +103,18 @@ func (f KeyFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) 
 		return f(ctx, mv)
 	}
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.KeyMutation", m)
+}
+
+// The ManagementKeyFunc type is an adapter to allow the use of ordinary
+// function as ManagementKey mutator.
+type ManagementKeyFunc func(context.Context, *ent.ManagementKeyMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f ManagementKeyFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.ManagementKeyMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.ManagementKeyMutation", m)
 }
 
 // The PriceEntryFunc type is an adapter to allow the use of ordinary
@@ -163,6 +187,54 @@ func (f SettingFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, err
 		return f(ctx, mv)
 	}
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.SettingMutation", m)
+}
+
+// The SupplierBalanceFunc type is an adapter to allow the use of ordinary
+// function as SupplierBalance mutator.
+type SupplierBalanceFunc func(context.Context, *ent.SupplierBalanceMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f SupplierBalanceFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.SupplierBalanceMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.SupplierBalanceMutation", m)
+}
+
+// The SupplierFrozenChunkFunc type is an adapter to allow the use of ordinary
+// function as SupplierFrozenChunk mutator.
+type SupplierFrozenChunkFunc func(context.Context, *ent.SupplierFrozenChunkMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f SupplierFrozenChunkFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.SupplierFrozenChunkMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.SupplierFrozenChunkMutation", m)
+}
+
+// The SupplierReconciliationFunc type is an adapter to allow the use of ordinary
+// function as SupplierReconciliation mutator.
+type SupplierReconciliationFunc func(context.Context, *ent.SupplierReconciliationMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f SupplierReconciliationFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.SupplierReconciliationMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.SupplierReconciliationMutation", m)
+}
+
+// The SupplierSettlementFunc type is an adapter to allow the use of ordinary
+// function as SupplierSettlement mutator.
+type SupplierSettlementFunc func(context.Context, *ent.SupplierSettlementMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f SupplierSettlementFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.SupplierSettlementMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.SupplierSettlementMutation", m)
 }
 
 // The TempBalanceFunc type is an adapter to allow the use of ordinary

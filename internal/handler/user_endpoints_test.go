@@ -22,6 +22,7 @@ import (
 	userapi "github.com/is7qin/c3api/internal/handler/user"
 	"github.com/is7qin/c3api/internal/repository"
 	"github.com/is7qin/c3api/internal/service"
+	"github.com/is7qin/c3api/internal/settingssnap"
 )
 
 // fakeUserStatus 快照 provider（测试替身：直读 fake store 当前状态，
@@ -36,19 +37,24 @@ func (f fakeUserStatus) UserSnapshot(userID int64) (domain.UserSnapshot, bool) {
 	return domain.UserSnapshot{Status: u.Status, Role: u.Role, TokenVersion: u.TokenVersion}, true
 }
 
+// AuthenticateManagement 补全 auth.SnapshotProvider（users-only → mgmt 恒 false）。
+func (f fakeUserStatus) AuthenticateManagement(*http.Request) (domain.ManagementKeyMeta, bool) {
+	return domain.ManagementKeyMeta{}, false
+}
+
 // newTestUserRouter /user 测试路由（真实 svc + fake store + 真实 Issuer）。
 // svc 一并返回：settings 快照测试需经 UpdateSetting（快照重载）改配置。
 func newTestUserRouter(t *testing.T) (func(method, path, body, token string) *httptest.ResponseRecorder, *fakeStore, *auth.Issuer, *service.Service) {
 	t.Helper()
 	store := newFakeStore()
-	svc := service.New(store, fakeSched{}, service.NopInvalidator{}, nil, nil, &fakeKeys{}, nil)
-	svc.SetEmailCodeStore(store) // 验证码迁 Redis 后独立注入面（fake 即实现，spec §2.2）
-	mw := service.NewMailWorker(svc)
+	// main 装配序（先快照 → worker → svc 一次注入，零回填）。
+	snap := settingssnap.New(store, nil)
+	mw := service.NewMailWorker(service.MailDeps{Settings: snap, Templates: store})
+	svc := service.New(service.Deps{Store: store, Scheduler: fakeSched{}, Invalidate: service.NopInvalidator{}, Publisher: nil, RuleReload: nil, Auth: &fakeKeys{}, Log: nil, EmailCodeStore: store, MailEnqueue: mw.Enqueue, SettingsSnapshot: snap})
 	require.NoError(t, mw.Start(t.Context()))
 	t.Cleanup(func() { _ = mw.Close(context.Background()) })
-	svc.SetMailEnqueue(mw.Enqueue)
 	iss := auth.NewIssuer("test-secret")
-	router := userapi.Router(svc, iss, fakeUserStatus{store: store}, nil)
+	router := userapi.Router(svc, iss, fakeUserStatus{store: store}, nil, nil)
 	do := func(method, path, body, token string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
 		if token != "" {
@@ -96,6 +102,7 @@ func TestUserRegisterLoginMe(t *testing.T) {
 	// 重复注册 → 409
 	rec = do(http.MethodPost, "/api/user/auth/register", `{"email":"new@example.com","password":"s3cret-pass"}`, "")
 	require.Equal(t, http.StatusConflict, rec.Code, "dup register: %s", rec.Body.String())
+	require.Contains(t, rec.Body.String(), "email already registered", "重复注册须给明确文案，非裸 service: conflict")
 
 	// 登录成功
 	rec = do(http.MethodPost, "/api/user/auth/login", `{"email":"new@example.com","password":"s3cret-pass"}`, "")
